@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.blend
+*.blend1
+*.fbx
+*.json
+*.log
+.venv/
+.idea/
+.vscode/
