@@ -246,6 +246,7 @@ def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Sou
     before = {obj.name for obj in bpy.data.objects}
     bpy.ops.import_scene.fbx(filepath=str(path))
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
+    applied_scales = apply_object_scales(imported)
     # Keep raw imports out of the Export collection (the FBX importer links to
     # the active collection) — send2ue exports every unit found in Export, so
     # stray source objects there would split the asset into multiple FBX files.
@@ -264,6 +265,7 @@ def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Sou
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
         "imported_mesh_count": sum(1 for obj in imported if obj.type == "MESH"),
         "imported_objects": [obj.name for obj in imported[:200]],
+        "applied_scales": applied_scales,
         "removed_phantom_texture_nodes": removed_phantoms,
         "renamed_materials": renamed_materials,
     }
@@ -335,6 +337,61 @@ def parent_keep_world(obj, parent):
     obj.parent = parent
     obj.matrix_parent_inverse.identity()
     obj.matrix_world = world
+
+
+def parent_depth(obj):
+    depth = 0
+    current = obj.parent
+    while current:
+        depth += 1
+        current = current.parent
+    return depth
+
+
+def has_non_unit_scale(obj, tolerance=1e-6):
+    return any(abs(float(value) - 1.0) > tolerance for value in obj.scale)
+
+
+def apply_object_scales(objects, tolerance=1e-6, max_passes=4):
+    # Blender's FBX importer can express centimeter conversion as object scale
+    # 0.01 on the armature/root containers. Apply scale parent-first, then
+    # repeat so child meshes that inherit the parent's inverse scale are baked
+    # too. This keeps world-space size unchanged while leaving object scale 1.
+    candidates = [
+        obj
+        for obj in objects
+        if obj and obj.type in {"ARMATURE", "MESH", "EMPTY"} and bpy.data.objects.get(obj.name) is obj
+    ]
+    if not candidates:
+        return []
+
+    ensure_object_mode()
+    applied = []
+    for _pass_index in range(max_passes):
+        changed = False
+        for obj in sorted(candidates, key=parent_depth):
+            if not has_non_unit_scale(obj, tolerance=tolerance):
+                continue
+            if bpy.context.view_layer.objects.get(obj.name) is None:
+                continue
+            old_scale = tuple(float(value) for value in obj.scale)
+            deselect_all()
+            bpy.context.view_layer.objects.active = obj
+            obj.select_set(True)
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            applied.append(
+                {
+                    "object": obj.name,
+                    "type": obj.type,
+                    "old_scale": old_scale,
+                    "new_scale": tuple(float(value) for value in obj.scale),
+                }
+            )
+            changed = True
+        if not changed:
+            break
+    deselect_all()
+    return applied
 
 
 def join_objects(objects):
@@ -2704,10 +2761,15 @@ def run_full_pipeline(settings):
     source_import_objects = [
         obj
         for obj in bpy.context.scene.objects
-        if obj.type == "MESH" and "codex_source_fbx" in obj
+        if "codex_source_fbx" in obj
     ]
-    tag_existing_source_materials(source_import_objects)
-    renamed_materials = strip_speedtree_material_suffixes(source_import_objects)
+    applied_scales = apply_object_scales(source_import_objects)
+    if applied_scales:
+        reports["steps"].append({"name": "apply_import_scales", "status": "applied", "applied": applied_scales})
+
+    source_import_meshes = [obj for obj in source_import_objects if obj.type == "MESH"]
+    tag_existing_source_materials(source_import_meshes)
+    renamed_materials = strip_speedtree_material_suffixes(source_import_meshes)
     if renamed_materials:
         reports["steps"].append(
             {"name": "normalize_material_names", "status": "applied", "renamed": renamed_materials}
