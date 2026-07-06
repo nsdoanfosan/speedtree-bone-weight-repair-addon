@@ -1529,6 +1529,12 @@ def collect_loose_instances(armature, name_contains):
         skinned_parent = find_skinned_parent(obj, armature)
         if skinned_parent:
             instances.append((obj, skinned_parent))
+            continue
+        # SpeedTree 10.1 material-grouped exports can place all leaf geometry
+        # under a zero-face source container rather than under a skinned parent
+        # mesh. Still create a skinned replacement object for it; the following
+        # weight-repair stage will fill zero-weight vertices by nearest bone.
+        instances.append((obj, None))
     return instances
 
 
@@ -1545,31 +1551,39 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
     ensure_object_mode()
 
     for obj, skinned_parent in instances:
-        bone_name, bone_distance = choose_bone_for_instance(
-            obj, skinned_parent, armature, segments, candidate_cache, fallback_all_bones
-        )
-        if not bone_name:
-            skipped.append({"object": obj.name, "reason": "no_candidate_bone", "parent": skinned_parent.name})
-            continue
-
         duplicate = obj.copy()
         duplicate.data = obj.data.copy()
         duplicate.modifiers.clear()
         duplicate.vertex_groups.clear()
         bpy.context.scene.collection.objects.link(duplicate)
-        group = duplicate.vertex_groups.new(name=bone_name)
-        group.add(list(range(len(duplicate.data.vertices))), 1.0, "REPLACE")
-        copies.append(duplicate)
-
-        assignments.append(
-            {
+        if skinned_parent:
+            bone_name, bone_distance = choose_bone_for_instance(
+                obj, skinned_parent, armature, segments, candidate_cache, fallback_all_bones
+            )
+            if not bone_name:
+                remove_object_and_orphan_mesh(duplicate)
+                skipped.append({"object": obj.name, "reason": "no_candidate_bone", "parent": skinned_parent.name})
+                continue
+            group = duplicate.vertex_groups.new(name=bone_name)
+            group.add(list(range(len(duplicate.data.vertices))), 1.0, "REPLACE")
+            assignment = {
                 "object": obj.name,
                 "parent_mesh": skinned_parent.name,
                 "bone": bone_name,
                 "vertex_count": len(obj.data.vertices),
                 "distance": bone_distance,
             }
-        )
+        else:
+            assignment = {
+                "object": obj.name,
+                "parent_mesh": "",
+                "bone": "",
+                "vertex_count": len(obj.data.vertices),
+                "distance": None,
+                "weighting": "deferred_to_weight_repair_nearest_bone",
+            }
+        copies.append(duplicate)
+        assignments.append(assignment)
 
         if hide_originals:
             obj.hide_viewport = True
