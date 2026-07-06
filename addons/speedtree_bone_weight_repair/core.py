@@ -1098,9 +1098,80 @@ def collect_bones(armature):
     return bones, children
 
 
+def unique_scale_candidates(candidates, tolerance=1e-5):
+    result = []
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= EPSILON:
+            continue
+        if any(abs(value - existing) <= tolerance * max(1.0, abs(existing)) for existing in result):
+            continue
+        result.append(value)
+    return result
+
+
+def point_array(points):
+    rows = []
+    for point in points:
+        if point is None:
+            continue
+        try:
+            row = [float(point[0]), float(point[1]), float(point[2])]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if all(math.isfinite(value) for value in row):
+            rows.append(row)
+    if not rows:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.array(rows, dtype=np.float64)
+
+
+def robust_span_candidates(source_points, target_points):
+    source = point_array(source_points)
+    target = point_array(target_points)
+    if len(source) < 2 or len(target) < 2:
+        return []
+
+    source_low, source_high = np.percentile(source, [5.0, 95.0], axis=0)
+    target_low, target_high = np.percentile(target, [5.0, 95.0], axis=0)
+    source_span = source_high - source_low
+    target_span = target_high - target_low
+
+    candidates = []
+    source_diag = float(np.linalg.norm(source_span))
+    target_diag = float(np.linalg.norm(target_span))
+    if source_diag > EPSILON and target_diag > EPSILON:
+        candidates.append(source_diag / target_diag)
+
+    for src, dst in zip(source_span, target_span):
+        src = float(abs(src))
+        dst = float(abs(dst))
+        if src > EPSILON and dst > EPSILON:
+            candidates.append(src / dst)
+
+    source_radius = np.percentile(np.linalg.norm(source, axis=1), 95.0)
+    target_radius = np.percentile(np.linalg.norm(target, axis=1), 95.0)
+    if source_radius > EPSILON and target_radius > EPSILON:
+        candidates.append(float(source_radius / target_radius))
+
+    return unique_scale_candidates(candidates)
+
+
+def build_scale_candidates(base_candidates, source_points, target_points):
+    return unique_scale_candidates(list(base_candidates) + robust_span_candidates(source_points, target_points))
+
+
 def choose_scale(records, orphan_roots, bones, candidates):
     if not records or not orphan_roots:
         return candidates[0], []
+    candidates = build_scale_candidates(
+        candidates,
+        [rec["child_coord_raw"] for rec in records],
+        [bones[root]["head"] for root in orphan_roots],
+    )
     sample_records = records[: min(len(records), 500)]
     scores = []
     for scale in candidates:
@@ -1375,7 +1446,12 @@ def resolve_spm_scale(tree, bones, true_root, scale_value="auto"):
     start_bones = [name for name in bones if name.endswith("_Start")]
     scores = []
     sample = branch_nodes[: min(len(branch_nodes), 500)]
-    for scale in [1.0, 3.28084, 100.0, 0.01]:
+    candidates = build_scale_candidates(
+        [1.0, 3.28084, 100.0, 0.01],
+        [node["coord"] for node in branch_nodes],
+        [bones[name]["head"] for name in start_bones],
+    )
+    for scale in candidates:
         nearest = []
         for node in sample:
             point = vec_div(node["coord"], scale)
@@ -1447,8 +1523,12 @@ def leaf_nodes_for_targets(tree, include_base_leaf_nodes=False):
     return nodes
 
 
-def choose_spm_leaf_scale(leaf_nodes, component_tree=None):
-    candidates = [3.28084, 1.0, 30.48, 100.0, 0.01]
+def choose_spm_leaf_scale(leaf_nodes, component_tree=None, component_points=None):
+    candidates = build_scale_candidates(
+        [3.28084, 1.0, 30.48, 100.0, 0.01],
+        [node["coord"] for node in leaf_nodes],
+        component_points or [],
+    )
     scores = []
     sample_count = min(len(leaf_nodes), 5000)
     sample_step = max(1, len(leaf_nodes) // sample_count) if sample_count else 1
@@ -1496,7 +1576,14 @@ def collect_spm_leaf_targets(
         if leaf_mesh_obj is not None:
             components, component_tree = mesh_component_centroid_tree(leaf_mesh_obj)
             component_count = len(components)
-        leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(leaf_nodes, component_tree=component_tree)
+            component_points = [component["centroid_world"] for component in components]
+        else:
+            component_points = []
+        leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(
+            leaf_nodes,
+            component_tree=component_tree,
+            component_points=component_points,
+        )
 
     scale = leaf_scale
     branch_map = branch_node_bone_map(tree, bones, scale)
@@ -1791,6 +1878,11 @@ def parse_speedtree_xml_bones(xml_path):
 
 def choose_xml_scale(xml_bones, head_array, candidates=(100.0, 1.0, 3.28084, 30.48, 0.01)):
     sample = xml_bones[: min(len(xml_bones), 300)]
+    candidates = build_scale_candidates(
+        candidates,
+        [bone["start"] for bone in xml_bones],
+        head_array.tolist() if hasattr(head_array, "tolist") else head_array,
+    )
     scores = []
     for scale in candidates:
         nearest = []
