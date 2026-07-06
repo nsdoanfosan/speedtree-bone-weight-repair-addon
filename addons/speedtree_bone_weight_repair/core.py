@@ -12,7 +12,7 @@ from pathlib import Path
 
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Vector, kdtree
 
 # Parked 3D Branch Cluster prototype.
 # The active add-on no longer imports/registers this path. Keep the separate
@@ -872,10 +872,19 @@ def read_spm_xml(path):
 
 
 def child_text(element, name, default=None):
+    if element is None:
+        return default
     child = element.find(name)
     if child is None or child.text is None:
         return default
     return child.text
+
+
+def child_bool(element, name, default=False):
+    value = child_text(element, name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes"}
 
 
 def parse_coord(text):
@@ -946,6 +955,7 @@ def parse_speedtree(path):
         if not guid:
             continue
         name = child_text(node, "Name", "")
+        extra = node.find("Extra")
         nodes[guid] = {
             "guid": guid,
             "type": node.attrib.get("Type"),
@@ -953,6 +963,8 @@ def parse_speedtree(path):
             "parent": child_text(node, "ParentGUID"),
             "name": name,
             "coord": parse_coord(name),
+            "has_skin": child_bool(extra, "m_bHasSkin", False),
+            "valid_position": child_bool(extra, "m_bValidPosition", True),
         }
         node_order.append(guid)
 
@@ -1287,6 +1299,317 @@ def nearest_segment(point, names, heads, tails):
 
 
 # ---------------------------------------------------------------------------
+# SPM leaf node -> armature bone mapping
+# ---------------------------------------------------------------------------
+
+
+def resolve_spm_scale(tree, bones, true_root, scale_value="auto"):
+    if str(scale_value).lower() != "auto":
+        return float(scale_value), []
+
+    records, _issues = find_base_ref_pairs(tree)
+    roots = [name for name, bone in bones.items() if bone["parent"] is None]
+    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
+    if records and orphan_roots:
+        return choose_scale(records, orphan_roots, bones, [1.0, 3.28084, 100.0, 0.01])
+
+    branch_nodes = [node for node in tree["nodes"].values() if node["type"] == "Branch" and node["coord"]]
+    start_bones = [name for name in bones if name.endswith("_Start")]
+    scores = []
+    sample = branch_nodes[: min(len(branch_nodes), 500)]
+    for scale in [1.0, 3.28084, 100.0, 0.01]:
+        nearest = []
+        for node in sample:
+            point = vec_div(node["coord"], scale)
+            nearest.append(min(dist(point, bones[name]["head"]) for name in start_bones))
+        nearest.sort()
+        scores.append({"scale": scale, "median_nearest_branch_start": nearest[len(nearest) // 2] if nearest else None})
+    scores.sort(key=lambda item: item["median_nearest_branch_start"] if item["median_nearest_branch_start"] is not None else float("inf"))
+    return scores[0]["scale"], scores
+
+
+def branch_node_bone_map(tree, bones, scale):
+    all_starts = [name for name in bones if name.endswith("_Start")]
+    mapping = {}
+    for guid, node in tree["nodes"].items():
+        if node["type"] != "Branch" or not node["coord"]:
+            continue
+        bone_name, distance = nearest_start(vec_div(node["coord"], scale), all_starts, bones)
+        if bone_name:
+            mapping[guid] = {"bone": bone_name, "distance": distance}
+    return mapping
+
+
+def parent_branch_node(tree, node):
+    nodes = tree["nodes"]
+    parent_guid = node.get("parent")
+    seen = set()
+    while parent_guid and parent_guid not in seen:
+        seen.add(parent_guid)
+        parent = nodes.get(parent_guid)
+        if not parent:
+            return None
+        if parent["type"] == "Branch":
+            return parent
+        parent_guid = parent.get("parent")
+    return None
+
+
+def collect_spm_leaf_targets(spm_path, armature, true_root="Bone_1_Start", scale_value="auto"):
+    if not spm_path or not Path(spm_path).exists():
+        return {"status": "missing-spm", "targets": []}
+
+    tree = parse_speedtree(spm_path)
+    bones, children = collect_bones(armature)
+    scale, scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
+    branch_map = branch_node_bone_map(tree, bones, scale)
+    targets = []
+    skipped = Counter()
+
+    for node in tree["nodes"].values():
+        if node["type"] not in {"Leaf Mesh", "Base", "BaseRef"}:
+            continue
+        if "leaf" not in (node["name"] or "").lower():
+            continue
+        if not node.get("coord"):
+            skipped["missing_coord"] += 1
+            continue
+        if not node.get("valid_position", True):
+            skipped["invalid_position"] += 1
+            continue
+
+        branch = parent_branch_node(tree, node)
+        if not branch:
+            skipped["missing_parent_branch"] += 1
+            continue
+        branch_match = branch_map.get(branch["guid"])
+        if not branch_match:
+            skipped["unmatched_parent_branch"] += 1
+            continue
+
+        branch_bone = branch_match["bone"]
+        chain = branch_chain(branch_bone, children)
+        point = vec_div(node["coord"], scale)
+        bone_name, bone_distance = nearest_bone_on_chain(point, chain, bones)
+        if not bone_name:
+            skipped["empty_parent_chain"] += 1
+            continue
+
+        targets.append(
+            {
+                "guid": node["guid"],
+                "name": node["name"],
+                "type": node["type"],
+                "point": point,
+                "bone": bone_name,
+                "parent_branch_guid": branch["guid"],
+                "parent_branch_name": branch["name"],
+                "parent_branch_bone": branch_bone,
+                "parent_branch_distance": branch_match["distance"],
+                "bone_distance": bone_distance,
+            }
+        )
+
+    return {
+        "status": "ok" if targets else "no-targets",
+        "spm": str(spm_path),
+        "spm_version": tree.get("version"),
+        "scale": scale,
+        "scale_scores": scale_scores,
+        "targets": targets,
+        "target_count": len(targets),
+        "skipped": dict(skipped),
+    }
+
+
+def mesh_connected_components(mesh):
+    vertex_count = len(mesh.vertices)
+    parent = list(range(vertex_count))
+    rank = [0] * vertex_count
+
+    def find(index):
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != index:
+            next_index = parent[index]
+            parent[index] = root
+            index = next_index
+        return root
+
+    def union(a, b):
+        ra = find(a)
+        rb = find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for polygon in mesh.polygons:
+        vertices = polygon.vertices
+        if len(vertices) < 2:
+            continue
+        first = vertices[0]
+        for vertex_index in vertices[1:]:
+            union(first, vertex_index)
+
+    components = {}
+    for vertex in mesh.vertices:
+        root = find(vertex.index)
+        entry = components.get(root)
+        if entry is None:
+            entry = {"vertices": [], "sum": Vector((0.0, 0.0, 0.0))}
+            components[root] = entry
+        entry["vertices"].append(vertex.index)
+        entry["sum"] += vertex.co
+    return list(components.values())
+
+
+def assign_mesh_components_from_spm_leaf_targets(obj, duplicate, targets):
+    if not targets:
+        return None
+    target_bones = {target["bone"] for target in targets if target.get("bone")}
+    if len(target_bones) <= 1 and len(targets) > 16:
+        return None
+
+    tree = kdtree.KDTree(len(targets))
+    for index, target in enumerate(targets):
+        tree.insert(Vector(target["point"]), index)
+    tree.balance()
+
+    components = mesh_connected_components(duplicate.data)
+    groups_by_bone = defaultdict(list)
+    distances = []
+    sample_assignments = []
+    matrix = obj.matrix_world
+
+    for component_index, component in enumerate(components):
+        centroid_local = component["sum"] / max(len(component["vertices"]), 1)
+        centroid_world = matrix @ centroid_local
+        _co, target_index, distance = tree.find(centroid_world)
+        target = targets[target_index]
+        groups_by_bone[target["bone"]].extend(component["vertices"])
+        distances.append(distance)
+        if len(sample_assignments) < 50:
+            sample_assignments.append(
+                {
+                    "component": component_index,
+                    "vertices": len(component["vertices"]),
+                    "bone": target["bone"],
+                    "leaf_node": target["name"],
+                    "distance": distance,
+                }
+            )
+
+    for bone_name, vertex_indices in groups_by_bone.items():
+        duplicate.vertex_groups.new(name=bone_name).add(vertex_indices, 1.0, "REPLACE")
+
+    distances.sort()
+    return {
+        "method": "spm_leaf_node_parent_branch",
+        "weighting": "spm_leaf_node_parent_branch",
+        "components": len(components),
+        "targets": len(targets),
+        "assigned_bones": len(groups_by_bone),
+        "mean_match_distance": float(sum(distances) / len(distances)) if distances else 0.0,
+        "median_match_distance": float(distances[len(distances) // 2]) if distances else 0.0,
+        "max_match_distance": float(distances[-1]) if distances else 0.0,
+        "sample_assignments": sample_assignments,
+    }
+
+
+def collect_skinned_surface_targets(armature, exclude_names=None):
+    exclude_names = set(exclude_names or [])
+    valid_bones = {bone.name for bone in armature.data.bones}
+    points = []
+    for obj in bpy.context.scene.objects:
+        if obj.name in exclude_names or obj.type != "MESH":
+            continue
+        if "mergedskinned" in obj.name.lower():
+            continue
+        if any(slot.material and "leaf" in slot.material.name.lower() for slot in obj.material_slots):
+            continue
+        if not obj.vertex_groups or not armature_modifier(obj, armature):
+            continue
+        names_by_index = {group.index: group.name for group in obj.vertex_groups}
+        matrix = obj.matrix_world
+        for vertex in obj.data.vertices:
+            best_name = None
+            best_weight = 0.0
+            for group_ref in vertex.groups:
+                if group_ref.weight <= best_weight:
+                    continue
+                name = names_by_index.get(group_ref.group)
+                if name in valid_bones:
+                    best_name = name
+                    best_weight = group_ref.weight
+            if best_name:
+                co = matrix @ vertex.co
+                points.append(((co.x, co.y, co.z), best_name, obj.name))
+
+    if not points:
+        return {"status": "no-skinned-surface-targets", "points": [], "tree": None}
+
+    tree = kdtree.KDTree(len(points))
+    for index, (co, _bone, _object_name) in enumerate(points):
+        tree.insert(Vector(co), index)
+    tree.balance()
+    return {"status": "ok", "points": points, "tree": tree}
+
+
+def assign_mesh_components_from_skinned_surface(obj, duplicate, surface_targets):
+    if not surface_targets or surface_targets.get("status") != "ok":
+        return None
+
+    components = mesh_connected_components(duplicate.data)
+    groups_by_bone = defaultdict(list)
+    distances = []
+    sample_assignments = []
+    matrix = obj.matrix_world
+    points = surface_targets["points"]
+    tree = surface_targets["tree"]
+
+    for component_index, component in enumerate(components):
+        centroid_local = component["sum"] / max(len(component["vertices"]), 1)
+        centroid_world = matrix @ centroid_local
+        _co, target_index, distance = tree.find(centroid_world)
+        _point, bone_name, source_object = points[target_index]
+        groups_by_bone[bone_name].extend(component["vertices"])
+        distances.append(distance)
+        if len(sample_assignments) < 50:
+            sample_assignments.append(
+                {
+                    "component": component_index,
+                    "vertices": len(component["vertices"]),
+                    "bone": bone_name,
+                    "source_object": source_object,
+                    "distance": distance,
+                }
+            )
+
+    for bone_name, vertex_indices in groups_by_bone.items():
+        duplicate.vertex_groups.new(name=bone_name).add(vertex_indices, 1.0, "REPLACE")
+
+    distances.sort()
+    return {
+        "method": "skinned_surface_component_match",
+        "weighting": "skinned_surface_component_match",
+        "components": len(components),
+        "surface_points": len(points),
+        "assigned_bones": len(groups_by_bone),
+        "mean_match_distance": float(sum(distances) / len(distances)) if distances else 0.0,
+        "median_match_distance": float(distances[len(distances) // 2]) if distances else 0.0,
+        "max_match_distance": float(distances[-1]) if distances else 0.0,
+        "sample_assignments": sample_assignments,
+    }
+
+
+# ---------------------------------------------------------------------------
 # SpeedTree XML bone metadata (Generator/Mass/Radius -> wind simulation groups)
 # ---------------------------------------------------------------------------
 #
@@ -1538,7 +1861,7 @@ def collect_loose_instances(armature, name_contains):
     return instances
 
 
-def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, fallback_all_bones):
+def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, fallback_all_bones, leaf_targets=None):
     # Duplicate each loose instance, weight it 1.0 to its nearest branch bone,
     # then join. Join preserves UV layers, color attributes, custom split
     # normals, and materials — the previous from_pydata rebuild lost all of
@@ -1548,6 +1871,8 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
     copies = []
     assignments = []
     skipped = []
+    source_names = {obj.name for obj, _parent in instances}
+    surface_targets = collect_skinned_surface_targets(armature, exclude_names=source_names)
     ensure_object_mode()
 
     for obj, skinned_parent in instances:
@@ -1555,6 +1880,8 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
         duplicate.data = obj.data.copy()
         duplicate.modifiers.clear()
         duplicate.vertex_groups.clear()
+        duplicate.hide_viewport = False
+        duplicate.hide_render = False
         bpy.context.scene.collection.objects.link(duplicate)
         if skinned_parent:
             bone_name, bone_distance = choose_bone_for_instance(
@@ -1574,6 +1901,10 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
                 "distance": bone_distance,
             }
         else:
+            spm_assignment = assign_mesh_components_from_spm_leaf_targets(obj, duplicate, leaf_targets or [])
+            surface_assignment = None
+            if not spm_assignment:
+                surface_assignment = assign_mesh_components_from_skinned_surface(obj, duplicate, surface_targets)
             assignment = {
                 "object": obj.name,
                 "parent_mesh": "",
@@ -1582,6 +1913,10 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
                 "distance": None,
                 "weighting": "deferred_to_weight_repair_nearest_bone",
             }
+            if spm_assignment:
+                assignment.update(spm_assignment)
+            elif surface_assignment:
+                assignment.update(surface_assignment)
         copies.append(duplicate)
         assignments.append(assignment)
 
@@ -1606,14 +1941,33 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
     return out_obj, assignments, skipped
 
 
-def run_skin_loose_instances(armature_name, name_contains, out_name, hide_originals=True, fallback_all_bones=False, apply=True, report_path=""):
+def run_skin_loose_instances(
+    armature_name,
+    name_contains,
+    out_name,
+    hide_originals=True,
+    fallback_all_bones=False,
+    apply=True,
+    report_path="",
+    spm_path="",
+    true_root="Bone_1_Start",
+    scale_value="auto",
+):
     armature = get_armature(armature_name)
     instances = collect_loose_instances(armature, name_contains)
+    leaf_target_info = {"status": "not-requested", "targets": []}
+    if spm_path:
+        leaf_target_info = collect_spm_leaf_targets(spm_path, armature, true_root=true_root, scale_value=scale_value)
     report = {
         "file": bpy.data.filepath,
         "armature": armature.name,
         "name_contains": name_contains,
         "candidate_instances": len(instances),
+        "spm_leaf_targets": {
+            key: value
+            for key, value in leaf_target_info.items()
+            if key not in {"targets", "scale_scores"}
+        },
         "apply": apply,
     }
     if not apply:
@@ -1623,7 +1977,12 @@ def run_skin_loose_instances(armature_name, name_contains, out_name, hide_origin
     else:
         remove_object_and_orphan_mesh(bpy.data.objects.get(out_name))
         out_obj, assignments, skipped = build_skinned_instance_mesh(
-            armature, instances, out_name, hide_originals, fallback_all_bones
+            armature,
+            instances,
+            out_name,
+            hide_originals,
+            fallback_all_bones,
+            leaf_targets=leaf_target_info.get("targets", []),
         )
         if out_obj is None:
             report.update(
@@ -2315,6 +2674,9 @@ def run_full_pipeline(settings):
             fallback_all_bones=settings.get("fallback_all_bones", False),
             apply=True,
             report_path=paths["leaf_report"],
+            spm_path=settings.get("spm_path", ""),
+            true_root=settings.get("true_root", "Bone_1_Start"),
+            scale_value=settings.get("scale_value", "auto"),
         )
         reports["steps"].append({"name": "skin_loose_instances", "status": leaf.get("status"), "report": paths["leaf_report"]})
         stage_save(paths["leaf_blend"])

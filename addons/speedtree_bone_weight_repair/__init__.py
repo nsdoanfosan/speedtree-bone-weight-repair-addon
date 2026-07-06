@@ -574,7 +574,7 @@ class STBWR_OT_ReparentFromSPM(STBWR_OT_Base):
 class STBWR_OT_SkinLooseInstances(STBWR_OT_Base):
     bl_idname = "speedtree_bwr.skin_loose_instances"
     bl_label = "Skin Loose Mesh Instances"
-    bl_description = "Convert disconnected loose leaf/cap meshes into one skinned mesh using nearest valid branch bones"
+    bl_description = "Convert disconnected loose leaf/cap meshes into one skinned mesh using SPM leaf-node parent branches when available"
 
     def execute(self, context):
         settings = self.settings().as_dict()
@@ -588,6 +588,9 @@ class STBWR_OT_SkinLooseInstances(STBWR_OT_Base):
                 fallback_all_bones=settings["fallback_all_bones"],
                 apply=True,
                 report_path=paths["leaf_report"],
+                spm_path=settings["spm_path"],
+                true_root=settings["true_root"],
+                scale_value=settings["scale_value"],
             )
         except Exception as exc:
             return self.fail(str(exc))
