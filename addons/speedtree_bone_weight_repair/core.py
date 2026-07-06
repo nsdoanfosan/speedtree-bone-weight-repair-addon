@@ -948,6 +948,7 @@ def parse_speedtree(path):
             "type": gen.attrib.get("Type"),
             "name": child_text(gen, "Name", ""),
             "level": child_text(gen, "Level"),
+            "hidden": child_bool(gen, "Hidden", False),
         }
 
     for node in root.findall(".//Node"):
@@ -1355,29 +1356,97 @@ def parent_branch_node(tree, node):
     return None
 
 
-def collect_spm_leaf_targets(spm_path, armature, true_root="Bone_1_Start", scale_value="auto"):
+def mesh_component_centroid_tree(mesh_obj):
+    components = mesh_connected_components(mesh_obj.data)
+    tree = kdtree.KDTree(len(components))
+    matrix = mesh_obj.matrix_world
+    for index, component in enumerate(components):
+        centroid = matrix @ (component["sum"] / max(len(component["vertices"]), 1))
+        component["centroid_world"] = centroid
+        tree.insert(centroid, index)
+    tree.balance()
+    return components, tree
+
+
+def leaf_nodes_for_targets(tree, include_base_leaf_nodes=False):
+    generators = tree.get("generators", {})
+    nodes = []
+    for node in tree["nodes"].values():
+        if node["type"] == "Leaf Mesh":
+            generator = generators.get(node.get("gen"), {})
+            if generator.get("hidden"):
+                continue
+        elif include_base_leaf_nodes and node["type"] in {"Base", "BaseRef"}:
+            pass
+        else:
+            continue
+        if "leaf" not in (node["name"] or "").lower():
+            continue
+        if not node.get("coord"):
+            continue
+        if not node.get("valid_position", True):
+            continue
+        nodes.append(node)
+    return nodes
+
+
+def choose_spm_leaf_scale(leaf_nodes, component_tree=None):
+    candidates = [3.28084, 1.0, 30.48, 100.0, 0.01]
+    scores = []
+    sample_count = min(len(leaf_nodes), 5000)
+    sample_step = max(1, len(leaf_nodes) // sample_count) if sample_count else 1
+    sample = leaf_nodes[::sample_step][:sample_count]
+    if component_tree and sample:
+        for scale in candidates:
+            distances = []
+            for node in sample:
+                point = Vector(vec_div(node["coord"], scale))
+                _co, _index, distance = component_tree.find(point)
+                distances.append(distance)
+            distances.sort()
+            scores.append(
+                {
+                    "scale": scale,
+                    "median_leaf_component_distance": distances[len(distances) // 2],
+                    "p90_leaf_component_distance": distances[int(len(distances) * 0.9)],
+                }
+            )
+        scores.sort(key=lambda item: item["median_leaf_component_distance"])
+        return scores[0]["scale"], scores
+    return candidates[0], []
+
+
+def collect_spm_leaf_targets(
+    spm_path,
+    armature,
+    true_root="Bone_1_Start",
+    scale_value="auto",
+    leaf_mesh_obj=None,
+    include_base_leaf_nodes=False,
+):
     if not spm_path or not Path(spm_path).exists():
         return {"status": "missing-spm", "targets": []}
 
     tree = parse_speedtree(spm_path)
     bones, children = collect_bones(armature)
-    scale, scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
+    reparent_scale, reparent_scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
+    leaf_nodes = leaf_nodes_for_targets(tree, include_base_leaf_nodes=include_base_leaf_nodes)
+    component_count = None
+    leaf_scale = reparent_scale
+    leaf_scale_scores = []
+    if str(scale_value).lower() == "auto":
+        component_tree = None
+        if leaf_mesh_obj is not None:
+            components, component_tree = mesh_component_centroid_tree(leaf_mesh_obj)
+            component_count = len(components)
+        leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(leaf_nodes, component_tree=component_tree)
+
+    scale = leaf_scale
     branch_map = branch_node_bone_map(tree, bones, scale)
     targets = []
     skipped = Counter()
 
-    for node in tree["nodes"].values():
-        if node["type"] not in {"Leaf Mesh", "Base", "BaseRef"}:
-            continue
-        if "leaf" not in (node["name"] or "").lower():
-            continue
-        if not node.get("coord"):
-            skipped["missing_coord"] += 1
-            continue
-        if not node.get("valid_position", True):
-            skipped["invalid_position"] += 1
-            continue
-
+    for node in leaf_nodes:
         branch = parent_branch_node(tree, node)
         if not branch:
             skipped["missing_parent_branch"] += 1
@@ -1400,6 +1469,7 @@ def collect_spm_leaf_targets(spm_path, armature, true_root="Bone_1_Start", scale
                 "guid": node["guid"],
                 "name": node["name"],
                 "type": node["type"],
+                "generator": tree.get("generators", {}).get(node.get("gen"), {}).get("name", ""),
                 "point": point,
                 "bone": bone_name,
                 "parent_branch_guid": branch["guid"],
@@ -1415,7 +1485,12 @@ def collect_spm_leaf_targets(spm_path, armature, true_root="Bone_1_Start", scale
         "spm": str(spm_path),
         "spm_version": tree.get("version"),
         "scale": scale,
-        "scale_scores": scale_scores,
+        "leaf_scale": leaf_scale,
+        "leaf_scale_scores": leaf_scale_scores,
+        "reparent_scale": reparent_scale,
+        "reparent_scale_scores": reparent_scale_scores,
+        "leaf_node_count": len(leaf_nodes),
+        "leaf_component_count": component_count,
         "targets": targets,
         "target_count": len(targets),
         "skipped": dict(skipped),
@@ -1957,7 +2032,14 @@ def run_skin_loose_instances(
     instances = collect_loose_instances(armature, name_contains)
     leaf_target_info = {"status": "not-requested", "targets": []}
     if spm_path:
-        leaf_target_info = collect_spm_leaf_targets(spm_path, armature, true_root=true_root, scale_value=scale_value)
+        leaf_mesh_obj = next((obj for obj, parent in instances if parent is None), None)
+        leaf_target_info = collect_spm_leaf_targets(
+            spm_path,
+            armature,
+            true_root=true_root,
+            scale_value=scale_value,
+            leaf_mesh_obj=leaf_mesh_obj,
+        )
     report = {
         "file": bpy.data.filepath,
         "armature": armature.name,
