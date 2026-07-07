@@ -238,6 +238,157 @@ def strip_speedtree_material_suffixes(objects, suffix="_Mat"):
     return renamed
 
 
+MATERIAL_GROUP_TOKENS = {"green", "twig", "twigs", "stem", "stems", "dead"}
+
+
+def material_name_tokens(name):
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", name or "").lower()
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return [token for token in normalized.split("_") if token]
+
+
+def material_group_token(material):
+    tokens = material_name_tokens(material.name if material else "")
+    for token in tokens:
+        if token in MATERIAL_GROUP_TOKENS:
+            return "twig" if token == "twigs" else "stem" if token == "stems" else token
+    return ""
+
+
+def material_base_name(material):
+    if material is None:
+        return ""
+    name = re.sub(r"(\.\d{3})$", "", material.name)
+    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", name) if part]
+    kept = [part for part in parts if part.lower() not in MATERIAL_GROUP_TOKENS]
+    return "_".join(kept).strip("_")
+
+
+def material_texture_signature(material):
+    if material is None or not material.use_nodes or not material.node_tree:
+        return ()
+    paths = []
+    for node in material.node_tree.nodes:
+        if node.type != "TEX_IMAGE" or not node.image:
+            continue
+        filepath = node.image.filepath_raw or node.image.filepath
+        if not filepath:
+            continue
+        try:
+            paths.append(str(Path(bpy.path.abspath(filepath)).resolve()).lower())
+        except (OSError, ValueError):
+            paths.append(bpy.path.abspath(filepath).lower())
+    return tuple(sorted(set(paths)))
+
+
+def unified_material_name(base_name, materials):
+    if base_name:
+        return base_name
+    return "SpeedTree_Atlas_Material"
+
+
+def remap_mesh_materials(mesh, slot_map, new_materials):
+    remapped = []
+    for poly in mesh.polygons:
+        remapped.append(slot_map.get(poly.material_index, 0))
+    mesh.materials.clear()
+    for material in new_materials:
+        mesh.materials.append(material)
+    for poly, material_index in zip(mesh.polygons, remapped):
+        poly.material_index = material_index
+    mesh.update()
+
+
+def consolidate_speedtree_group_materials(objects):
+    # SpeedTree FBX grouped by material can come back as Green/Twig/Stem slots
+    # even when they are all the same atlas texture. Collapse those slots before
+    # merge/weight export; do not touch object transforms, UVs, vertex groups, or weights.
+    mesh_objects = [obj for obj in objects if obj.type == "MESH" and obj.data]
+    if not mesh_objects:
+        return {"status": "skipped", "reason": "no mesh objects", "groups": []}
+
+    grouped = defaultdict(list)
+    for obj in mesh_objects:
+        for slot_index, material in enumerate(obj.data.materials):
+            group_token = material_group_token(material)
+            if not group_token:
+                continue
+            key = (material_base_name(material), material_texture_signature(material))
+            grouped[key].append((obj, slot_index, material, group_token))
+
+    reports = []
+    for (base_name, texture_signature), entries in grouped.items():
+        group_tokens = sorted({entry[3] for entry in entries})
+        if len(group_tokens) < 2:
+            continue
+        source_materials = []
+        seen_materials = set()
+        for _obj, _slot_index, material, _token in entries:
+            if material and material.name not in seen_materials:
+                seen_materials.add(material.name)
+                source_materials.append(material)
+        if not source_materials:
+            continue
+
+        target_name = unified_material_name(base_name, source_materials)
+        target_material = bpy.data.materials.get(target_name)
+        if target_material is None:
+            target_material = source_materials[0].copy()
+            target_material.name = target_name
+            target_material["codex_speedtree_consolidated_from"] = [material.name for material in source_materials]
+
+        slots_by_object = defaultdict(list)
+        for obj, slot_index, _material, _token in entries:
+            slots_by_object[obj].append(slot_index)
+
+        changed_objects = []
+        changed_faces = 0
+        for obj, candidate_slots in slots_by_object.items():
+            if obj.data.users > 1:
+                obj.data = obj.data.copy()
+            mesh = obj.data
+            candidate_slots = set(candidate_slots)
+            slot_map = {}
+            new_materials = [target_material]
+            non_candidate_indices = {}
+            for old_index, material in enumerate(mesh.materials):
+                if old_index in candidate_slots:
+                    slot_map[old_index] = 0
+                    continue
+                if material is None:
+                    slot_map[old_index] = 0
+                    continue
+                if material.name not in non_candidate_indices:
+                    non_candidate_indices[material.name] = len(new_materials)
+                    new_materials.append(material)
+                slot_map[old_index] = non_candidate_indices[material.name]
+            for poly in mesh.polygons:
+                if poly.material_index in candidate_slots:
+                    changed_faces += 1
+            remap_mesh_materials(mesh, slot_map, new_materials)
+            obj["codex_speedtree_unified_material"] = target_material.name
+            changed_objects.append(obj.name)
+
+        reports.append(
+            {
+                "target_material": target_material.name,
+                "source_materials": [material.name for material in source_materials],
+                "group_tokens": group_tokens,
+                "texture_signature": list(texture_signature),
+                "object_count": len(changed_objects),
+                "objects": changed_objects[:200],
+                "changed_faces": changed_faces,
+            }
+        )
+
+    return {
+        "status": "applied" if reports else "skipped",
+        "groups": reports,
+        "changed_object_count": sum(group["object_count"] for group in reports),
+        "changed_face_count": sum(group["changed_faces"] for group in reports),
+    }
+
+
 def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Source"):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -369,24 +520,31 @@ def apply_object_scales(objects, tolerance=1e-6, max_passes=4):
     applied = []
     for _pass_index in range(max_passes):
         changed = False
-        for obj in sorted(candidates, key=parent_depth):
-            if not has_non_unit_scale(obj, tolerance=tolerance):
+        for depth in sorted({parent_depth(obj) for obj in candidates}):
+            batch = [
+                obj
+                for obj in candidates
+                if parent_depth(obj) == depth
+                and has_non_unit_scale(obj, tolerance=tolerance)
+                and bpy.context.view_layer.objects.get(obj.name) is obj
+            ]
+            if not batch:
                 continue
-            if bpy.context.view_layer.objects.get(obj.name) is None:
-                continue
-            old_scale = tuple(float(value) for value in obj.scale)
             deselect_all()
-            bpy.context.view_layer.objects.active = obj
-            obj.select_set(True)
+            for obj in batch:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = batch[0]
+            old_scales = {obj.name: tuple(float(value) for value in obj.scale) for obj in batch}
             bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-            applied.append(
-                {
-                    "object": obj.name,
-                    "type": obj.type,
-                    "old_scale": old_scale,
-                    "new_scale": tuple(float(value) for value in obj.scale),
-                }
-            )
+            for obj in batch:
+                applied.append(
+                    {
+                        "object": obj.name,
+                        "type": obj.type,
+                        "old_scale": old_scales[obj.name],
+                        "new_scale": tuple(float(value) for value in obj.scale),
+                    }
+                )
             changed = True
         if not changed:
             break
@@ -1333,7 +1491,10 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
     orphan_roots = [root for root in roots_before if root != true_root and root.endswith("_Start")]
 
     if scale_value == "auto":
-        scale, scale_scores = choose_scale(records, orphan_roots, bones, [1.0, 3.28084, 100.0, 0.01])
+        if records and orphan_roots:
+            scale, scale_scores = choose_scale(records, orphan_roots, bones, [1.0, 3.28084, 100.0, 0.01])
+        else:
+            scale, scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
     else:
         scale = float(scale_value)
         scale_scores = [{"scale": scale, "manual": True}]
@@ -1444,6 +1605,8 @@ def resolve_spm_scale(tree, bones, true_root, scale_value="auto"):
 
     branch_nodes = [node for node in tree["nodes"].values() if node["type"] == "Branch" and node["coord"]]
     start_bones = [name for name in bones if name.endswith("_Start")]
+    if not branch_nodes or not start_bones:
+        return 1.0, [{"scale": 1.0, "fallback": "no branch nodes or start bones"}]
     scores = []
     sample = branch_nodes[: min(len(branch_nodes), 500)]
     candidates = build_scale_candidates(
@@ -1523,9 +1686,9 @@ def leaf_nodes_for_targets(tree, include_base_leaf_nodes=False):
     return nodes
 
 
-def choose_spm_leaf_scale(leaf_nodes, component_tree=None, component_points=None):
+def choose_spm_leaf_scale(leaf_nodes, component_tree=None, component_points=None, base_candidates=None):
     candidates = build_scale_candidates(
-        [3.28084, 1.0, 30.48, 100.0, 0.01],
+        base_candidates or [3.28084, 1.0, 30.48, 100.0, 0.01],
         [node["coord"] for node in leaf_nodes],
         component_points or [],
     )
@@ -1577,13 +1740,12 @@ def collect_spm_leaf_targets(
             components, component_tree = mesh_component_centroid_tree(leaf_mesh_obj)
             component_count = len(components)
             component_points = [component["centroid_world"] for component in components]
-        else:
-            component_points = []
-        leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(
-            leaf_nodes,
-            component_tree=component_tree,
-            component_points=component_points,
-        )
+            leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(
+                leaf_nodes,
+                component_tree=component_tree,
+                component_points=component_points,
+                base_candidates=[reparent_scale, 3.28084, 1.0, 30.48, 100.0, 0.01],
+            )
 
     scale = leaf_scale
     branch_map = branch_node_bone_map(tree, bones, scale)
@@ -2871,6 +3033,18 @@ def run_full_pipeline(settings):
     if removed_phantoms:
         reports["steps"].append(
             {"name": "remove_phantom_texture_nodes", "status": "applied", "removed": removed_phantoms}
+        )
+
+    material_consolidation = consolidate_speedtree_group_materials(source_import_meshes)
+    if material_consolidation.get("status") == "applied":
+        reports["steps"].append(
+            {
+                "name": "consolidate_speedtree_group_materials",
+                "status": "applied",
+                "changed_object_count": material_consolidation.get("changed_object_count", 0),
+                "changed_face_count": material_consolidation.get("changed_face_count", 0),
+                "groups": material_consolidation.get("groups", []),
+            }
         )
 
     def stage_save(path):
