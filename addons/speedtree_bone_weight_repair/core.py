@@ -48,8 +48,72 @@ def utc_timestamp():
 
 BUNDLED_PRESET_DIR = Path(__file__).parent / "presets" / "speedtree_10_1"
 BUNDLED_FBX_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_MA_Fbx.ini"
+BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_MA_Fbx_NoBones.ini"
 BUNDLED_XML_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_HI_Xml.ini"
 LEGACY_BUNDLED_EXPORT_OPTIONS = Path(__file__).parent / "presets" / "Options_Fbx.ini"
+
+
+def inspect_spm_bone_generators(spm_path):
+    try:
+        root = ET.fromstring(read_spm_xml(spm_path))
+    except Exception as exc:
+        return {
+            "inspection_ok": False,
+            "inspection_error": str(exc),
+            "visible_branch_generators": 0,
+            "enabled_branch_generators": 1,
+            "disabled_generators": [],
+        }
+    visible = []
+    enabled = []
+    disabled = []
+    for gen in root.findall(".//Generator"):
+        if gen.attrib.get("Type") != "Branch" or child_bool(gen, "Hidden", False):
+            continue
+        style = element_property_value(gen, "Physics:Bone style")
+        bones = element_property_value(gen, "Physics:Bones")
+        if style is None or bones is None:
+            continue
+        item = {
+            "generator": gen.findtext("Name") or "?",
+            "style": float(style),
+            "bones": float(bones),
+        }
+        visible.append(item)
+        if item["style"] == 0.0 and item["bones"] == 0.0:
+            disabled.append(item)
+        else:
+            enabled.append(item)
+    return {
+        "inspection_ok": True,
+        "visible_branch_generators": len(visible),
+        "enabled_branch_generators": len(enabled),
+        "disabled_generators": disabled,
+    }
+
+
+def spm_has_enabled_bone_generators(spm_path):
+    return inspect_spm_bone_generators(spm_path)["enabled_branch_generators"] > 0
+
+
+def require_spm_sk_ready(spm_path):
+    bone_status = inspect_spm_bone_generators(spm_path)
+    has_enabled_bones = bone_status["enabled_branch_generators"] > 0
+    if (
+        bone_status.get("inspection_ok")
+        and bone_status["visible_branch_generators"] > 0
+        and not has_enabled_bones
+    ):
+        settings = ", ".join(
+            f"{item['generator']}(style={item['style']:g}, bones={item['bones']:g})"
+            for item in bone_status["disabled_generators"]
+        )
+        raise RuntimeError(
+            "SPM is not SK-ready: every visible Branch bone generator is Absolute/0 "
+            f"(bones disabled): {settings}. Configure bones on at least one visible "
+            "Branch generator before running the SK batch."
+        )
+    return bone_status
 
 
 def default_speedtree_export_options(spm_path, kind="fbx"):
@@ -93,9 +157,13 @@ def run_speedtree_cli_export(
 
     root = Path(output_root) if output_root else spm.parent
     stem = name_stem or spm.stem
+    bone_status = require_spm_sk_ready(spm)
+    has_enabled_bones = bone_status["enabled_branch_generators"] > 0
     targets = []
     if export_fbx:
         options = Path(fbx_export_options_path or export_options_path or default_speedtree_export_options(spm_path, "fbx"))
+        if not has_enabled_bones and BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS.exists():
+            options = BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS
         targets.append(("fbx", root / "fbx" / f"{stem}.fbx", options))
     if export_xml:
         options = Path(xml_export_options_path or export_options_path or default_speedtree_export_options(spm_path, "xml"))
@@ -129,7 +197,6 @@ def run_speedtree_cli_export(
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"SpeedTree {kind.upper()} export timed out after {timeout_seconds} seconds.") from exc
-
         results[kind] = {
             "path": str(target),
             "export_options": str(options),
@@ -142,7 +209,9 @@ def run_speedtree_cli_export(
             "stderr": completed.stderr[-4000:],
         }
         if completed.returncode != 0:
-            raise RuntimeError(f"SpeedTree {kind.upper()} export failed with code {completed.returncode}: {completed.stderr[-1000:]}")
+            raise RuntimeError(
+                f"SpeedTree {kind.upper()} export failed with code {completed.returncode}: {completed.stderr[-1000:]}"
+            )
         if not target.exists() or target.stat().st_size == 0:
             raise RuntimeError(f"SpeedTree {kind.upper()} export finished but did not create a valid file: {target}")
 
@@ -152,6 +221,8 @@ def run_speedtree_cli_export(
         "export_options": export_options,
         "output_root": str(root),
         "name_stem": stem,
+        "spm_has_enabled_bones": has_enabled_bones,
+        "spm_bone_generators": bone_status,
         "exports": results,
     }
 
@@ -313,11 +384,17 @@ def consolidate_speedtree_group_materials(objects):
             group_token = material_group_token(material)
             if not group_token:
                 continue
-            key = (material_base_name(material), material_texture_signature(material))
+            # SpeedTree material-group exports often write separate Green/Stem/Twig
+            # image files even when they came from the same atlas. The normalized
+            # base material name is therefore the primary grouping key; texture
+            # paths stay in the report as diagnostics instead of blocking the merge.
+            base_name = material_base_name(material)
+            key = ("base", base_name) if base_name else ("texture", material_texture_signature(material))
             grouped[key].append((obj, slot_index, material, group_token))
 
     reports = []
-    for (base_name, texture_signature), entries in grouped.items():
+    for (key_type, key_value), entries in grouped.items():
+        base_name = key_value if key_type == "base" else ""
         group_tokens = sorted({entry[3] for entry in entries})
         if len(group_tokens) < 2:
             continue
@@ -330,6 +407,7 @@ def consolidate_speedtree_group_materials(objects):
         if not source_materials:
             continue
 
+        texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
         target_name = unified_material_name(base_name, source_materials)
         target_material = bpy.data.materials.get(target_name)
         if target_material is None:
@@ -374,7 +452,8 @@ def consolidate_speedtree_group_materials(objects):
                 "target_material": target_material.name,
                 "source_materials": [material.name for material in source_materials],
                 "group_tokens": group_tokens,
-                "texture_signature": list(texture_signature),
+                "key_type": key_type,
+                "texture_signatures": [list(signature) for signature in texture_signatures],
                 "object_count": len(changed_objects),
                 "objects": changed_objects[:200],
                 "changed_faces": changed_faces,
@@ -389,7 +468,56 @@ def consolidate_speedtree_group_materials(objects):
     }
 
 
-def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Source"):
+def build_rigid_fallback_armature(objects, armature_name="Root", bone_name="Bone_1_Start"):
+    if any(obj.type == "ARMATURE" for obj in objects):
+        return None
+    meshes = [obj for obj in objects if obj.type == "MESH" and obj.data and len(obj.data.vertices) > 0]
+    if not meshes:
+        return None
+
+    world_points = [obj.matrix_world @ Vector(corner) for obj in meshes for corner in obj.bound_box]
+    low = Vector((min(point.x for point in world_points), min(point.y for point in world_points), min(point.z for point in world_points)))
+    high = Vector((max(point.x for point in world_points), max(point.y for point in world_points), max(point.z for point in world_points)))
+    center = (low + high) * 0.5
+    height = max(high.z - low.z, 0.1)
+
+    armature_data = bpy.data.armatures.new(armature_name)
+    armature = bpy.data.objects.new(armature_name, armature_data)
+    bpy.context.scene.collection.objects.link(armature)
+    ensure_object_mode()
+    deselect_all()
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_bone = armature.data.edit_bones.new(bone_name)
+    edit_bone.head = (center.x, center.y, low.z)
+    edit_bone.tail = (center.x, center.y, low.z + height)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    for obj in meshes:
+        group = obj.vertex_groups.get(bone_name) or obj.vertex_groups.new(name=bone_name)
+        group.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        parent_keep_world(obj, armature)
+        modifier = next((item for item in obj.modifiers if item.type == "ARMATURE"), None)
+        if modifier is None:
+            modifier = obj.modifiers.new(name=armature_name, type="ARMATURE")
+        modifier.object = armature
+
+    return {
+        "armature": armature.name,
+        "bone": bone_name,
+        "meshes": [obj.name for obj in meshes],
+        "reason": "SpeedTree FBX contained geometry but no armature",
+    }
+
+
+def run_import_source_fbx(
+    source_fbx_path,
+    source_collection_name="SpeedTree_Source",
+    rigid_fallback=False,
+    armature_name="Root",
+    true_root="Bone_1_Start",
+):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
         raise RuntimeError(f"Source FBX does not exist: {source_fbx_path}")
@@ -408,6 +536,15 @@ def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Sou
     tag_speedtree_import_materials(imported, path)
     removed_phantoms = remove_phantom_image_nodes(imported)
     renamed_materials = strip_speedtree_material_suffixes(imported)
+    rigid_fallback_result = None
+    if rigid_fallback:
+        rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
+        if rigid_fallback_result:
+            armature = bpy.data.objects.get(rigid_fallback_result["armature"])
+            if armature:
+                armature["codex_source_fbx"] = str(path)
+                ensure_only_collection(armature, source_collection)
+                imported.append(armature)
 
     return {
         "source_fbx": str(path),
@@ -419,6 +556,7 @@ def run_import_source_fbx(source_fbx_path, source_collection_name="SpeedTree_Sou
         "applied_scales": applied_scales,
         "removed_phantom_texture_nodes": removed_phantoms,
         "renamed_materials": renamed_materials,
+        "rigid_fallback": rigid_fallback_result,
     }
 
 
@@ -983,6 +1121,41 @@ def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.
     }
 
 
+def build_armature_fallback_metadata(xml_path, armature, reason):
+    names = [bone.name for bone in armature.data.bones]
+    records = [
+        {
+            "name": name,
+            "xml_id": None,
+            "generator": "RigidFallback",
+            "mass": 0.0,
+            "radius": 0.0,
+            "group": 0,
+            "match_distance": None,
+        }
+        for name in names
+    ]
+    group = {
+        "index": 0,
+        "generators": ["RigidFallback"],
+        "is_trunk_group": True,
+        "bone_count": len(names),
+        "mean_mass": 0.0,
+        "mean_radius": 0.0,
+    }
+    info = {
+        "source": str(xml_path),
+        "xml_bone_count": 0,
+        "armature_bone_count": len(names),
+        "synthetic": True,
+        "fallback_reason": reason,
+        "generators": {"RigidFallback": 0},
+        "simulation_groups": [group],
+        "match": {"median_distance": None, "max_distance": None},
+    }
+    return records, info
+
+
 def write_unreal_json_from_scene(settings, paths, export_report=None):
     # Guard: never write the JSON from a scene without the repaired armature
     # (e.g. a fresh default scene) — that would overwrite a valid JSON with
@@ -995,13 +1168,22 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
 
     xml_bones = None
     xml_info = None
+    warnings = []
     xml_path = settings.get("xml_path", "")
     if xml_path:
-        xml_bones, xml_info = build_xml_bone_metadata(
-            xml_path,
-            armature,
-            settings.get("xml_trunk_generator_regex", "trunk"),
-        )
+        try:
+            xml_bones, xml_info = build_xml_bone_metadata(
+                xml_path,
+                armature,
+                settings.get("xml_trunk_generator_regex", "trunk"),
+            )
+        except RuntimeError as exc:
+            if "No <Bone> entries" not in str(exc):
+                raise
+            xml_bones, xml_info = build_armature_fallback_metadata(xml_path, armature, str(exc))
+            warnings.append(
+                "SpeedTree XML had no bones; generated a rigid group-0 mapping from the fallback armature"
+            )
 
     # Health check: MegaPlant consumes the per-bone simulation groups, so the
     # JSON is only meaningful ("not hollow") when there is XML and the bones
@@ -1014,7 +1196,6 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
         "is_hollow": (not xml_info) or len(distinct_bone_groups) <= 1,
         "note": "MegaPlant consumes per-bone simulation groups (skeleton.bones[].group).",
     }
-    warnings = []
     if not xml_info:
         warnings.append("No SpeedTree XML set: JSON has no per-bone simulation groups (hollow for MegaPlant).")
     elif len(distinct_bone_groups) <= 1:
@@ -1102,6 +1283,16 @@ def child_bool(element, name, default=False):
     return str(value).strip().lower() in {"1", "true", "yes"}
 
 
+def element_property_value(element, property_name):
+    # SpeedTree uses several property container tags (Property,
+    # SplineProperty, CurveProperty, ...). Match by their Name/Value children
+    # instead of assuming one tag name.
+    for prop in element.iter():
+        if child_text(prop, "Name") == property_name:
+            return child_text(prop, "Value")
+    return None
+
+
 def parse_coord(text):
     match = COORD_RE.search(text or "")
     if not match:
@@ -1158,12 +1349,23 @@ def parse_speedtree(path):
         guid = child_text(gen, "GUID")
         if not guid:
             continue
+        bone_style = element_property_value(gen, "Physics:Bone style")
+        bone_count = element_property_value(gen, "Physics:Bones")
+        hidden = child_bool(gen, "Hidden", False)
         generators[guid] = {
             "guid": guid,
             "type": gen.attrib.get("Type"),
             "name": child_text(gen, "Name", ""),
             "level": child_text(gen, "Level"),
-            "hidden": child_bool(gen, "Hidden", False),
+            "hidden": hidden,
+            "bone_style": float(bone_style) if bone_style is not None else None,
+            "bone_count": float(bone_count) if bone_count is not None else None,
+            "bone_enabled": (
+                not hidden
+                and bone_style is not None
+                and bone_count is not None
+                and not (float(bone_style) == 0.0 and float(bone_count) == 0.0)
+            ),
         }
 
     for node in root.findall(".//Node"):
@@ -1194,10 +1396,21 @@ def parse_speedtree(path):
 
 def find_base_ref_pairs(tree, raw_tolerance=0.05):
     nodes = tree["nodes"]
-    base_refs = [node for node in nodes.values() if node["type"] == "BaseRef" and node["coord"]]
+    generators = tree.get("generators", {})
+    base_refs = [
+        node
+        for node in nodes.values()
+        if node["type"] == "BaseRef" and node["coord"] and node.get("valid_position", True)
+    ]
     refs_by_key = defaultdict(list)
     for ref in base_refs:
         refs_by_key[coord_key(ref["coord"])].append(ref)
+
+    def generator_family(node):
+        name = generators.get(node.get("gen"), {}).get("name", "")
+        # SpeedTree commonly pairs Base "End 2" with BaseRef "End_01 2".
+        # Prefer that semantic pair when multiple references share (0, 0, 0).
+        return re.sub(r"(?:_01)+", "", re.sub(r"\s+", " ", name.lower())).strip()
 
     records = []
     issues = []
@@ -1205,8 +1418,18 @@ def find_base_ref_pairs(tree, raw_tolerance=0.05):
         node = nodes[guid]
         if node["type"] != "Branch":
             continue
+        generator = generators.get(node.get("gen"), {})
+        if generator.get("bone_enabled") is False:
+            continue
         base = nodes.get(node["parent"])
-        if not base or base["type"] != "Base" or not base["coord"] or not node["coord"]:
+        if (
+            not base
+            or base["type"] != "Base"
+            or not base["coord"]
+            or not node["coord"]
+            or not base.get("valid_position", True)
+            or not node.get("valid_position", True)
+        ):
             continue
 
         candidates = refs_by_key.get(coord_key(base["coord"]), [])
@@ -1216,6 +1439,11 @@ def find_base_ref_pairs(tree, raw_tolerance=0.05):
         if not candidates:
             issues.append({"child_branch": guid, "base": base["guid"], "error": "no matching BaseRef"})
             continue
+
+        family = generator_family(base)
+        family_candidates = [ref for ref in candidates if generator_family(ref) == family]
+        if family_candidates:
+            candidates = family_candidates
 
         ref = min(candidates, key=lambda item: dist(item["coord"], base["coord"]))
         parent_branch = nodes[ref["parent"]]
@@ -1330,16 +1558,26 @@ def choose_scale(records, orphan_roots, bones, candidates):
         [rec["child_coord_raw"] for rec in records],
         [bones[root]["head"] for root in orphan_roots],
     )
-    sample_records = records[: min(len(records), 500)]
+    sample_records = records[: min(len(records), 2000)]
     scores = []
     for scale in candidates:
+        record_points = [vec_div(rec["child_coord_raw"], scale) for rec in sample_records]
         nearest = []
-        for rec in sample_records:
-            point = vec_div(rec["child_coord_raw"], scale)
-            nearest.append(min(dist(point, bones[root]["head"]) for root in orphan_roots))
+        # Only a subset of SPM Branch nodes receives bones after Relative
+        # rounding. Score from each actual FBX orphan root toward all SPM
+        # records, not the other way around; otherwise hundreds of unboned
+        # Base children dominate the median and invent scales such as 100-400.
+        for root in orphan_roots:
+            nearest.append(min(dist(bones[root]["head"], point) for point in record_points))
         nearest.sort()
-        scores.append({"scale": scale, "median_nearest_child_root": nearest[len(nearest) // 2]})
-    scores.sort(key=lambda item: item["median_nearest_child_root"])
+        scores.append(
+            {
+                "scale": scale,
+                "median_nearest_child_root": nearest[len(nearest) // 2],
+                "max_nearest_child_root": nearest[-1],
+            }
+        )
+    scores.sort(key=lambda item: (item["median_nearest_child_root"], item["max_nearest_child_root"]))
     return scores[0]["scale"], scores
 
 
@@ -1402,17 +1640,40 @@ def build_reparent_map(records, bones, children, true_root, scale, tolerance):
 
     mapping = {}
     details = []
-    used_children = set()
     problems = []
 
-    for rec in records:
-        child_point = vec_div(rec["child_coord_raw"], scale)
-        child_bone, child_distance = nearest_unused_start(child_point, orphan_roots, bones, used_children)
-        if not child_bone:
-            problems.append({**rec, "error": "no unused orphan root for child branch"})
+    # Match the smaller, authoritative set (actual FBX orphan roots) onto the
+    # larger SPM Base/BaseRef record set. A global nearest-pair greedy pass is
+    # deterministic and prevents irrelevant unboned SPM branches from
+    # consuming roots before their real record is reached.
+    pairs = []
+    record_points = [vec_div(rec["child_coord_raw"], scale) for rec in records]
+    for child_bone in orphan_roots:
+        child_head = bones[child_bone]["head"]
+        for record_index, child_point in enumerate(record_points):
+            pairs.append((dist(child_head, child_point), child_bone, record_index))
+    pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+    matches = {}
+    used_records = set()
+    for child_distance, child_bone, record_index in pairs:
+        if child_bone in matches or record_index in used_records:
             continue
-        if child_distance is None or child_distance > tolerance:
-            problems.append({**rec, "error": "child root distance over tolerance", "distance": child_distance})
+        matches[child_bone] = (record_index, child_distance)
+        used_records.add(record_index)
+        if len(matches) == len(orphan_roots):
+            break
+
+    for child_bone in orphan_roots:
+        match = matches.get(child_bone)
+        if not match:
+            problems.append({"child_bone": child_bone, "error": "no SPM Base/BaseRef record for orphan root"})
+            continue
+        record_index, child_distance = match
+        rec = records[record_index]
+        if child_distance > tolerance:
+            problems.append(
+                {**rec, "child_bone": child_bone, "error": "child root distance over tolerance", "distance": child_distance}
+            )
             continue
 
         parent_branch_point = vec_div(rec["parent_branch_coord_raw"], scale)
@@ -1429,7 +1690,6 @@ def build_reparent_map(records, bones, children, true_root, scale, tolerance):
             continue
 
         mapping[child_bone] = parent_bone
-        used_children.add(child_bone)
         details.append(
             {
                 **rec,
@@ -1444,6 +1704,40 @@ def build_reparent_map(records, bones, children, true_root, scale, tolerance):
         )
 
     return mapping, details, problems, roots, orphan_roots
+
+
+def resolve_true_root_bone(bones, requested):
+    roots = [name for name, bone in bones.items() if bone["parent"] is None]
+    if requested in bones and requested in roots:
+        return requested, "requested"
+
+    def bone_number(name):
+        match = re.search(r"(?:^|_)(\d+)(?:_|$)", name)
+        return int(match.group(1)) if match else 10**9
+
+    non_start_roots = [name for name in roots if not name.endswith("_Start")]
+    candidates = non_start_roots or roots
+    if not candidates:
+        return requested, "missing"
+    return min(candidates, key=lambda name: (bone_number(name), name)), "inferred"
+
+
+def build_root_fallback_reparent_map(bones, true_root):
+    roots = [name for name, bone in bones.items() if bone["parent"] is None]
+    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
+    if true_root not in bones:
+        return {}, [], [{"error": "true root bone not found", "true_root": true_root}], roots, orphan_roots
+    mapping = {root: true_root for root in orphan_roots}
+    details = [
+        {
+            "child_bone": root,
+            "parent_bone": true_root,
+            "method": "fallback_parent_orphan_roots_to_true_root",
+            "reason": "SPM contains no Base/BaseRef branch records",
+        }
+        for root in orphan_roots
+    ]
+    return mapping, details, [], roots, orphan_roots
 
 
 def apply_reparent_mapping(armature, mapping):
@@ -1487,6 +1781,8 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
     records, spm_issues = find_base_ref_pairs(tree)
     armature = get_armature(armature_name)
     bones, children = collect_bones(armature)
+    requested_true_root = true_root
+    true_root, true_root_source = resolve_true_root_bone(bones, requested_true_root)
     roots_before = [name for name, bone in bones.items() if bone["parent"] is None]
     orphan_roots = [root for root in roots_before if root != true_root and root.endswith("_Start")]
 
@@ -1499,9 +1795,30 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
         scale = float(scale_value)
         scale_scores = [{"scale": scale, "manual": True}]
 
-    mapping, details, problems, roots_before, orphan_roots = build_reparent_map(
-        records, bones, children, true_root, scale, tolerance
-    )
+    fallback_reason = ""
+    if not records:
+        mapping, details, problems, roots_before, orphan_roots = build_root_fallback_reparent_map(bones, true_root)
+        fallback_reason = "no_base_ref_records"
+    else:
+        mapping, details, problems, roots_before, orphan_roots = build_reparent_map(
+            records, bones, children, true_root, scale, tolerance
+        )
+        unmatched_orphans = [root for root in orphan_roots if root not in mapping]
+        if unmatched_orphans:
+            # Some files mix Base/BaseRef-attached branches with independent
+            # top-level branches. Those top-level roots have no Base record by
+            # design; connect only the leftovers to the resolved true root.
+            for root in unmatched_orphans:
+                mapping[root] = true_root
+                details.append(
+                    {
+                        "child_bone": root,
+                        "parent_bone": true_root,
+                        "method": "fallback_unmatched_orphan_to_true_root",
+                        "reason": "no usable Base/BaseRef record for this FBX root",
+                    }
+                )
+            fallback_reason = "unmatched_orphan_roots_to_true_root"
 
     report = {
         "blend": bpy.data.filepath,
@@ -1512,6 +1829,8 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
         "roots_before": len(roots_before),
         "root_names_before": roots_before[:100],
         "true_root": true_root,
+        "requested_true_root": requested_true_root,
+        "true_root_source": true_root_source,
         "orphan_start_roots": len(orphan_roots),
         "base_ref_records": len(records),
         "mapping_count": len(mapping),
@@ -1522,6 +1841,10 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
         "problems": problems[:80],
         "mapping": mapping,
         "details_sample": details[:30],
+        "fallback_reason": fallback_reason,
+        "fallback_mapping_count": sum(
+            1 for detail in details if str(detail.get("method", "")).startswith("fallback_")
+        ),
         "applied": False,
     }
 
@@ -1530,7 +1853,7 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
     # contain extra BaseRef records that do not correspond to remaining orphan
     # roots; those are still reported as problems, but should not stop the
     # export structure when every orphan root has a parent mapping.
-    blocked = strict and (len(mapping) != len(orphan_roots) or spm_issues)
+    blocked = strict and len(mapping) != len(orphan_roots)
     if blocked:
         report["status"] = "blocked"
         report["error"] = "Reparent mapping was not complete; no changes applied."
@@ -3230,6 +3553,9 @@ def run_import_and_repair(settings):
     imported = run_import_source_fbx(
         settings["source_fbx_path"],
         settings.get("source_collection_name", "SpeedTree_Source"),
+        rigid_fallback=True,
+        armature_name=settings.get("armature_name", "Root"),
+        true_root=settings.get("true_root", "Bone_1_Start"),
     )
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:
@@ -3241,5 +3567,9 @@ def run_import_and_repair(settings):
         "imported_mesh_count": imported.get("imported_mesh_count", 0),
         "imported_armature_count": imported.get("imported_armature_count", 0),
         "renamed_materials": imported.get("renamed_materials", []),
+        "rigid_fallback": imported.get("rigid_fallback"),
     }
+    pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
+    if pipeline_path:
+        write_report(pipeline_path, reports)
     return reports
