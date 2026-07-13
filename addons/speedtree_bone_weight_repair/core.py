@@ -309,6 +309,201 @@ def strip_speedtree_material_suffixes(objects, suffix="_Mat"):
     return renamed
 
 
+SPEEDTREE_TEXTURE_ROLES = (
+    "color",
+    "normal",
+    "extra",
+    "height",
+    "opacity",
+    "subsurface",
+)
+SPEEDTREE_TEXTURE_EXTENSIONS = (".tga", ".png", ".tif", ".tiff", ".exr")
+
+
+def _speedtree_texture_set_key(value):
+    """Canonical comparison key shared by M_ materials and T_ output sets."""
+    value = re.sub(r"(\.\d{3})$", "", str(value or "").strip())
+    if value[:2].lower() in {"m_", "t_"}:
+        value = value[2:]
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _speedtree_texture_dir(source_fbx_path):
+    source = Path(source_fbx_path).resolve()
+    if source.parent.name.lower() == "fbx":
+        return source.parent.parent / "texture"
+    return source.parent / "texture"
+
+
+def _speedtree_texture_sets(texture_dir):
+    """Index only the managed top-level T_<set>_<role> batch outputs."""
+    texture_dir = Path(texture_dir)
+    indexed = defaultdict(lambda: {"bases": set(), "files": {}})
+    if not texture_dir.is_dir():
+        return indexed
+    role_pattern = "|".join(re.escape(role) for role in SPEEDTREE_TEXTURE_ROLES)
+    pattern = re.compile(rf"^(T_.+)_({role_pattern})$", re.IGNORECASE)
+    extension_rank = {
+        extension: index for index, extension in enumerate(SPEEDTREE_TEXTURE_EXTENSIONS)
+    }
+    for path in texture_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in extension_rank:
+            continue
+        match = pattern.match(path.stem)
+        if not match:
+            continue
+        texture_base, role = match.group(1), match.group(2).lower()
+        key = _speedtree_texture_set_key(texture_base)
+        row = indexed[key]
+        row["bases"].add(texture_base)
+        current = row["files"].get(role)
+        if current is None or extension_rank[path.suffix.lower()] < extension_rank[current.suffix.lower()]:
+            row["files"][role] = path
+    return indexed
+
+
+def _remove_speedtree_image_nodes(material):
+    removed_images = set()
+    if not material or not material.node_tree:
+        return removed_images
+    for node in list(material.node_tree.nodes):
+        if node.type != "TEX_IMAGE" or not node.image:
+            continue
+        removed_images.add(node.image.name)
+        material.node_tree.nodes.remove(node)
+    return removed_images
+
+
+def _load_speedtree_image(path, role):
+    image = bpy.data.images.load(str(path), check_existing=True)
+    image.name = path.stem
+    if role not in {"color", "subsurface"}:
+        try:
+            image.colorspace_settings.name = "Non-Color"
+        except TypeError:
+            pass
+    return image
+
+
+def _replace_speedtree_material_nodes(material, texture_files):
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    removed_images = _remove_speedtree_image_nodes(material)
+    for node in list(nodes):
+        if node.type == "NORMAL_MAP":
+            nodes.remove(node)
+
+    bsdf = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+    image_nodes = {}
+    for index, role in enumerate(SPEEDTREE_TEXTURE_ROLES):
+        path = texture_files[role]
+        node = nodes.new("ShaderNodeTexImage")
+        node.name = path.stem
+        node.label = path.stem
+        node.image = _load_speedtree_image(path, role)
+        node.location = (-720, 360 - index * 190)
+        image_nodes[role] = node
+
+    if bsdf is not None:
+        color_socket = bsdf.inputs.get("Base Color")
+        if color_socket is not None:
+            links.new(image_nodes["color"].outputs["Color"], color_socket)
+
+        normal_socket = bsdf.inputs.get("Normal")
+        if normal_socket is not None:
+            normal_map = nodes.new("ShaderNodeNormalMap")
+            normal_map.name = "SpeedTree T_ Normal"
+            normal_map.label = "SpeedTree T_ Normal"
+            normal_map.location = (-360, 120)
+            links.new(image_nodes["normal"].outputs["Color"], normal_map.inputs["Color"])
+            links.new(normal_map.outputs["Normal"], normal_socket)
+
+        alpha_socket = bsdf.inputs.get("Alpha")
+        if alpha_socket is not None:
+            links.new(image_nodes["opacity"].outputs["Color"], alpha_socket)
+
+    for image_name in removed_images:
+        image = bpy.data.images.get(image_name)
+        if image and image.users == 0:
+            bpy.data.images.remove(image)
+
+
+def normalize_speedtree_material_textures(objects):
+    """Replace SpeedTree FBX dummy images with PCG texture-batch T_ outputs.
+
+    Matching is material-set based (M_x -> T_x) and requires the complete six-map
+    output contract. Missing sets are reported and left without dummy image nodes
+    so a later Unreal push can fail cleanly instead of consuming FBX placeholders.
+    """
+    rows = []
+    removed_dummy_images = set()
+    for material in collect_object_materials(objects):
+        source_fbx = str(material.get("codex_source_fbx", "")).strip()
+        if not source_fbx:
+            continue
+        texture_dir = _speedtree_texture_dir(source_fbx)
+        indexed = _speedtree_texture_sets(texture_dir)
+        key = _speedtree_texture_set_key(material.name)
+        match = indexed.get(key)
+        material_base = re.sub(r"(\.\d{3})$", "", material.name)
+        if material_base[:2].lower() in {"m_", "t_"}:
+            material_base = material_base[2:]
+        expected_base = "T_" + material_base
+        missing_roles = list(SPEEDTREE_TEXTURE_ROLES)
+        texture_base = expected_base
+        texture_files = {}
+        ambiguity = []
+        if match:
+            ambiguity = sorted(match["bases"], key=str.casefold)
+            if len(ambiguity) == 1:
+                texture_base = ambiguity[0]
+                texture_files = dict(match["files"])
+                missing_roles = [
+                    role for role in SPEEDTREE_TEXTURE_ROLES if role not in texture_files
+                ]
+
+        if missing_roles or len(ambiguity) > 1:
+            removed_dummy_images.update(_remove_speedtree_image_nodes(material))
+            rows.append(
+                {
+                    "material": material.name,
+                    "texture_dir": str(texture_dir),
+                    "expected_texture_base": expected_base,
+                    "matched_texture_bases": ambiguity,
+                    "missing_roles": missing_roles,
+                    "status": "missing",
+                }
+            )
+            continue
+
+        _replace_speedtree_material_nodes(material, texture_files)
+        material["codex_speedtree_texture_base"] = texture_base
+        rows.append(
+            {
+                "material": material.name,
+                "texture_dir": str(texture_dir),
+                "texture_base": texture_base,
+                "files": {role: str(texture_files[role]) for role in SPEEDTREE_TEXTURE_ROLES},
+                "missing_roles": [],
+                "status": "ok",
+            }
+        )
+
+    for image_name in removed_dummy_images:
+        image = bpy.data.images.get(image_name)
+        if image and image.users == 0:
+            bpy.data.images.remove(image)
+
+    missing = [row for row in rows if row["status"] != "ok"]
+    return {
+        "status": "missing" if missing else "ok",
+        "materials": rows,
+        "missing": missing,
+        "material_count": len(rows),
+    }
+
+
 MATERIAL_GROUP_TOKENS = {"green", "twig", "twigs", "stem", "stems", "dead"}
 
 
@@ -536,6 +731,7 @@ def run_import_source_fbx(
     tag_speedtree_import_materials(imported, path)
     removed_phantoms = remove_phantom_image_nodes(imported)
     renamed_materials = strip_speedtree_material_suffixes(imported)
+    texture_normalization = normalize_speedtree_material_textures(imported)
     rigid_fallback_result = None
     if rigid_fallback:
         rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
@@ -556,6 +752,7 @@ def run_import_source_fbx(
         "applied_scales": applied_scales,
         "removed_phantom_texture_nodes": removed_phantoms,
         "renamed_materials": renamed_materials,
+        "texture_normalization": texture_normalization,
         "rigid_fallback": rigid_fallback_result,
     }
 
@@ -3351,6 +3548,16 @@ def run_full_pipeline(settings):
         reports["steps"].append(
             {"name": "normalize_material_names", "status": "applied", "renamed": renamed_materials}
         )
+
+    texture_normalization = normalize_speedtree_material_textures(source_import_meshes)
+    reports["texture_normalization"] = texture_normalization
+    reports["steps"].append(
+        {
+            "name": "normalize_speedtree_material_textures",
+            "status": texture_normalization.get("status", "missing"),
+            "materials": texture_normalization.get("materials", []),
+        }
+    )
 
     removed_phantoms = remove_phantom_image_nodes(bpy.context.scene.objects)
     if removed_phantoms:
