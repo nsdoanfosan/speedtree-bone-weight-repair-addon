@@ -279,6 +279,24 @@ def tag_speedtree_import_materials(objects, source_fbx_path):
         material["codex_source_fbx"] = str(source_fbx_path)
 
 
+def normalized_source_fbx_path(value):
+    if not value:
+        return ""
+    return os.path.normcase(
+        os.path.normpath(os.path.abspath(os.path.expanduser(str(value))))
+    )
+
+
+def belongs_to_source_fbx(datablock, source_fbx_path):
+    if datablock is None:
+        return False
+    tagged_path = datablock.get("codex_source_fbx", "")
+    return bool(tagged_path) and (
+        normalized_source_fbx_path(tagged_path)
+        == normalized_source_fbx_path(source_fbx_path)
+    )
+
+
 def tag_existing_source_materials(objects):
     for obj in objects:
         source_fbx = obj.get("codex_source_fbx", "") if obj else ""
@@ -3272,7 +3290,15 @@ def get_or_create_export_empty(name, collection, excluded=()):
     return empty, renamed_conflict
 
 
-def structure_export_unit(armature, merged_obj, unit_name, mesh_unit_name, collection_name="Export", source_collection_name="SpeedTree_Source"):
+def structure_export_unit(
+    armature,
+    merged_obj,
+    unit_name,
+    mesh_unit_name,
+    collection_name="Export",
+    source_collection_name="SpeedTree_Source",
+    source_fbx_path="",
+):
     # Build the final Blender export unit:
     #   Export collection > Root armature > Empty (source mesh name,
     #   e.g. SK_Tree_elm_01) > merged mesh.
@@ -3290,6 +3316,8 @@ def structure_export_unit(armature, merged_obj, unit_name, mesh_unit_name, colle
     mesh_unit_empty, renamed = get_or_create_export_empty(mesh_unit_name, coll, excluded=(armature, merged_obj))
     if renamed:
         renamed_conflicts.append({"requested": mesh_unit_name, "renamed_to": renamed})
+    if source_fbx_path:
+        mesh_unit_empty["codex_source_fbx"] = str(source_fbx_path)
 
     if armature.parent is not None:
         parent_keep_world(armature, None)
@@ -3308,14 +3336,19 @@ def structure_export_unit(armature, merged_obj, unit_name, mesh_unit_name, colle
     for obj in (armature, mesh_unit_empty, merged_obj):
         ensure_only_collection(obj, coll)
 
-    # send2ue exports one FBX per unit it finds in the Export collection, so
-    # sweep everything that is not part of this unit out of it: stale childless
-    # empties from earlier runs are deleted, all other strays move to the
-    # source collection.
+    # Send2UE may intentionally contain several export units. Only stale items
+    # owned by this source FBX are eligible for cleanup; unrelated/user-managed
+    # Export contents must remain untouched.
     unit_members = {armature, mesh_unit_empty, merged_obj}
     swept_to_source = []
     deleted_stale_empties = []
-    strays = [obj for obj in list(coll.objects) if obj not in unit_members]
+    strays = [
+        obj
+        for obj in list(coll.objects)
+        if obj not in unit_members
+        and source_fbx_path
+        and belongs_to_source_fbx(obj, source_fbx_path)
+    ]
     for obj in strays:
         if obj.type == "EMPTY" and not obj.children:
             deleted_stale_empties.append(obj.name)
@@ -3412,6 +3445,7 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
             mesh_unit_name,
             settings.get("export_collection_name", "Export"),
             settings.get("source_collection_name", "SpeedTree_Source"),
+            source_fbx,
         )
 
     if fbx_path:
@@ -3532,10 +3566,15 @@ def run_full_pipeline(settings):
     reports = {"paths": paths, "steps": [], "saved_blends": []}
     save_stage_blends = settings.get("save_intermediate_blends", False)
 
+    source_fbx_path = settings.get("source_fbx_path", "")
     source_import_objects = [
         obj
         for obj in bpy.context.scene.objects
-        if "codex_source_fbx" in obj
+        if (
+            belongs_to_source_fbx(obj, source_fbx_path)
+            if source_fbx_path
+            else "codex_source_fbx" in obj
+        )
     ]
     applied_scales = apply_object_scales(source_import_objects)
     if applied_scales:
@@ -3696,30 +3735,49 @@ def clear_previous_codex_build(settings):
     if bpy.context.scene.get(JSON_PREVIEW_SCENE_KEY):
         restore_json_group_preview()
 
+    source_fbx_path = settings.get("source_fbx_path", "")
+    target_merged_name = default_paths(settings)["merged_name"]
     doomed = [
         obj
         for obj in list(bpy.data.objects)
-        if "codex_source_fbx" in obj or is_codex_merged_output_name(obj.name)
+        if (
+            belongs_to_source_fbx(obj, source_fbx_path)
+            if source_fbx_path
+            else (
+                "codex_source_fbx" in obj
+                or is_codex_merged_output_name(obj.name)
+            )
+        )
+        or obj.name == target_merged_name
     ]
     candidate_materials = collect_object_materials(doomed)
     removed_objects = [obj.name for obj in doomed]
     for obj in doomed:
         remove_object_and_orphan_data(obj)
 
-    # Sweep now-childless empties left behind in the Export collection (the
-    # source-mesh unit Empty is not id-tagged, so remove it once it is empty).
+    # Remove only childless unit empties owned by this source. The exact source
+    # stem is included as a compatibility cleanup for units made before the
+    # ownership tag was added.
     removed_empties = []
     export_collection = bpy.data.collections.get(settings.get("export_collection_name", "Export"))
+    legacy_unit_name = Path(source_fbx_path).stem if source_fbx_path else ""
     if export_collection:
         for obj in list(export_collection.objects):
-            if obj.type == "EMPTY" and not obj.children:
+            owned_empty = belongs_to_source_fbx(obj, source_fbx_path)
+            legacy_empty = bool(legacy_unit_name) and obj.name == legacy_unit_name
+            if obj.type == "EMPTY" and not obj.children and (owned_empty or legacy_empty):
                 removed_empties.append(obj.name)
                 bpy.data.objects.remove(obj, do_unlink=True)
 
     tagged_orphan_materials = [
         material
         for material in bpy.data.materials
-        if "codex_source_fbx" in material and material.users == 0
+        if material.users == 0
+        and (
+            belongs_to_source_fbx(material, source_fbx_path)
+            if source_fbx_path
+            else "codex_source_fbx" in material
+        )
     ]
     removed_materials = []
     seen_material_names = set()
@@ -3736,12 +3794,6 @@ def clear_previous_codex_build(settings):
         seen_material_names.add(material_name)
         removed_materials.append(material_name)
         bpy.data.materials.remove(material)
-
-    # Purge any data blocks the object removals orphaned.
-    for datablocks in (bpy.data.meshes, bpy.data.armatures):
-        for block in list(datablocks):
-            if block.users == 0:
-                datablocks.remove(block)
 
     return {
         "removed_objects": removed_objects,
