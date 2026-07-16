@@ -652,7 +652,8 @@ def normalize_speedtree_material_textures(objects):
                 missing_roles = best_attempt["missing_roles"]
 
         if missing_roles or len(ambiguity) > 1:
-            removed_dummy_images.update(_remove_speedtree_image_nodes(material))
+            removed = _remove_speedtree_image_nodes(material)
+            removed_dummy_images.update(removed)
             rows.append(
                 {
                     "material": material.name,
@@ -663,12 +664,27 @@ def normalize_speedtree_material_textures(objects):
                     "matched_texture_bases": ambiguity,
                     "missing_roles": missing_roles,
                     "status": "missing",
+                    "changed": bool(removed),
                 }
             )
             continue
 
-        _replace_speedtree_material_nodes(material, texture_files)
-        material["codex_speedtree_texture_base"] = texture_base
+        # Verified large blends get re-saved on every push if we rebuild the
+        # node tree unconditionally; skip materials already wired to exactly
+        # this texture set so callers can tell nothing was mutated.
+        target_paths = set()
+        for role in SPEEDTREE_TEXTURE_ROLES:
+            try:
+                target_paths.add(str(Path(texture_files[role]).resolve()).lower())
+            except (OSError, ValueError):
+                target_paths.add(str(texture_files[role]).lower())
+        already_normalized = (
+            str(material.get("codex_speedtree_texture_base", "")) == texture_base
+            and material_texture_signature(material) == tuple(sorted(target_paths))
+        )
+        if not already_normalized:
+            _replace_speedtree_material_nodes(material, texture_files)
+            material["codex_speedtree_texture_base"] = texture_base
         rows.append(
             {
                 "material": material.name,
@@ -678,6 +694,7 @@ def normalize_speedtree_material_textures(objects):
                 "files": {role: str(texture_files[role]) for role in SPEEDTREE_TEXTURE_ROLES},
                 "missing_roles": [],
                 "status": "ok",
+                "changed": not already_normalized,
             }
         )
 
@@ -692,6 +709,7 @@ def normalize_speedtree_material_textures(objects):
         "materials": rows,
         "missing": missing,
         "material_count": len(rows),
+        "changed_count": sum(1 for row in rows if row.get("changed")),
     }
 
 
