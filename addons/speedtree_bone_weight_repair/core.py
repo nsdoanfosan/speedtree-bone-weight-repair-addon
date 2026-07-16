@@ -353,6 +353,146 @@ def _speedtree_texture_dir(source_fbx_path):
     return source.parent / "texture"
 
 
+def _speedtree_asset_root(source_fbx_path):
+    source = Path(source_fbx_path).resolve()
+    return source.parent.parent if source.parent.name.lower() == "fbx" else source.parent
+
+
+def _speedtree_material_name_key(value):
+    value = re.sub(r"(\.\d{3})$", "", str(value or "").strip())
+    if value.lower().endswith("_mat"):
+        value = value[:-4]
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _speedtree_stmat_materials(source_fbx_path):
+    """Read authoritative material provenance from SpeedTree's FBX sidecar."""
+    stmat_path = Path(source_fbx_path).resolve().with_suffix(".stmat")
+    result = {"path": str(stmat_path), "materials": {}, "error": ""}
+    if not stmat_path.is_file():
+        return result
+    try:
+        root = ET.parse(stmat_path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        result["error"] = str(exc)
+        return result
+
+    for node in root.findall(".//Material"):
+        name = str(node.attrib.get("Name") or "").strip()
+        if not name:
+            continue
+        source_paths = []
+        for map_node in node.findall("./Map"):
+            source = str(map_node.attrib.get("Source") or "").strip()
+            if source:
+                source_paths.append(source)
+        user_data = {}
+        raw_user_data = str(node.attrib.get("UserData") or "").strip()
+        if raw_user_data:
+            try:
+                parsed = json.loads(raw_user_data)
+                if isinstance(parsed, dict):
+                    user_data = parsed
+            except json.JSONDecodeError:
+                pass
+        result["materials"][_speedtree_material_name_key(name)] = {
+            "name": name,
+            "source_paths": source_paths,
+            "user_data": user_data,
+        }
+    return result
+
+
+def _speedtree_manifest_paths(source_fbx_path, stmat_material=None):
+    root = _speedtree_asset_root(source_fbx_path)
+    paths = []
+    user_data = (stmat_material or {}).get("user_data") or {}
+    scope = str(user_data.get("scope") or "").strip()
+    if scope:
+        safe_scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "AtlasLeaf"
+        paths.append(root / ".atlas_leaf_speedtree_scopes" / f"{safe_scope}.json")
+    paths.append(root / "speedtree_import_manifest.json")
+    unique = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(str(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _load_speedtree_import_manifest(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, manifest_cache=None):
+    """Resolve an intermediate atlas group material to its final atlas material."""
+    stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
+    manifest_cache = manifest_cache if manifest_cache is not None else {}
+    material_key = _speedtree_material_name_key(material.name)
+    stmat_material = stmat_data.get("materials", {}).get(material_key, {})
+    stmat_scope = str((stmat_material.get("user_data") or {}).get("scope") or "").strip()
+
+    for manifest_path in _speedtree_manifest_paths(source_fbx_path, stmat_material):
+        cache_key = os.path.normcase(str(manifest_path))
+        if cache_key not in manifest_cache:
+            manifest_cache[cache_key] = _load_speedtree_import_manifest(manifest_path)
+        manifest = manifest_cache[cache_key]
+        if not manifest:
+            continue
+        manifest_scope = str(manifest.get("export_scope_id") or "").strip()
+        if stmat_scope and manifest_scope and stmat_scope != manifest_scope:
+            continue
+        # A one-group export already has its final material name. Multi-group
+        # atlases intentionally set ``material`` to null and collapse back to
+        # the source collection name during repair.
+        target_name = str(manifest.get("material") or manifest.get("source_collection") or "").strip()
+        if not target_name:
+            continue
+        for group in manifest.get("material_groups") or []:
+            if _speedtree_material_name_key(group.get("material")) != material_key:
+                continue
+            if _speedtree_material_name_key(target_name) == material_key:
+                return None
+            return {
+                "target_name": target_name,
+                "manifest_path": str(manifest_path),
+                "export_scope_id": manifest_scope,
+                "group": str(group.get("collection") or ""),
+            }
+    return None
+
+
+def _speedtree_material_texture_dirs(source_fbx_path, material, stmat_data=None):
+    """Return managed texture locations, including shared paths recorded by SpeedTree."""
+    paths = [_speedtree_texture_dir(source_fbx_path)]
+    stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
+    stmat_material = stmat_data.get("materials", {}).get(
+        _speedtree_material_name_key(material.name), {}
+    )
+    for source in stmat_material.get("source_paths", []):
+        try:
+            paths.append(Path(source).expanduser().resolve().parent)
+        except (OSError, ValueError):
+            continue
+    unique = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(str(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
 def _speedtree_texture_sets(texture_dir):
     """Index only the managed top-level T_<set>_<role> batch outputs."""
     texture_dir = Path(texture_dir)
@@ -456,14 +596,19 @@ def normalize_speedtree_material_textures(objects):
     """
     rows = []
     removed_dummy_images = set()
+    stmat_cache = {}
+    texture_index_cache = {}
     for material in collect_object_materials(objects):
         source_fbx = str(material.get("codex_source_fbx", "")).strip()
         if not source_fbx:
             continue
-        texture_dir = _speedtree_texture_dir(source_fbx)
-        indexed = _speedtree_texture_sets(texture_dir)
+        source_key = normalized_source_fbx_path(source_fbx)
+        if source_key not in stmat_cache:
+            stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
+        texture_dirs = _speedtree_material_texture_dirs(
+            source_fbx, material, stmat_cache[source_key]
+        )
         key = _speedtree_texture_set_key(material.name)
-        match = indexed.get(key)
         material_base = re.sub(r"(\.\d{3})$", "", material.name)
         if material_base[:2].lower() in {"m_", "t_"}:
             material_base = material_base[2:]
@@ -472,14 +617,39 @@ def normalize_speedtree_material_textures(objects):
         texture_base = expected_base
         texture_files = {}
         ambiguity = []
-        if match:
-            ambiguity = sorted(match["bases"], key=str.casefold)
-            if len(ambiguity) == 1:
-                texture_base = ambiguity[0]
-                texture_files = dict(match["files"])
-                missing_roles = [
-                    role for role in SPEEDTREE_TEXTURE_ROLES if role not in texture_files
-                ]
+        texture_dir = texture_dirs[0] if texture_dirs else _speedtree_texture_dir(source_fbx)
+        attempts = []
+        best_attempt = None
+        for candidate_dir in texture_dirs:
+            cache_key = os.path.normcase(str(candidate_dir))
+            if cache_key not in texture_index_cache:
+                texture_index_cache[cache_key] = _speedtree_texture_sets(candidate_dir)
+            match = texture_index_cache[cache_key].get(key)
+            candidate_bases = sorted(match["bases"], key=str.casefold) if match else []
+            candidate_files = dict(match["files"]) if match and len(candidate_bases) == 1 else {}
+            candidate_missing = [
+                role for role in SPEEDTREE_TEXTURE_ROLES if role not in candidate_files
+            ]
+            attempt = {
+                "texture_dir": str(candidate_dir),
+                "matched_texture_bases": candidate_bases,
+                "missing_roles": candidate_missing,
+            }
+            attempts.append(attempt)
+            if best_attempt is None or len(candidate_missing) < len(best_attempt["missing_roles"]):
+                best_attempt = attempt
+            if len(candidate_bases) == 1 and not candidate_missing:
+                texture_dir = candidate_dir
+                texture_base = candidate_bases[0]
+                texture_files = candidate_files
+                missing_roles = []
+                ambiguity = candidate_bases
+                break
+        else:
+            if best_attempt:
+                texture_dir = Path(best_attempt["texture_dir"])
+                ambiguity = best_attempt["matched_texture_bases"]
+                missing_roles = best_attempt["missing_roles"]
 
         if missing_roles or len(ambiguity) > 1:
             removed_dummy_images.update(_remove_speedtree_image_nodes(material))
@@ -487,6 +657,8 @@ def normalize_speedtree_material_textures(objects):
                 {
                     "material": material.name,
                     "texture_dir": str(texture_dir),
+                    "texture_dirs": [str(path) for path in texture_dirs],
+                    "texture_attempts": attempts,
                     "expected_texture_base": expected_base,
                     "matched_texture_bases": ambiguity,
                     "missing_roles": missing_roles,
@@ -501,6 +673,7 @@ def normalize_speedtree_material_textures(objects):
             {
                 "material": material.name,
                 "texture_dir": str(texture_dir),
+                "texture_dirs": [str(path) for path in texture_dirs],
                 "texture_base": texture_base,
                 "files": {role: str(texture_files[role]) for role in SPEEDTREE_TEXTURE_ROLES},
                 "missing_roles": [],
@@ -522,7 +695,7 @@ def normalize_speedtree_material_textures(objects):
     }
 
 
-MATERIAL_GROUP_TOKENS = {"green", "twig", "twigs", "stem", "stems", "dead"}
+MATERIAL_GROUP_TOKENS = {"green", "yellow", "twig", "twigs", "stem", "stems", "dead"}
 
 
 def material_name_tokens(name):
@@ -583,6 +756,174 @@ def remap_mesh_materials(mesh, slot_map, new_materials):
     mesh.update()
 
 
+def _consolidate_speedtree_manifest_materials(mesh_objects):
+    """Collapse Atlas Leaf Mesh Builder groups using its persisted manifest contract."""
+    stmat_cache = {}
+    manifest_cache = {}
+    target_texture_cache = {}
+    bindings = {}
+    grouped = defaultdict(list)
+
+    for obj in mesh_objects:
+        for material in obj.data.materials:
+            if material is None or material in bindings:
+                continue
+            source_fbx = str(material.get("codex_source_fbx", "")).strip()
+            if not source_fbx:
+                bindings[material] = None
+                continue
+            source_key = normalized_source_fbx_path(source_fbx)
+            if source_key not in stmat_cache:
+                stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
+            binding = _speedtree_manifest_binding(
+                source_fbx,
+                material,
+                stmat_data=stmat_cache[source_key],
+                manifest_cache=manifest_cache,
+            )
+            if binding:
+                target_key = _speedtree_texture_set_key(binding["target_name"])
+                texture_cache_key = (source_key, target_key)
+                if texture_cache_key not in target_texture_cache:
+                    target_match = _speedtree_texture_sets(
+                        _speedtree_texture_dir(source_fbx)
+                    ).get(target_key)
+                    target_texture_cache[texture_cache_key] = bool(
+                        target_match
+                        and len(target_match["bases"]) == 1
+                        and all(
+                            role in target_match["files"]
+                            for role in SPEEDTREE_TEXTURE_ROLES
+                        )
+                    )
+                # The manifest describes the intended atlas relationship, but
+                # older assets may still only have group-specific T_ outputs.
+                # Do not create a new missing set by renaming those materials.
+                if not target_texture_cache[texture_cache_key]:
+                    binding = None
+            bindings[material] = binding
+            if binding:
+                group_key = (
+                    source_key,
+                    binding["target_name"],
+                    binding["manifest_path"],
+                    binding.get("export_scope_id", ""),
+                )
+                grouped[group_key].append(material)
+
+    if not grouped:
+        return {"groups": [], "changed_object_count": 0, "changed_face_count": 0}
+
+    target_materials = {}
+    material_targets = {}
+    group_stats = {}
+    source_material_pool = collect_object_materials(mesh_objects)
+    target_material_pool = list(source_material_pool)
+    target_material_pool.extend(
+        material for material in bpy.data.materials if material not in target_material_pool
+    )
+    for group_key, source_materials in grouped.items():
+        source_key, target_name, manifest_path, export_scope_id = group_key
+        unique_sources = []
+        seen = set()
+        for material in source_materials:
+            if material.name not in seen:
+                seen.add(material.name)
+                unique_sources.append(material)
+
+        target_material = next(
+            (
+                material
+                for material in target_material_pool
+                if _speedtree_material_name_key(material.name)
+                == _speedtree_material_name_key(target_name)
+                and normalized_source_fbx_path(material.get("codex_source_fbx", "")) == source_key
+            ),
+            None,
+        )
+        if target_material is None:
+            target_material = unique_sources[0].copy()
+            target_material.name = target_name
+        target_material["codex_source_fbx"] = str(unique_sources[0].get("codex_source_fbx", ""))
+        target_material["codex_speedtree_consolidated_from"] = [
+            material.name for material in unique_sources
+        ]
+        target_material["codex_speedtree_import_manifest"] = manifest_path
+        if export_scope_id:
+            target_material["codex_speedtree_export_scope_id"] = export_scope_id
+        target_materials[group_key] = target_material
+        for material in unique_sources:
+            material_targets[material] = (group_key, target_material)
+        group_stats[group_key] = {
+            "objects": set(),
+            "changed_faces": 0,
+            "source_materials": [material.name for material in unique_sources],
+            "groups": sorted(
+                {
+                    bindings[material].get("group", "")
+                    for material in unique_sources
+                    if bindings.get(material)
+                }
+                - {""}
+            ),
+        }
+
+    for obj in mesh_objects:
+        old_materials = list(obj.data.materials)
+        if not any(material in material_targets for material in old_materials if material):
+            continue
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        mesh = obj.data
+        old_materials = list(mesh.materials)
+        slot_map = {}
+        new_materials = []
+        new_indices = {}
+        slot_groups = {}
+        for old_index, material in enumerate(old_materials):
+            group_target = material_targets.get(material)
+            replacement = group_target[1] if group_target else material
+            if replacement is None:
+                slot_map[old_index] = 0
+                continue
+            replacement_key = replacement.name
+            if replacement_key not in new_indices:
+                new_indices[replacement_key] = len(new_materials)
+                new_materials.append(replacement)
+            slot_map[old_index] = new_indices[replacement_key]
+            if group_target:
+                slot_groups[old_index] = group_target[0]
+                group_stats[group_target[0]]["objects"].add(obj.name)
+        for poly in mesh.polygons:
+            group_key = slot_groups.get(poly.material_index)
+            if group_key:
+                group_stats[group_key]["changed_faces"] += 1
+        remap_mesh_materials(mesh, slot_map, new_materials)
+
+    reports = []
+    for group_key, target_material in target_materials.items():
+        _source_key, _target_name, manifest_path, export_scope_id = group_key
+        stats = group_stats[group_key]
+        reports.append(
+            {
+                "mode": "speedtree_import_manifest",
+                "target_material": target_material.name,
+                "source_materials": stats["source_materials"],
+                "group_tokens": stats["groups"],
+                "manifest": manifest_path,
+                "export_scope_id": export_scope_id,
+                "object_count": len(stats["objects"]),
+                "objects": sorted(stats["objects"])[:200],
+                "changed_faces": stats["changed_faces"],
+            }
+        )
+    return {
+        "groups": reports,
+        "changed_object_count": sum(group["object_count"] for group in reports),
+        "changed_face_count": sum(group["changed_faces"] for group in reports),
+    }
+
+
 def consolidate_speedtree_group_materials(objects):
     # SpeedTree FBX grouped by material can come back as Green/Twig/Stem slots
     # even when they are all the same atlas texture. Collapse those slots before
@@ -590,6 +931,8 @@ def consolidate_speedtree_group_materials(objects):
     mesh_objects = [obj for obj in objects if obj.type == "MESH" and obj.data]
     if not mesh_objects:
         return {"status": "skipped", "reason": "no mesh objects", "groups": []}
+
+    manifest_result = _consolidate_speedtree_manifest_materials(mesh_objects)
 
     grouped = defaultdict(list)
     for obj in mesh_objects:
@@ -662,6 +1005,7 @@ def consolidate_speedtree_group_materials(objects):
 
         reports.append(
             {
+                "mode": "name_tokens",
                 "target_material": target_material.name,
                 "source_materials": [material.name for material in source_materials],
                 "group_tokens": group_tokens,
@@ -673,11 +1017,18 @@ def consolidate_speedtree_group_materials(objects):
             }
         )
 
+    all_reports = list(manifest_result["groups"]) + reports
     return {
-        "status": "applied" if reports else "skipped",
-        "groups": reports,
-        "changed_object_count": sum(group["object_count"] for group in reports),
-        "changed_face_count": sum(group["changed_faces"] for group in reports),
+        "status": "applied" if all_reports else "skipped",
+        "groups": all_reports,
+        "changed_object_count": (
+            manifest_result["changed_object_count"]
+            + sum(group["object_count"] for group in reports)
+        ),
+        "changed_face_count": (
+            manifest_result["changed_face_count"]
+            + sum(group["changed_faces"] for group in reports)
+        ),
     }
 
 
@@ -747,9 +1098,10 @@ def run_import_source_fbx(
         obj["codex_source_fbx"] = str(path)
         ensure_only_collection(obj, source_collection)
     tag_speedtree_import_materials(imported, path)
-    removed_phantoms = remove_phantom_image_nodes(imported)
     renamed_materials = strip_speedtree_material_suffixes(imported)
+    material_consolidation = consolidate_speedtree_group_materials(imported)
     texture_normalization = normalize_speedtree_material_textures(imported)
+    removed_phantoms = remove_phantom_image_nodes(imported)
     rigid_fallback_result = None
     if rigid_fallback:
         rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
@@ -770,6 +1122,7 @@ def run_import_source_fbx(
         "applied_scales": applied_scales,
         "removed_phantom_texture_nodes": removed_phantoms,
         "renamed_materials": renamed_materials,
+        "material_consolidation": material_consolidation,
         "texture_normalization": texture_normalization,
         "rigid_fallback": rigid_fallback_result,
     }
@@ -3588,6 +3941,17 @@ def run_full_pipeline(settings):
             {"name": "normalize_material_names", "status": "applied", "renamed": renamed_materials}
         )
 
+    material_consolidation = consolidate_speedtree_group_materials(source_import_meshes)
+    reports["steps"].append(
+        {
+            "name": "consolidate_speedtree_group_materials",
+            "status": material_consolidation.get("status", "skipped"),
+            "changed_object_count": material_consolidation.get("changed_object_count", 0),
+            "changed_face_count": material_consolidation.get("changed_face_count", 0),
+            "groups": material_consolidation.get("groups", []),
+        }
+    )
+
     texture_normalization = normalize_speedtree_material_textures(source_import_meshes)
     reports["texture_normalization"] = texture_normalization
     reports["steps"].append(
@@ -3602,18 +3966,6 @@ def run_full_pipeline(settings):
     if removed_phantoms:
         reports["steps"].append(
             {"name": "remove_phantom_texture_nodes", "status": "applied", "removed": removed_phantoms}
-        )
-
-    material_consolidation = consolidate_speedtree_group_materials(source_import_meshes)
-    if material_consolidation.get("status") == "applied":
-        reports["steps"].append(
-            {
-                "name": "consolidate_speedtree_group_materials",
-                "status": "applied",
-                "changed_object_count": material_consolidation.get("changed_object_count", 0),
-                "changed_face_count": material_consolidation.get("changed_face_count", 0),
-                "groups": material_consolidation.get("groups", []),
-            }
         )
 
     def stage_save(path):
@@ -3826,6 +4178,7 @@ def run_import_and_repair(settings):
         "imported_mesh_count": imported.get("imported_mesh_count", 0),
         "imported_armature_count": imported.get("imported_armature_count", 0),
         "renamed_materials": imported.get("renamed_materials", []),
+        "material_consolidation": imported.get("material_consolidation", {}),
         "rigid_fallback": imported.get("rigid_fallback"),
     }
     pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
