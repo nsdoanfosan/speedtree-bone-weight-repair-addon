@@ -4,7 +4,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -13,6 +12,8 @@ from pathlib import Path
 import bpy
 import numpy as np
 from mathutils import Vector, kdtree
+
+from . import speedtree_cli
 
 # Parked 3D Branch Cluster prototype.
 # The active add-on no longer imports/registers this path. Keep the separate
@@ -178,42 +179,14 @@ def run_speedtree_cli_export(
             raise RuntimeError(f"SpeedTree {kind.upper()} export options INI does not exist: {options}")
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            str(exe),
-            str(spm),
-            "-export_options",
-            str(options),
-            "-export",
-            str(target),
-        ]
-        started = utc_timestamp()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(spm.parent),
-                timeout=timeout_seconds,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"SpeedTree {kind.upper()} export timed out after {timeout_seconds} seconds.") from exc
-        results[kind] = {
-            "path": str(target),
-            "export_options": str(options),
-            "exists": target.exists(),
-            "size": target.stat().st_size if target.exists() else 0,
-            "returncode": completed.returncode,
-            "started": started,
-            "finished": utc_timestamp(),
-            "stdout": completed.stdout[-4000:],
-            "stderr": completed.stderr[-4000:],
-        }
-        if completed.returncode != 0:
-            raise RuntimeError(
-                f"SpeedTree {kind.upper()} export failed with code {completed.returncode}: {completed.stderr[-1000:]}"
-            )
-        if not target.exists() or target.stat().st_size == 0:
-            raise RuntimeError(f"SpeedTree {kind.upper()} export finished but did not create a valid file: {target}")
+        results[kind] = speedtree_cli.export_target(
+            exe=exe,
+            spm=spm,
+            options=options,
+            kind=kind,
+            target=target,
+            timeout_seconds=timeout_seconds,
+        )
 
     return {
         "speedtree_exe": str(exe),
@@ -223,6 +196,7 @@ def run_speedtree_cli_export(
         "name_stem": stem,
         "spm_has_enabled_bones": has_enabled_bones,
         "spm_bone_generators": bone_status,
+        "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "exports": results,
     }
 
@@ -336,6 +310,7 @@ SPEEDTREE_TEXTURE_ROLES = (
     "subsurface",
 )
 SPEEDTREE_TEXTURE_EXTENSIONS = (".tga", ".png", ".tif", ".tiff", ".exr")
+SPEEDTREE_CLUSTER_REQUIRED_MAPS = {"color", "opacity", "normal"}
 
 
 def _speedtree_texture_set_key(value):
@@ -382,10 +357,14 @@ def _speedtree_stmat_materials(source_fbx_path):
         if not name:
             continue
         source_paths = []
+        source_maps = {}
         for map_node in node.findall("./Map"):
             source = str(map_node.attrib.get("Source") or "").strip()
             if source:
                 source_paths.append(source)
+                map_name = str(map_node.attrib.get("Name") or "").strip().lower()
+                if map_name:
+                    source_maps[map_name] = source
         user_data = {}
         raw_user_data = str(node.attrib.get("UserData") or "").strip()
         if raw_user_data:
@@ -398,9 +377,87 @@ def _speedtree_stmat_materials(source_fbx_path):
         result["materials"][_speedtree_material_name_key(name)] = {
             "name": name,
             "source_paths": source_paths,
+            "source_maps": source_maps,
             "user_data": user_data,
         }
     return result
+
+
+def _resolved_speedtree_source_path(source_fbx_path, value):
+    path = Path(str(value or "")).expanduser()
+    if not path.is_absolute():
+        path = Path(source_fbx_path).resolve().parent / path
+    return path.resolve()
+
+
+def _path_is_under(path, root):
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _speedtree_preserved_cluster_sources(source_fbx_path, material, stmat_data=None):
+    """Return verified original Cluster maps for a PCG-preserved material.
+
+    PCG deliberately keeps authoritative SpeedTree Cluster render slots instead
+    of manufacturing a canonical T_ six-map set for them.  Accept that contract
+    only when STMAT proves every source-bearing map belongs to this asset's
+    Cluster directory, the essential Color/Opacity/Normal roles are present,
+    and every declared source file still exists.
+    """
+    stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
+    stmat_material = stmat_data.get("materials", {}).get(
+        _speedtree_material_name_key(material.name), {}
+    )
+    source_maps = stmat_material.get("source_maps") or {}
+    if not SPEEDTREE_CLUSTER_REQUIRED_MAPS.issubset(source_maps):
+        return None
+
+    cluster_root = _speedtree_asset_root(source_fbx_path) / "cluster"
+    source_paths = stmat_material.get("source_paths") or []
+    if not source_paths:
+        return None
+    for value in source_paths:
+        try:
+            path = _resolved_speedtree_source_path(source_fbx_path, value)
+        except (OSError, ValueError):
+            return None
+        try:
+            valid_source = (
+                _path_is_under(path, cluster_root)
+                and path.is_file()
+                and path.stat().st_size > 0
+            )
+        except OSError:
+            valid_source = False
+        if not valid_source:
+            return None
+
+    resolved = {}
+    for map_name, value in source_maps.items():
+        try:
+            path = _resolved_speedtree_source_path(source_fbx_path, value)
+        except (OSError, ValueError):
+            return None
+        try:
+            valid_source = (
+                _path_is_under(path, cluster_root)
+                and path.is_file()
+                and path.stat().st_size > 0
+            )
+        except OSError:
+            valid_source = False
+        if not valid_source:
+            return None
+        resolved[map_name] = str(path)
+    return {
+        "cluster_root": str(cluster_root.resolve()),
+        "source_maps": resolved,
+        "preserved_files": resolved,
+        "required_maps": sorted(SPEEDTREE_CLUSTER_REQUIRED_MAPS),
+    }
 
 
 def _speedtree_manifest_paths(source_fbx_path, stmat_material=None):
@@ -520,6 +577,109 @@ def _speedtree_texture_sets(texture_dir):
     return indexed
 
 
+def _speedtree_stmat_texture_set(source_fbx_path, material, stmat_data=None):
+    """Return one complete managed T_ set explicitly referenced by STMAT.
+
+    PCG can intentionally connect differently named SpeedTree materials to one
+    shared texture set.  In that case ``M_material -> T_material`` name matching
+    is not the contract: the exported STMAT source paths are.  Only accept an
+    unambiguous six-map T_ set whose files all still exist.
+    """
+    stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
+    stmat_material = stmat_data.get("materials", {}).get(
+        _speedtree_material_name_key(material.name), {}
+    )
+    role_pattern = "|".join(re.escape(role) for role in SPEEDTREE_TEXTURE_ROLES)
+    pattern = re.compile(rf"^(T_.+)_({role_pattern})$", re.IGNORECASE)
+    referenced = defaultdict(lambda: {"bases": set(), "roles": set()})
+    for source in stmat_material.get("source_paths", []):
+        try:
+            path = _resolved_speedtree_source_path(source_fbx_path, source)
+        except (OSError, ValueError):
+            continue
+        if path.suffix.lower() not in SPEEDTREE_TEXTURE_EXTENSIONS:
+            continue
+        match = pattern.match(path.stem)
+        if not match:
+            continue
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        texture_base, role = match.group(1), match.group(2).lower()
+        row = referenced[
+            (os.path.normcase(str(path.parent)), _speedtree_texture_set_key(texture_base))
+        ]
+        row["bases"].add(texture_base)
+        row["roles"].add(role)
+
+    complete = []
+    for (texture_dir, texture_key), row in referenced.items():
+        if len(row["bases"]) != 1:
+            continue
+        # SpeedTree 10.1 can omit Opacity from an FBX STMAT even when the SPM
+        # slot is connected. Color+Normal on one managed base are the durable
+        # anchors; the directory scan below must still prove all six files.
+        if not {"color", "normal"}.issubset(row["roles"]):
+            continue
+        match = _speedtree_texture_sets(texture_dir).get(texture_key)
+        if not match or len(match["bases"]) != 1:
+            continue
+        if not all(role in match["files"] for role in SPEEDTREE_TEXTURE_ROLES):
+            continue
+        complete.append(
+            {
+                "texture_dir": str(texture_dir),
+                "texture_base": next(iter(match["bases"])),
+                "files": {
+                    role: match["files"][role]
+                    for role in SPEEDTREE_TEXTURE_ROLES
+                },
+                "stmat_roles": sorted(row["roles"]),
+            }
+        )
+    return complete[0] if len(complete) == 1 else None
+
+
+def _complete_speedtree_texture_set(
+    material, target_name, stmat_cache=None, texture_index_cache=None
+):
+    """Find one complete canonical T_ set reachable from a tagged material."""
+    if material is None:
+        return None
+    source_fbx = str(material.get("codex_source_fbx", "")).strip()
+    if not source_fbx:
+        return None
+    stmat_cache = stmat_cache if stmat_cache is not None else {}
+    texture_index_cache = (
+        texture_index_cache if texture_index_cache is not None else {}
+    )
+    source_key = normalized_source_fbx_path(source_fbx)
+    if source_key not in stmat_cache:
+        stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
+    texture_key = _speedtree_texture_set_key(target_name)
+    for texture_dir in _speedtree_material_texture_dirs(
+        source_fbx, material, stmat_cache[source_key]
+    ):
+        cache_key = os.path.normcase(str(texture_dir))
+        if cache_key not in texture_index_cache:
+            texture_index_cache[cache_key] = _speedtree_texture_sets(texture_dir)
+        match = texture_index_cache[cache_key].get(texture_key)
+        if not match or len(match["bases"]) != 1:
+            continue
+        if not all(role in match["files"] for role in SPEEDTREE_TEXTURE_ROLES):
+            continue
+        return {
+            "texture_dir": str(texture_dir),
+            "texture_base": next(iter(match["bases"])),
+            "files": {
+                role: str(match["files"][role]) for role in SPEEDTREE_TEXTURE_ROLES
+            },
+        }
+    return None
+
+
 def _remove_speedtree_image_nodes(material):
     removed_images = set()
     if not material or not material.node_tree:
@@ -605,8 +765,12 @@ def normalize_speedtree_material_textures(objects):
         source_key = normalized_source_fbx_path(source_fbx)
         if source_key not in stmat_cache:
             stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
+        stmat_data = stmat_cache[source_key]
+        referenced_set = _speedtree_stmat_texture_set(
+            source_fbx, material, stmat_data
+        )
         texture_dirs = _speedtree_material_texture_dirs(
-            source_fbx, material, stmat_cache[source_key]
+            source_fbx, material, stmat_data
         )
         key = _speedtree_texture_set_key(material.name)
         material_base = re.sub(r"(\.\d{3})$", "", material.name)
@@ -620,38 +784,75 @@ def normalize_speedtree_material_textures(objects):
         texture_dir = texture_dirs[0] if texture_dirs else _speedtree_texture_dir(source_fbx)
         attempts = []
         best_attempt = None
-        for candidate_dir in texture_dirs:
-            cache_key = os.path.normcase(str(candidate_dir))
-            if cache_key not in texture_index_cache:
-                texture_index_cache[cache_key] = _speedtree_texture_sets(candidate_dir)
-            match = texture_index_cache[cache_key].get(key)
-            candidate_bases = sorted(match["bases"], key=str.casefold) if match else []
-            candidate_files = dict(match["files"]) if match and len(candidate_bases) == 1 else {}
-            candidate_missing = [
-                role for role in SPEEDTREE_TEXTURE_ROLES if role not in candidate_files
-            ]
-            attempt = {
-                "texture_dir": str(candidate_dir),
-                "matched_texture_bases": candidate_bases,
-                "missing_roles": candidate_missing,
-            }
-            attempts.append(attempt)
-            if best_attempt is None or len(candidate_missing) < len(best_attempt["missing_roles"]):
-                best_attempt = attempt
-            if len(candidate_bases) == 1 and not candidate_missing:
-                texture_dir = candidate_dir
-                texture_base = candidate_bases[0]
-                texture_files = candidate_files
-                missing_roles = []
-                ambiguity = candidate_bases
-                break
+        match_source = "material_name"
+        if referenced_set:
+            texture_dir = Path(referenced_set["texture_dir"])
+            texture_base = referenced_set["texture_base"]
+            texture_files = dict(referenced_set["files"])
+            missing_roles = []
+            ambiguity = [texture_base]
+            match_source = "stmat_reference"
+            attempts.append(
+                {
+                    "texture_dir": str(texture_dir),
+                    "matched_texture_bases": [texture_base],
+                    "missing_roles": [],
+                    "match_source": match_source,
+                }
+            )
         else:
-            if best_attempt:
-                texture_dir = Path(best_attempt["texture_dir"])
-                ambiguity = best_attempt["matched_texture_bases"]
-                missing_roles = best_attempt["missing_roles"]
+            for candidate_dir in texture_dirs:
+                cache_key = os.path.normcase(str(candidate_dir))
+                if cache_key not in texture_index_cache:
+                    texture_index_cache[cache_key] = _speedtree_texture_sets(candidate_dir)
+                match = texture_index_cache[cache_key].get(key)
+                candidate_bases = sorted(match["bases"], key=str.casefold) if match else []
+                candidate_files = dict(match["files"]) if match and len(candidate_bases) == 1 else {}
+                candidate_missing = [
+                    role for role in SPEEDTREE_TEXTURE_ROLES if role not in candidate_files
+                ]
+                attempt = {
+                    "texture_dir": str(candidate_dir),
+                    "matched_texture_bases": candidate_bases,
+                    "missing_roles": candidate_missing,
+                    "match_source": match_source,
+                }
+                attempts.append(attempt)
+                if best_attempt is None or len(candidate_missing) < len(best_attempt["missing_roles"]):
+                    best_attempt = attempt
+                if len(candidate_bases) == 1 and not candidate_missing:
+                    texture_dir = candidate_dir
+                    texture_base = candidate_bases[0]
+                    texture_files = candidate_files
+                    missing_roles = []
+                    ambiguity = candidate_bases
+                    break
+            else:
+                if best_attempt:
+                    texture_dir = Path(best_attempt["texture_dir"])
+                    ambiguity = best_attempt["matched_texture_bases"]
+                    missing_roles = best_attempt["missing_roles"]
 
         if missing_roles or len(ambiguity) > 1:
+            preserved_cluster = _speedtree_preserved_cluster_sources(
+                source_fbx, material, stmat_data
+            )
+            if preserved_cluster:
+                rows.append(
+                    {
+                        "material": material.name,
+                        "texture_dir": str(texture_dir),
+                        "texture_dirs": [str(path) for path in texture_dirs],
+                    "expected_texture_base": expected_base,
+                    "matched_texture_bases": ambiguity,
+                    "missing_roles": [],
+                    "match_source": match_source,
+                    "status": "preserved_cluster",
+                        "changed": False,
+                        **preserved_cluster,
+                    }
+                )
+                continue
             removed = _remove_speedtree_image_nodes(material)
             removed_dummy_images.update(removed)
             rows.append(
@@ -663,6 +864,7 @@ def normalize_speedtree_material_textures(objects):
                     "expected_texture_base": expected_base,
                     "matched_texture_bases": ambiguity,
                     "missing_roles": missing_roles,
+                    "match_source": match_source,
                     "status": "missing",
                     "changed": bool(removed),
                 }
@@ -693,6 +895,7 @@ def normalize_speedtree_material_textures(objects):
                 "texture_base": texture_base,
                 "files": {role: str(texture_files[role]) for role in SPEEDTREE_TEXTURE_ROLES},
                 "missing_roles": [],
+                "match_source": match_source,
                 "status": "ok",
                 "changed": not already_normalized,
             }
@@ -703,12 +906,22 @@ def normalize_speedtree_material_textures(objects):
         if image and image.users == 0:
             bpy.data.images.remove(image)
 
-    missing = [row for row in rows if row["status"] != "ok"]
+    missing = [row for row in rows if row["status"] == "missing"]
+    preserved_cluster_count = sum(
+        1 for row in rows if row["status"] == "preserved_cluster"
+    )
+    if missing:
+        status = "missing"
+    elif preserved_cluster_count:
+        status = "preserved_cluster"
+    else:
+        status = "ok"
     return {
-        "status": "missing" if missing else "ok",
+        "status": status,
         "materials": rows,
         "missing": missing,
         "material_count": len(rows),
+        "preserved_cluster_count": preserved_cluster_count,
         "changed_count": sum(1 for row in rows if row.get("changed")),
     }
 
@@ -948,9 +1161,17 @@ def consolidate_speedtree_group_materials(objects):
     # merge/weight export; do not touch object transforms, UVs, vertex groups, or weights.
     mesh_objects = [obj for obj in objects if obj.type == "MESH" and obj.data]
     if not mesh_objects:
-        return {"status": "skipped", "reason": "no mesh objects", "groups": []}
+        return {
+            "status": "skipped",
+            "reason": "no mesh objects",
+            "groups": [],
+            "skipped_groups": [],
+        }
 
     manifest_result = _consolidate_speedtree_manifest_materials(mesh_objects)
+    stmat_cache = {}
+    texture_index_cache = {}
+    skipped_groups = []
 
     grouped = defaultdict(list)
     for obj in mesh_objects:
@@ -983,6 +1204,28 @@ def consolidate_speedtree_group_materials(objects):
 
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
         target_name = unified_material_name(base_name, source_materials)
+        canonical_sets = [
+            _complete_speedtree_texture_set(
+                material,
+                target_name,
+                stmat_cache=stmat_cache,
+                texture_index_cache=texture_index_cache,
+            )
+            for material in source_materials
+        ]
+        if not all(canonical_sets):
+            skipped_groups.append(
+                {
+                    "mode": "name_tokens",
+                    "target_material": target_name,
+                    "source_materials": [
+                        material.name for material in source_materials
+                    ],
+                    "group_tokens": group_tokens,
+                    "reason": "canonical target T_ six-map set is not complete",
+                }
+            )
+            continue
         target_material = bpy.data.materials.get(target_name)
         if target_material is None:
             target_material = source_materials[0].copy()
@@ -1039,6 +1282,7 @@ def consolidate_speedtree_group_materials(objects):
     return {
         "status": "applied" if all_reports else "skipped",
         "groups": all_reports,
+        "skipped_groups": skipped_groups,
         "changed_object_count": (
             manifest_result["changed_object_count"]
             + sum(group["object_count"] for group in reports)
