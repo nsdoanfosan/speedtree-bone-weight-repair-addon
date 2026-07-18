@@ -5,6 +5,8 @@ Run with Blender:
       --fbx X.fbx --report result.json
 """
 import argparse
+import gzip
+import hashlib
 import json
 import sys
 import tempfile
@@ -75,7 +77,31 @@ def make_mesh_object(name, materials):
     return obj
 
 
-def run_contract_smoke(normalize_speedtree_material_textures, consolidate_speedtree_group_materials):
+def make_armature_object(name):
+    armature_data = bpy.data.armatures.new(f"{name}_Data")
+    armature = bpy.data.objects.new(name, armature_data)
+    bpy.context.scene.collection.objects.link(armature)
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bone = armature_data.edit_bones.new("Bone_1_Start")
+    bone.head = (0.0, 0.0, 0.0)
+    bone.tail = (0.0, 0.0, 1.0)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    armature.select_set(False)
+    return armature
+
+
+def run_contract_smoke(
+    normalize_speedtree_material_textures,
+    consolidate_speedtree_group_materials,
+    apply_speedtree_material_intents,
+    handoff_contract,
+    load_speedtree_texture_readiness_contract,
+    inspect_spm_unreal_instance_profile,
+    apply_spm_unreal_instance_profile,
+    merge_skinned_meshes,
+):
     with tempfile.TemporaryDirectory(prefix="bwr_material_contract_") as temporary:
         asset = Path(temporary) / "asset"
         fbx_dir = asset / "fbx"
@@ -165,6 +191,29 @@ def run_contract_smoke(normalize_speedtree_material_textures, consolidate_speedt
             raise AssertionError(normalization["missing"])
         if preserved_material.node_tree.nodes.get("ClusterSentinelNode") is None:
             raise AssertionError("preserved Cluster image node was removed")
+        strict_preserve_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": {"material_intents": []},
+            "bindings": [
+                {
+                    "material": preserved_material.name,
+                    "material_key": "mleafcluster01",
+                    "production_group_base": preserved_material.name,
+                    "status": "not_managed",
+                    "texture_source_mode": "preserve_declared_sources",
+                    "files": {},
+                    "missing_roles": [],
+                }
+            ],
+        }
+        strict_preserved_cluster = normalize_speedtree_material_textures(
+            [preserved_object], texture_contract=strict_preserve_contract
+        )
+        if strict_preserved_cluster.get("status") != "preserved_cluster":
+            raise AssertionError(strict_preserved_cluster)
+        if preserved_material.node_tree.nodes.get("ClusterSentinelNode") is None:
+            raise AssertionError("strict contract removed a preserved Cluster node")
 
         outside_material = bpy.data.materials.new("M_leaf_outside_cluster_01")
         outside_material.use_nodes = True
@@ -208,11 +257,101 @@ def run_contract_smoke(normalize_speedtree_material_textures, consolidate_speedt
             for row in shared_result.get("materials", [])
         } != {"stmat_reference"}:
             raise AssertionError(shared_result)
+        shared_contract = {
+            "status": "ok",
+            "bindings": [
+                {
+                    "material": f"{material.name}_Mat",
+                    "status": "ok",
+                    "texture_base": "T_Leaf_Grass_atlas_01",
+                    "texture_dir": str(texture_dir),
+                    "stmat_roles": ["color", "normal", "extra", "height", "subsurface"],
+                    "files": {role: str(path) for role, path in shared.items()},
+                    "missing_roles": [],
+                }
+                for material in shared_materials
+            ],
+        }
+        shared_contract_result = normalize_speedtree_material_textures(
+            [shared_object], texture_contract=shared_contract
+        )
+        if shared_contract_result.get("status") != "ok":
+            raise AssertionError(shared_contract_result)
+        if {
+            row.get("match_source")
+            for row in shared_contract_result.get("materials", [])
+        } != {"shared_texture_contract"}:
+            raise AssertionError(shared_contract_result)
+        strict_intents = []
+        shared_files = {role: str(path) for role, path in shared.items()}
+        for index, material in enumerate(shared_materials):
+            intent = handoff_contract.central_contract_api().build_material_intent(
+                material.name
+            )
+            intent.update(
+                {
+                    "stmat_material_index": index,
+                    "stmat_material_id": str(index + 1),
+                    "material_name": material.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "texture_binding": {
+                        "status": "ok",
+                        "set_key": "leafgrassatlas01",
+                        "texture_base": "T_Leaf_Grass_atlas_01",
+                        "texture_dir": str(texture_dir),
+                        "files": shared_files,
+                        "missing_roles": [],
+                    },
+                }
+            )
+            strict_intents.append(intent)
+        strict_envelope = {"material_intents": strict_intents}
+        strict_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": strict_envelope,
+            "bindings": handoff_contract.texture_bindings_from_envelope(
+                strict_envelope
+            ),
+        }
+        strict_intent_result = apply_speedtree_material_intents(
+            [shared_object], strict_contract
+        )
+        strict_shared_result = normalize_speedtree_material_textures(
+            [shared_object], texture_contract=strict_contract
+        )
+        if strict_shared_result.get("status") != "ok" or {
+            row.get("match_source")
+            for row in strict_shared_result.get("materials", [])
+        } != {"speedtree_material_intent"}:
+            raise AssertionError(strict_shared_result)
+        if any(
+            material.get("unreal_tree_part") != "leaf"
+            or material.get("unreal_tree_shading") != "foliage"
+            for material in shared_materials
+        ):
+            raise AssertionError(strict_intent_result)
 
         green_material = bpy.data.materials.new("M_Leaf_common_grass_01_green")
         dead_material = bpy.data.materials.new("M_Leaf_common_grass_01_dead")
         for material in (green_material, dead_material):
             material["codex_source_fbx"] = str(source_fbx)
+        try:
+            normalize_speedtree_material_textures(
+                [make_mesh_object("StrictNoFallbackObject", [green_material])],
+                texture_contract={
+                    "status": "ok",
+                    "strict_speedtree_pipeline_contract": True,
+                    "speedtree_pipeline_contract": {"material_intents": []},
+                    "bindings": [],
+                },
+            )
+        except RuntimeError as exc:
+            if "texture binding is missing" not in str(exc):
+                raise
+            strict_no_fallback = str(exc)
+        else:
+            raise AssertionError("strict contract used a material-name fallback")
         variant_object = make_mesh_object(
             "VariantOnlyObject", [green_material, dead_material]
         )
@@ -237,16 +376,259 @@ def run_contract_smoke(normalize_speedtree_material_textures, consolidate_speedt
         if canonical_names != ["M_Leaf_common_grass_01"]:
             raise AssertionError(canonical_names)
 
+        profile_materials = [
+            bpy.data.materials.new("M_Profile_stem_01"),
+            bpy.data.materials.new("M_Profile_leaf_01"),
+        ]
+        profile_object = make_mesh_object("ProfileObject", profile_materials)
+        name_only_materials = [
+            bpy.data.materials.new("M_Leaf_contract_green"),
+            bpy.data.materials.new("M_Leaf_contract_yellow"),
+            bpy.data.materials.new("M_Stem_contract_dead"),
+        ]
+        name_only_object = make_mesh_object(
+            "NameOnlyProfileObject", name_only_materials
+        )
+        stale_profile_material = bpy.data.materials.new("M_Stale_Profile")
+        stale_profile_material["unreal_instance_profile"] = "dead"
+        stale_profile_object = make_mesh_object(
+            "StaleProfileObject", [stale_profile_material]
+        )
+        spm_path = asset / "profile_contract.spm"
+
+        def write_profile_spm(value, compressed=False):
+            root = ET.Element("SpeedTree")
+            generator = ET.SubElement(root, "Generator", Type="Tree")
+            prop = ET.SubElement(generator, "Property")
+            ET.SubElement(prop, "Name").text = "SpeedTree SDK:User data"
+            ET.SubElement(prop, "Value").text = value
+            payload = ET.tostring(
+                root, encoding="utf-8", xml_declaration=True
+            )
+            if compressed:
+                with gzip.open(spm_path, "wb") as handle:
+                    handle.write(payload)
+            else:
+                spm_path.write_bytes(payload)
+
+        write_profile_spm("Dead", compressed=True)
+        profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
+        if profile_inspection.get("profile") != "dead":
+            raise AssertionError(profile_inspection)
+
+        def source_identity(path):
+            path = Path(path).resolve()
+            stat = path.stat()
+            return {
+                "canonical_path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+
+        source_identity_payload = {
+            "spm": source_identity(spm_path),
+            "stmat": [source_identity(source_fbx.with_suffix(".stmat"))],
+        }
+
+        def strict_profile_envelope(profile):
+            api = handoff_contract.central_contract_api()
+            intents = []
+            for index, material in enumerate(profile_materials):
+                intent = api.build_material_intent(
+                    material.name, instance_profile=profile
+                )
+                intent.update(
+                    {
+                        "stmat_material_index": index,
+                        "stmat_material_id": str(index + 1),
+                        "material_name": material.name,
+                        "texture_source_mode": "managed_texture_set",
+                        "texture_binding": {
+                            "status": "ok",
+                            "set_key": "leafgrassatlas01",
+                            "texture_base": "T_Leaf_Grass_atlas_01",
+                            "texture_dir": str(texture_dir),
+                            "files": shared_files,
+                            "missing_roles": [],
+                        },
+                    }
+                )
+                intents.append(intent)
+            return {
+                "kind": "speedtree_material_preflight",
+                "schema_version": 1,
+                "speedtree_handoff_contract": api.build_sidecar_descriptor(
+                    spm_path.stem, source=source_identity_payload
+                ),
+                "outcome": "ok",
+                "source": source_identity_payload,
+                "source_fingerprint": handoff_contract.source_fingerprint(
+                    source_identity_payload
+                ),
+                "instance_profile": profile,
+                "tree_user_data": {
+                    "property": "SpeedTree SDK:User data",
+                    "raw": profile,
+                    "normalized": profile,
+                    "status": "ok" if profile else "empty",
+                },
+                "material_intents": intents,
+                "dynamic_wind": {},
+                "issues": [],
+            }
+
+        strict_report_path = asset / "strict_material_preflight.json"
+        strict_report_path.write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "speedtree_pipeline_contract": strict_profile_envelope(
+                        "dead"
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        loaded_strict_contract = load_speedtree_texture_readiness_contract(
+            strict_report_path,
+            spm_path=spm_path,
+            source_fbx_path=source_fbx,
+        )
+        if not loaded_strict_contract.get("strict_speedtree_pipeline_contract"):
+            raise AssertionError(loaded_strict_contract)
+
+        mismatch_report_path = asset / "mismatch_material_preflight.json"
+        mismatch_report_path.write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "speedtree_pipeline_contract": strict_profile_envelope(""),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            load_speedtree_texture_readiness_contract(
+                mismatch_report_path,
+                spm_path=spm_path,
+                source_fbx_path=source_fbx,
+            )
+        except RuntimeError as exc:
+            if "instance_profile mismatch" not in str(exc):
+                raise
+            profile_mismatch_blocked = str(exc)
+        else:
+            raise AssertionError("profile mismatch contract was not blocked")
+        profile_result = apply_spm_unreal_instance_profile(
+            [profile_object], spm_path
+        )
+        if {
+            material.get("unreal_instance_profile")
+            for material in profile_materials
+        } != {"dead"}:
+            raise AssertionError(profile_result)
+        consolidated_profile_result = apply_spm_unreal_instance_profile(
+            [canonical_object], spm_path
+        )
+        if len(canonical_object.data.materials) != 1 or (
+            canonical_object.data.materials[0].get("unreal_instance_profile")
+            != "dead"
+        ):
+            raise AssertionError(consolidated_profile_result)
+
+        merge_armature = make_armature_object("ProfileMergeArmature")
+        source_profile_materials = {
+            material.as_pointer()
+            for obj in (profile_object, canonical_object)
+            for material in obj.data.materials
+            if material
+        }
+        merged_profile_object, *_merge_result = merge_skinned_meshes(
+            merge_armature,
+            [profile_object, canonical_object],
+            "ProfileMergedObject",
+        )
+        merged_profile_materials = [
+            material
+            for material in merged_profile_object.data.materials
+            if material
+        ]
+        if not merged_profile_materials or any(
+            material.get("unreal_instance_profile") != "dead"
+            for material in merged_profile_materials
+        ):
+            raise AssertionError(
+                {
+                    "materials": [material.name for material in merged_profile_materials],
+                    "profiles": [
+                        material.get("unreal_instance_profile")
+                        for material in merged_profile_materials
+                    ],
+                }
+            )
+        if not source_profile_materials.issubset(
+            {material.as_pointer() for material in merged_profile_materials}
+        ):
+            raise AssertionError("merge replaced one or more profiled material datablocks")
+
+        write_profile_spm("")
+        cleared_profile_result = apply_spm_unreal_instance_profile(
+            [stale_profile_object], spm_path
+        )
+        if "unreal_instance_profile" in stale_profile_material:
+            raise AssertionError(cleared_profile_result)
+        name_only_result = apply_spm_unreal_instance_profile(
+            [name_only_object], spm_path
+        )
+        if any(
+            "unreal_instance_profile" in material
+            for material in name_only_materials
+        ):
+            raise AssertionError(name_only_result)
+
+        write_profile_spm("../dead")
+        invalid_profile = inspect_spm_unreal_instance_profile(spm_path)
+        if invalid_profile.get("status") != "inspection_error":
+            raise AssertionError(invalid_profile)
+
         return {
             "preserved_cluster": normalization,
+            "strict_preserved_cluster": strict_preserved_cluster,
             "outside_cluster_rejected": outside_result,
             "missing_cluster_source_rejected": missing_result,
             "shared_stmat_texture_set": shared_result,
+            "shared_texture_contract": shared_contract_result,
+            "strict_shared_material_intent": strict_intent_result,
+            "strict_shared_texture_contract": strict_shared_result,
+            "strict_name_fallback_blocked": strict_no_fallback,
             "variant_only_consolidation": variant_only,
             "variant_only_materials": variant_names,
             "canonical_files": {role: str(path) for role, path in canonical.items()},
             "canonical_consolidation": canonical_result,
             "canonical_materials": canonical_names,
+            "instance_profile": profile_result,
+            "strict_contract_load": {
+                "contract_path": loaded_strict_contract.get("contract_path"),
+                "binding_count": len(
+                    loaded_strict_contract.get("bindings") or []
+                ),
+            },
+            "profile_mismatch_blocked": profile_mismatch_blocked,
+            "consolidated_instance_profile": consolidated_profile_result,
+            "merged_instance_profile": {
+                "object": merged_profile_object.name,
+                "materials": [material.name for material in merged_profile_materials],
+                "profiles": [
+                    material.get("unreal_instance_profile")
+                    for material in merged_profile_materials
+                ],
+            },
+            "name_only_material_groups": name_only_result,
+            "cleared_instance_profile": cleared_profile_result,
+            "invalid_instance_profile": invalid_profile,
         }
 
 
@@ -260,15 +642,27 @@ def main():
     try:
         addon_utils.enable("speedtree_bone_weight_repair", default_set=False)
         from speedtree_bone_weight_repair.core import (
+            apply_speedtree_material_intents,
+            apply_spm_unreal_instance_profile,
             consolidate_speedtree_group_materials,
+            inspect_spm_unreal_instance_profile,
+            load_speedtree_texture_readiness_contract,
+            merge_skinned_meshes,
             normalize_speedtree_material_textures,
             run_import_source_fbx,
         )
+        from speedtree_bone_weight_repair import handoff_contract
 
         if args.contracts:
             result = run_contract_smoke(
                 normalize_speedtree_material_textures,
                 consolidate_speedtree_group_materials,
+                apply_speedtree_material_intents,
+                handoff_contract,
+                load_speedtree_texture_readiness_contract,
+                inspect_spm_unreal_instance_profile,
+                apply_spm_unreal_instance_profile,
+                merge_skinned_meshes,
             )
         elif args.blend:
             bpy.ops.wm.open_mainfile(filepath=str(source_path))

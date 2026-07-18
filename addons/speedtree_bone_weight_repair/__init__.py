@@ -117,6 +117,12 @@ class STBWR_Settings(PropertyGroup):
         subtype="FILE_PATH",
         default="",
     )
+    texture_contract_path: StringProperty(
+        name="Texture Contract",
+        description="Optional SK preflight report containing the shared SpeedTree texture bindings",
+        subtype="FILE_PATH",
+        default="",
+    )
     speedtree_exe_path: StringProperty(
         name="SpeedTree 10.1",
         description="SpeedTree Modeler executable used for command-line SPM export",
@@ -365,6 +371,11 @@ class STBWR_Settings(PropertyGroup):
         return {
             "source_fbx_path": bpy.path.abspath(self.source_fbx_path) if self.source_fbx_path else "",
             "spm_path": bpy.path.abspath(self.spm_path),
+            "texture_contract_path": (
+                bpy.path.abspath(self.texture_contract_path)
+                if self.texture_contract_path
+                else ""
+            ),
             "speedtree_exe_path": bpy.path.abspath(self.speedtree_exe_path) if self.speedtree_exe_path else "",
             "speedtree_export_options_path": bpy.path.abspath(self.speedtree_export_options_path) if self.speedtree_export_options_path else "",
             "speedtree_fbx_export_options_path": bpy.path.abspath(self.speedtree_fbx_export_options_path) if self.speedtree_fbx_export_options_path else "",
@@ -452,9 +463,17 @@ class STBWR_OT_ImportSourceFBX(STBWR_OT_Base):
         if not settings["source_fbx_path"]:
             return self.fail("Source FBX path is required.")
         try:
-            result = get_core().run_import_source_fbx(
+            core = get_core()
+            texture_contract = core.load_speedtree_texture_readiness_contract(
+                settings.get("texture_contract_path", ""),
+                spm_path=settings.get("spm_path", ""),
+                source_fbx_path=settings.get("source_fbx_path", ""),
+            )
+            result = core.run_import_source_fbx(
                 settings["source_fbx_path"],
                 settings.get("source_collection_name", "SpeedTree_Source"),
+                spm_path=settings.get("spm_path", ""),
+                texture_contract=texture_contract,
             )
         except Exception as exc:
             return self.fail(str(exc))

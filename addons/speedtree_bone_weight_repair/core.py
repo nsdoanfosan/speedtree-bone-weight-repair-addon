@@ -13,7 +13,7 @@ import bpy
 import numpy as np
 from mathutils import Vector, kdtree
 
-from . import speedtree_cli
+from . import handoff_contract, speedtree_cli
 
 # Parked 3D Branch Cluster prototype.
 # The active add-on no longer imports/registers this path. Keep the separate
@@ -27,6 +27,11 @@ JSON_PREVIEW_ATTR_NAME = "Codex_JSON_Group_Preview"
 JSON_PREVIEW_SCENE_KEY = "codex_json_preview_active"
 JSON_PREVIEW_COLLECTION_HIDE_KEY = "codex_json_preview_original_hide_viewport"
 JSON_PREVIEW_ARMATURE_HIDE_KEY = "codex_json_preview_armature_prev_hide"
+SPEEDTREE_MODEL_USER_DATA_PROPERTY = "SpeedTree SDK:User data"
+UNREAL_INSTANCE_PROFILE_PROPERTY = "unreal_instance_profile"
+UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+UNREAL_TREE_PART_PROPERTY = "unreal_tree_part"
+UNREAL_TREE_SHADING_PROPERTY = "unreal_tree_shading"
 JSON_PREVIEW_OBJECT_KEYS = (
     "codex_json_group",
     "codex_json_group_matched_by",
@@ -41,6 +46,102 @@ def write_report(path, data):
         return
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_speedtree_texture_readiness_contract(
+    path, *, spm_path="", source_fbx_path=""
+):
+    if not path:
+        return None
+    contract_path = Path(path)
+    if not contract_path.is_file():
+        raise RuntimeError(f"SpeedTree texture contract does not exist: {path}")
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"SpeedTree texture contract could not be read: {path} ({exc})"
+        ) from exc
+    envelope = payload.get(handoff_contract.PIPELINE_ENVELOPE_FIELD)
+    if envelope is not None:
+        if str(payload.get("status") or "") != "ok":
+            raise RuntimeError(
+                "SpeedTree material preflight report status is not ok: "
+                + str(payload.get("status") or "unknown")
+            )
+        if not spm_path:
+            raise RuntimeError(
+                "New SpeedTree preflight contract requires the current SPM path"
+            )
+        stmat_paths = []
+        if source_fbx_path:
+            stmat_paths.append(Path(source_fbx_path).with_suffix(".stmat"))
+        try:
+            validated, live_source = handoff_contract.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm_path,
+                stmat_paths=stmat_paths,
+                expected_mesh_name=Path(spm_path).stem,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"SpeedTree preflight contract rejected before Blender mutation: {exc}"
+            ) from exc
+
+        tree_user_data = validated.get("tree_user_data")
+        if not isinstance(tree_user_data, dict) or str(
+            tree_user_data.get("property") or ""
+        ) != SPEEDTREE_MODEL_USER_DATA_PROPERTY:
+            raise RuntimeError(
+                "SpeedTree preflight Tree User Data provenance is missing or invalid"
+            )
+        profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
+        if profile_inspection.get("status") == "inspection_error":
+            raise RuntimeError(
+                "SpeedTree model User Data inspection failed: "
+                + profile_inspection.get("error", "unknown error")
+            )
+        reported_profile = handoff_contract.normalize_instance_profile(
+            validated.get("instance_profile")
+        )
+        tree_data_profile = handoff_contract.normalize_instance_profile(
+            tree_user_data.get("normalized")
+        )
+        if tree_data_profile != reported_profile:
+            raise RuntimeError(
+                "SpeedTree preflight Tree User Data/profile fields disagree: "
+                f"tree_user_data={tree_data_profile!r}, "
+                f"instance_profile={reported_profile!r}"
+            )
+        if profile_inspection.get("profile", "") != reported_profile:
+            raise RuntimeError(
+                "SpeedTree instance_profile mismatch; preflight is stale: "
+                f"report={reported_profile!r}, "
+                f"SPM={profile_inspection.get('profile', '')!r}"
+            )
+
+        contract = {
+            "status": "ok",
+            "bindings": handoff_contract.texture_bindings_from_envelope(
+                validated
+            ),
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": validated,
+            "live_source_identity": live_source,
+            "instance_profile": reported_profile,
+            "tree_user_data": dict(tree_user_data),
+        }
+    else:
+        contract = payload.get("texture_readiness_contract", payload)
+    if not isinstance(contract, dict) or not isinstance(
+        contract.get("bindings"), list
+    ):
+        raise RuntimeError(
+            f"SpeedTree texture contract has no bindings: {path}"
+        )
+    contract = dict(contract)
+    contract["contract_path"] = str(contract_path.resolve())
+    return contract
 
 
 def utc_timestamp():
@@ -460,6 +561,30 @@ def _speedtree_preserved_cluster_sources(source_fbx_path, material, stmat_data=N
     }
 
 
+def _speedtree_preserved_declared_sources(
+    source_fbx_path, material, stmat_data=None
+):
+    """Verify non-managed STMAT sources without guessing a managed T_ set."""
+    stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
+    stmat_material = stmat_data.get("materials", {}).get(
+        _speedtree_material_name_key(material.name), {}
+    )
+    source_paths = stmat_material.get("source_paths") or []
+    if not source_paths:
+        return None
+    resolved = []
+    for value in source_paths:
+        try:
+            path = _resolved_speedtree_source_path(source_fbx_path, value)
+            ready = path.is_file() and path.stat().st_size > 0
+        except (OSError, ValueError):
+            ready = False
+        if not ready:
+            return None
+        resolved.append(str(path))
+    return {"declared_sources": sorted(set(resolved), key=str.casefold)}
+
+
 def _speedtree_manifest_paths(source_fbx_path, stmat_material=None):
     root = _speedtree_asset_root(source_fbx_path)
     paths = []
@@ -747,7 +872,7 @@ def _replace_speedtree_material_nodes(material, texture_files):
             bpy.data.images.remove(image)
 
 
-def normalize_speedtree_material_textures(objects):
+def normalize_speedtree_material_textures(objects, texture_contract=None):
     """Replace SpeedTree FBX dummy images with PCG texture-batch T_ outputs.
 
     Matching is material-set based (M_x -> T_x) and requires the complete six-map
@@ -758,7 +883,107 @@ def normalize_speedtree_material_textures(objects):
     removed_dummy_images = set()
     stmat_cache = {}
     texture_index_cache = {}
-    for material in collect_object_materials(objects):
+    contract_bindings = defaultdict(list)
+    contract_bindings_by_group_base = defaultdict(list)
+    contract_status = ""
+    strict_contract = bool(
+        isinstance(texture_contract, dict)
+        and texture_contract.get("strict_speedtree_pipeline_contract")
+    )
+    if isinstance(texture_contract, dict):
+        contract_status = str(texture_contract.get("status") or "")
+        for binding in texture_contract.get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            contract_bindings[
+                _speedtree_material_name_key(binding.get("material"))
+            ].append(binding)
+            group_base = str(binding.get("production_group_base") or "")
+            if group_base:
+                contract_bindings_by_group_base[
+                    _speedtree_material_name_key(group_base)
+                ].append(binding)
+    materials = collect_object_materials(objects)
+
+    def strict_binding_candidates(material):
+        candidates = contract_bindings.get(
+            _speedtree_material_name_key(material.name), []
+        )
+        if not candidates:
+            group_base = handoff_contract.production_group_base_name(
+                material.name
+            )
+            if group_base:
+                candidates = contract_bindings_by_group_base.get(
+                    _speedtree_material_name_key(group_base), []
+                )
+        if len(candidates) > 1:
+            signatures = {
+                json.dumps(
+                    {
+                        "status": row.get("status"),
+                        "texture_source_mode": row.get("texture_source_mode"),
+                        "set_key": row.get("set_key"),
+                        "texture_base": row.get("texture_base"),
+                        "files": row.get("files") or {},
+                        "missing_roles": row.get("missing_roles") or [],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for row in candidates
+            }
+            if len(signatures) == 1:
+                candidates = candidates[:1]
+        return candidates
+
+    if strict_contract:
+        # Resolve every final slot before touching a node tree. This prevents a
+        # late unmatched/ambiguous material from leaving a partially wired scene.
+        for material in materials:
+            candidates = strict_binding_candidates(material)
+            if len(candidates) != 1:
+                reason = "missing" if not candidates else "ambiguous"
+                raise RuntimeError(
+                    f"SpeedTree material-intent texture binding is {reason} "
+                    f"after consolidation: {material.name}"
+                )
+            binding = candidates[0]
+            mode = str(binding.get("texture_source_mode") or "")
+            source_fbx = str(material.get("codex_source_fbx", "")).strip()
+            if mode == "preserve_declared_sources":
+                stmat_data = _speedtree_stmat_materials(source_fbx)
+                if not (
+                    _speedtree_preserved_cluster_sources(
+                        source_fbx, material, stmat_data
+                    )
+                    or _speedtree_preserved_declared_sources(
+                        source_fbx, material, stmat_data
+                    )
+                ):
+                    raise RuntimeError(
+                        "SpeedTree declared texture sources are stale: "
+                        + material.name
+                    )
+                continue
+            if mode != "managed_texture_set" or binding.get("status") != "ok":
+                raise RuntimeError(
+                    "SpeedTree managed texture binding is unresolved: "
+                    + material.name
+                )
+            for role in SPEEDTREE_TEXTURE_ROLES:
+                file_path = Path(str((binding.get("files") or {}).get(role) or ""))
+                try:
+                    ready = file_path.is_file() and file_path.stat().st_size > 0
+                except OSError:
+                    ready = False
+                if not ready:
+                    raise RuntimeError(
+                        f"SpeedTree managed texture binding is stale: "
+                        f"{material.name} {role}"
+                    )
+
+    for material in materials:
         source_fbx = str(material.get("codex_source_fbx", "")).strip()
         if not source_fbx:
             continue
@@ -766,9 +991,114 @@ def normalize_speedtree_material_textures(objects):
         if source_key not in stmat_cache:
             stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
         stmat_data = stmat_cache[source_key]
-        referenced_set = _speedtree_stmat_texture_set(
-            source_fbx, material, stmat_data
+        key = _speedtree_material_name_key(material.name)
+        binding_candidates = contract_bindings.get(key, [])
+        if strict_contract:
+            binding_candidates = strict_binding_candidates(material)
+        if len(binding_candidates) > 1:
+            signatures = {
+                json.dumps(
+                    {
+                        "status": row.get("status"),
+                        "texture_source_mode": row.get("texture_source_mode"),
+                        "set_key": row.get("set_key"),
+                        "texture_base": row.get("texture_base"),
+                        "files": row.get("files") or {},
+                        "missing_roles": row.get("missing_roles") or [],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for row in binding_candidates
+            }
+            if len(signatures) == 1:
+                binding_candidates = binding_candidates[:1]
+        contract_binding = (
+            binding_candidates[0] if len(binding_candidates) == 1 else None
         )
+        contract_blocked = len(binding_candidates) > 1 or (
+            strict_contract and not binding_candidates
+        )
+        contract_reason = "ambiguous_material_binding" if contract_blocked else ""
+        if strict_contract and not binding_candidates:
+            contract_reason = "missing_material_intent_binding"
+        stale_roles = []
+        referenced_set = None
+        source_mode = str(
+            (contract_binding or {}).get("texture_source_mode") or ""
+        )
+        preserve_declared = (
+            strict_contract and source_mode == "preserve_declared_sources"
+        )
+        if preserve_declared:
+            preserved_cluster = _speedtree_preserved_cluster_sources(
+                source_fbx, material, stmat_data
+            )
+            preserved_declared = (
+                preserved_cluster
+                or _speedtree_preserved_declared_sources(
+                    source_fbx, material, stmat_data
+                )
+            )
+            if preserved_declared:
+                rows.append(
+                    {
+                        "material": material.name,
+                        "texture_dirs": [
+                            str(path)
+                            for path in _speedtree_material_texture_dirs(
+                                source_fbx, material, stmat_data
+                            )
+                        ],
+                        "matched_texture_bases": [],
+                        "missing_roles": [],
+                        "match_source": "speedtree_material_intent",
+                        "status": (
+                            "preserved_cluster"
+                            if preserved_cluster
+                            else "preserved_declared_sources"
+                        ),
+                        "changed": False,
+                        **preserved_declared,
+                    }
+                )
+                continue
+            contract_blocked = True
+            contract_reason = "declared_sources_missing"
+            stale_roles = ["declared_source"]
+        elif contract_binding and contract_binding.get("status") == "ok":
+            contract_files = {
+                role: Path(str((contract_binding.get("files") or {}).get(role) or ""))
+                for role in SPEEDTREE_TEXTURE_ROLES
+            }
+            stale_roles = []
+            for role, path in contract_files.items():
+                try:
+                    if not path.is_file() or path.stat().st_size <= 0:
+                        stale_roles.append(role)
+                except OSError:
+                    stale_roles.append(role)
+            if stale_roles:
+                contract_blocked = True
+                contract_reason = "contract_files_missing"
+            else:
+                referenced_set = {
+                    "texture_dir": contract_binding.get("texture_dir", ""),
+                    "texture_base": contract_binding.get("texture_base", ""),
+                    "files": contract_files,
+                    "stmat_roles": contract_binding.get("stmat_roles", []),
+                }
+        elif contract_binding and contract_binding.get("status") != "not_managed":
+            contract_blocked = True
+            contract_reason = str(
+                contract_binding.get("status") or "contract_binding_incomplete"
+            )
+            stale_roles = list(contract_binding.get("missing_roles") or [])
+
+        if referenced_set is None and not contract_blocked and not strict_contract:
+            referenced_set = _speedtree_stmat_texture_set(
+                source_fbx, material, stmat_data
+            )
         texture_dirs = _speedtree_material_texture_dirs(
             source_fbx, material, stmat_data
         )
@@ -785,13 +1115,38 @@ def normalize_speedtree_material_textures(objects):
         attempts = []
         best_attempt = None
         match_source = "material_name"
-        if referenced_set:
+        if contract_blocked:
+            missing_roles = stale_roles or ["texture_binding"]
+            ambiguity = list(
+                (contract_binding or {}).get("referenced_set_keys") or []
+            )
+            match_source = (
+                "speedtree_material_intent"
+                if strict_contract
+                else "shared_texture_contract"
+            )
+            attempts.append(
+                {
+                    "texture_dir": str(texture_dir),
+                    "matched_texture_bases": ambiguity,
+                    "missing_roles": missing_roles,
+                    "match_source": match_source,
+                    "reason": contract_reason,
+                }
+            )
+        elif referenced_set:
             texture_dir = Path(referenced_set["texture_dir"])
             texture_base = referenced_set["texture_base"]
             texture_files = dict(referenced_set["files"])
             missing_roles = []
             ambiguity = [texture_base]
-            match_source = "stmat_reference"
+            match_source = (
+                "speedtree_material_intent"
+                if strict_contract
+                else "shared_texture_contract"
+                if contract_binding and contract_binding.get("status") == "ok"
+                else "stmat_reference"
+            )
             attempts.append(
                 {
                     "texture_dir": str(texture_dir),
@@ -800,7 +1155,7 @@ def normalize_speedtree_material_textures(objects):
                     "match_source": match_source,
                 }
             )
-        else:
+        elif not strict_contract:
             for candidate_dir in texture_dirs:
                 cache_key = os.path.normcase(str(candidate_dir))
                 if cache_key not in texture_index_cache:
@@ -832,8 +1187,13 @@ def normalize_speedtree_material_textures(objects):
                     texture_dir = Path(best_attempt["texture_dir"])
                     ambiguity = best_attempt["matched_texture_bases"]
                     missing_roles = best_attempt["missing_roles"]
+        else:
+            contract_blocked = True
+            contract_reason = contract_reason or "material_intent_binding_unresolved"
+            missing_roles = stale_roles or ["texture_binding"]
+            match_source = "speedtree_material_intent"
 
-        if missing_roles or len(ambiguity) > 1:
+        if contract_blocked or missing_roles or len(ambiguity) > 1:
             preserved_cluster = _speedtree_preserved_cluster_sources(
                 source_fbx, material, stmat_data
             )
@@ -918,6 +1278,13 @@ def normalize_speedtree_material_textures(objects):
         status = "ok"
     return {
         "status": status,
+        "strict_speedtree_pipeline_contract": strict_contract,
+        "texture_contract_status": contract_status,
+        "texture_contract_path": (
+            texture_contract.get("contract_path", "")
+            if isinstance(texture_contract, dict)
+            else ""
+        ),
         "materials": rows,
         "missing": missing,
         "material_count": len(rows),
@@ -936,6 +1303,14 @@ def material_name_tokens(name):
 
 
 def material_group_token(material):
+    try:
+        tokens = handoff_contract.production_group_tokens(
+            material.name if material else ""
+        )
+        return tokens[0] if tokens else ""
+    except RuntimeError:
+        # Legacy/local installs without the shared repo keep the existing rule.
+        pass
     tokens = material_name_tokens(material.name if material else "")
     for token in tokens:
         if token in MATERIAL_GROUP_TOKENS:
@@ -946,6 +1321,11 @@ def material_group_token(material):
 def material_base_name(material):
     if material is None:
         return ""
+    try:
+        return handoff_contract.production_group_base_name(material.name)
+    except RuntimeError:
+        # Legacy/local installs without the shared repo keep the existing rule.
+        pass
     name = re.sub(r"(\.\d{3})$", "", material.name)
     parts = [part for part in re.split(r"[^a-zA-Z0-9]+", name) if part]
     kept = [part for part in parts if part.lower() not in MATERIAL_GROUP_TOKENS]
@@ -1294,6 +1674,71 @@ def consolidate_speedtree_group_materials(objects):
     }
 
 
+def apply_speedtree_material_intents(objects, texture_contract=None):
+    """Apply explicit tree classification after material consolidation.
+
+    New-schema contracts are matched only by the central exact material key or
+    the central production-group base.  The unrelated PCG Atlas Auto Split
+    namespace is intentionally not consulted here.
+    """
+    if not isinstance(texture_contract, dict) or not texture_contract.get(
+        "strict_speedtree_pipeline_contract"
+    ):
+        return {
+            "status": "legacy_fallback",
+            "materials": [],
+            "changed_materials": [],
+        }
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        raise RuntimeError("Strict SpeedTree texture contract has no envelope")
+
+    rows = []
+    changed = []
+    unmatched = []
+    resolved_materials = []
+    for material in collect_object_materials(objects):
+        intent = handoff_contract.resolve_material_intent(material.name, envelope)
+        if intent is None:
+            unmatched.append(material.name)
+            continue
+        resolved_materials.append((material, intent))
+
+    if unmatched:
+        raise RuntimeError(
+            "SpeedTree material intent has no exact/canonical match after "
+            "consolidation: " + ", ".join(sorted(unmatched, key=str.casefold))
+        )
+
+    for material, intent in resolved_materials:
+        changed_properties = []
+        tree_part = intent.get("tree_part")
+        tree_shading = intent.get("tree_shading")
+        if tree_part and material.get(UNREAL_TREE_PART_PROPERTY) != tree_part:
+            material[UNREAL_TREE_PART_PROPERTY] = tree_part
+            changed_properties.append(UNREAL_TREE_PART_PROPERTY)
+        if (
+            tree_shading
+            and material.get(UNREAL_TREE_SHADING_PROPERTY) != tree_shading
+        ):
+            material[UNREAL_TREE_SHADING_PROPERTY] = tree_shading
+            changed_properties.append(UNREAL_TREE_SHADING_PROPERTY)
+        if changed_properties:
+            changed.append(material.name)
+        rows.append(
+            {
+                **intent,
+                "changed_properties": changed_properties,
+            }
+        )
+
+    return {
+        "status": "applied" if rows else "not_applicable",
+        "materials": rows,
+        "changed_materials": changed,
+    }
+
+
 def build_rigid_fallback_armature(objects, armature_name="Root", bone_name="Bone_1_Start"):
     if any(obj.type == "ARMATURE" for obj in objects):
         return None
@@ -1343,6 +1788,8 @@ def run_import_source_fbx(
     rigid_fallback=False,
     armature_name="Root",
     true_root="Bone_1_Start",
+    spm_path="",
+    texture_contract=None,
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -1362,7 +1809,17 @@ def run_import_source_fbx(
     tag_speedtree_import_materials(imported, path)
     renamed_materials = strip_speedtree_material_suffixes(imported)
     material_consolidation = consolidate_speedtree_group_materials(imported)
-    texture_normalization = normalize_speedtree_material_textures(imported)
+    material_intents = apply_speedtree_material_intents(
+        imported, texture_contract=texture_contract
+    )
+    instance_profile = (
+        apply_spm_unreal_instance_profile(imported, spm_path)
+        if spm_path
+        else {"status": "not_requested", "profile": ""}
+    )
+    texture_normalization = normalize_speedtree_material_textures(
+        imported, texture_contract=texture_contract
+    )
     removed_phantoms = remove_phantom_image_nodes(imported)
     rigid_fallback_result = None
     if rigid_fallback:
@@ -1385,6 +1842,8 @@ def run_import_source_fbx(
         "removed_phantom_texture_nodes": removed_phantoms,
         "renamed_materials": renamed_materials,
         "material_consolidation": material_consolidation,
+        "speedtree_material_intents": material_intents,
+        "unreal_instance_profile": instance_profile,
         "texture_normalization": texture_normalization,
         "rigid_fallback": rigid_fallback_result,
     }
@@ -2121,6 +2580,83 @@ def element_property_value(element, property_name):
         if child_text(prop, "Name") == property_name:
             return child_text(prop, "Value")
     return None
+
+
+def normalize_unreal_instance_profile(value):
+    """Validate the opaque profile key authored in SpeedTree model User Data."""
+    try:
+        return handoff_contract.normalize_instance_profile(value)
+    except RuntimeError:
+        # Legacy/local installs without the shared repo keep the existing rule.
+        pass
+    profile = str(value or "").strip()
+    if not profile:
+        return ""
+    if not UNREAL_INSTANCE_PROFILE_RE.fullmatch(profile):
+        raise ValueError(
+            "SpeedTree model User Data must be a single profile key using only "
+            "letters, numbers, '_' or '-' (for example 'dead')."
+        )
+    return profile.casefold()
+
+
+def inspect_spm_unreal_instance_profile(spm_path):
+    """Read Tree Generator > SpeedTree SDK > User data directly from an SPM."""
+    result = {
+        "status": "inspection_error",
+        "spm": str(spm_path or ""),
+        "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
+        "profile": "",
+    }
+    try:
+        root = ET.fromstring(read_spm_xml(spm_path))
+        tree_generators = [
+            generator
+            for generator in root.findall(".//Generator")
+            if generator.attrib.get("Type") == "Tree"
+        ]
+        if not tree_generators:
+            raise ValueError("SPM has no Tree Generator.")
+        raw_value = element_property_value(
+            tree_generators[0], SPEEDTREE_MODEL_USER_DATA_PROPERTY
+        )
+        result["raw_value"] = str(raw_value or "")
+        result["tree_generator_count"] = len(tree_generators)
+        result["profile"] = normalize_unreal_instance_profile(raw_value)
+        result["status"] = "ok" if result["profile"] else "empty"
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def apply_spm_unreal_instance_profile(objects, spm_path):
+    """Attach the model-wide profile to final Blender materials without renaming."""
+    inspection = inspect_spm_unreal_instance_profile(spm_path)
+    if inspection["status"] == "inspection_error":
+        raise RuntimeError(
+            "SpeedTree model User Data inspection failed: "
+            + inspection.get("error", "unknown error")
+        )
+
+    profile = inspection.get("profile", "")
+    materials = collect_object_materials(objects)
+    changed = []
+    cleared = []
+    for material in materials:
+        previous = str(material.get(UNREAL_INSTANCE_PROFILE_PROPERTY, ""))
+        if profile:
+            if previous != profile:
+                material[UNREAL_INSTANCE_PROFILE_PROPERTY] = profile
+                changed.append(material.name)
+        elif UNREAL_INSTANCE_PROFILE_PROPERTY in material:
+            del material[UNREAL_INSTANCE_PROFILE_PROPERTY]
+            cleared.append(material.name)
+    return {
+        **inspection,
+        "material_count": len(materials),
+        "changed_materials": changed,
+        "cleared_materials": cleared,
+    }
 
 
 def parse_coord(text):
@@ -4181,6 +4717,23 @@ def run_full_pipeline(settings):
     reports = {"paths": paths, "steps": [], "saved_blends": []}
     save_stage_blends = settings.get("save_intermediate_blends", False)
 
+    # New-schema provenance/profile validation must finish before any Blender
+    # object, material, or node mutation. Legacy reports keep the old fallback.
+    texture_contract = load_speedtree_texture_readiness_contract(
+        settings.get("texture_contract_path", ""),
+        spm_path=settings.get("spm_path", ""),
+        source_fbx_path=settings.get("source_fbx_path", ""),
+    )
+    if isinstance(texture_contract, dict) and texture_contract.get(
+        "strict_speedtree_pipeline_contract"
+    ):
+        reports["speedtree_pipeline_contract"] = texture_contract.get(
+            "speedtree_pipeline_contract"
+        )
+        reports["speedtree_live_source_identity"] = texture_contract.get(
+            "live_source_identity"
+        )
+
     source_fbx_path = settings.get("source_fbx_path", "")
     source_import_objects = [
         obj
@@ -4214,7 +4767,34 @@ def run_full_pipeline(settings):
         }
     )
 
-    texture_normalization = normalize_speedtree_material_textures(source_import_meshes)
+    material_intents = apply_speedtree_material_intents(
+        source_import_meshes, texture_contract=texture_contract
+    )
+    reports["speedtree_material_intents"] = material_intents
+    reports["steps"].append(
+        {
+            "name": "apply_speedtree_material_intents",
+            "status": material_intents.get("status", "legacy_fallback"),
+            "changed_materials": material_intents.get("changed_materials", []),
+        }
+    )
+
+    instance_profile = apply_spm_unreal_instance_profile(
+        source_import_meshes, settings["spm_path"]
+    )
+    reports["unreal_instance_profile"] = instance_profile
+    reports["steps"].append(
+        {
+            "name": "apply_spm_unreal_instance_profile",
+            "status": instance_profile.get("status", "inspection_error"),
+            "profile": instance_profile.get("profile", ""),
+            "material_count": instance_profile.get("material_count", 0),
+        }
+    )
+
+    texture_normalization = normalize_speedtree_material_textures(
+        source_import_meshes, texture_contract=texture_contract
+    )
     reports["texture_normalization"] = texture_normalization
     reports["steps"].append(
         {
@@ -4422,6 +5002,11 @@ def run_import_and_repair(settings):
     # full repair pipeline. Pressing the button again is a clean update.
     if not settings.get("source_fbx_path"):
         raise RuntimeError("Source FBX path is required (run the SpeedTree export first).")
+    texture_contract = load_speedtree_texture_readiness_contract(
+        settings.get("texture_contract_path", ""),
+        spm_path=settings.get("spm_path", ""),
+        source_fbx_path=settings.get("source_fbx_path", ""),
+    )
     cleanup = clear_previous_codex_build(settings)
     imported = run_import_source_fbx(
         settings["source_fbx_path"],
@@ -4429,6 +5014,8 @@ def run_import_and_repair(settings):
         rigid_fallback=True,
         armature_name=settings.get("armature_name", "Root"),
         true_root=settings.get("true_root", "Bone_1_Start"),
+        spm_path=settings.get("spm_path", ""),
+        texture_contract=texture_contract,
     )
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:
@@ -4441,6 +5028,10 @@ def run_import_and_repair(settings):
         "imported_armature_count": imported.get("imported_armature_count", 0),
         "renamed_materials": imported.get("renamed_materials", []),
         "material_consolidation": imported.get("material_consolidation", {}),
+        "speedtree_material_intents": imported.get(
+            "speedtree_material_intents", {}
+        ),
+        "unreal_instance_profile": imported.get("unreal_instance_profile", {}),
         "rigid_fallback": imported.get("rigid_fallback"),
     }
     pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
