@@ -2564,14 +2564,47 @@ def influence_color_map(flex_by_group):
     return colors
 
 
-def build_dynamic_wind_groups(simulation_groups, flexibility=1.0):
+def build_dynamic_wind_groups(simulation_groups, flexibility=1.0, ground_cover=False):
     flex_by_group = derive_group_flex(simulation_groups, flexibility)
     max_index = max((group["index"] for group in simulation_groups), default=0)
     by_index = {group["index"]: group for group in simulation_groups}
     groups = []
+    zero_sway = flexibility <= 0.0
     for group_index in range(max_index + 1):
         source = by_index.get(group_index, {})
+        if zero_sway:
+            # Wind NONE: Unreal's trunk shader path rocks trunk bones regardless
+            # of Influence, so a truly still plant must be all non-trunk with
+            # zero influence — Influence 0 on the branch path is exact identity.
+            groups.append(
+                {
+                    "bUseDualInfluence": False,
+                    "Influence": 0.0,
+                    "MinInfluence": 0.0,
+                    "MaxInfluence": 0.0,
+                    "ShiftTop": 0.0,
+                    "bIsTrunkGroup": False,
+                }
+            )
+            continue
         if source.get("is_trunk_group", group_index == 0):
+            if ground_cover:
+                # Ground cover (grass): a trunk group makes the whole clump rock
+                # rigidly like a plate — single-generator grass SPMs put every
+                # bone in group 0, so the entire field tilts in unison. Emit the
+                # verified grass reference instead: non-trunk dual influence so
+                # blades bend per-bone on the branch path.
+                groups.append(
+                    {
+                        "bUseDualInfluence": True,
+                        "Influence": 0.0,
+                        "MinInfluence": 0.2,
+                        "MaxInfluence": 0.6,
+                        "ShiftTop": 0.3,
+                        "bIsTrunkGroup": False,
+                    }
+                )
+                continue
             groups.append(
                 {
                     "bUseDualInfluence": False,
@@ -2612,9 +2645,12 @@ def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.
         raise RuntimeError("Cannot build dynamic wind JSON: no joint→group entries (needs the SpeedTree XML).")
     return {
         "Joints": joints,
-        "SimulationGroups": build_dynamic_wind_groups(simulation_groups or [], flexibility),
+        "SimulationGroups": build_dynamic_wind_groups(simulation_groups or [], flexibility, ground_cover),
         "bIsGroundCover": bool(ground_cover),
         "GustAttenuation": float(gust_attenuation),
+        # flexibility<=0 (wind NONE) marks the mesh disabled so the runtime can
+        # skip it entirely; older importers ignore the extra key harmlessly.
+        "bIsEnabled": flexibility > 0.0,
     }
 
 
