@@ -95,6 +95,7 @@ def make_armature_object(name):
 def run_contract_smoke(
     normalize_speedtree_material_textures,
     consolidate_speedtree_group_materials,
+    speedtree_manifest_binding,
     apply_speedtree_material_intents,
     handoff_contract,
     load_speedtree_texture_readiness_contract,
@@ -376,6 +377,175 @@ def run_contract_smoke(
         if canonical_names != ["M_Leaf_common_grass_01"]:
             raise AssertionError(canonical_names)
 
+        arbitrary_materials = [
+            bpy.data.materials.new("M_Leaf_arbitrary_grass_01_fresh_custom"),
+            bpy.data.materials.new("M_Leaf_arbitrary_grass_01_winter_dry"),
+        ]
+        for material in arbitrary_materials:
+            material["codex_source_fbx"] = str(source_fbx)
+        arbitrary_intents = []
+        for index, material in enumerate(arbitrary_materials):
+            intent = handoff_contract.central_contract_api().build_material_intent(
+                material.name
+            )
+            intent.update(
+                {
+                    "stmat_material_index": index,
+                    "stmat_material_id": str(index + 20),
+                    "material_name": material.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "texture_binding": {
+                        "status": "ok",
+                        "set_key": "leafgrassatlas01",
+                        "texture_base": "T_Leaf_Grass_atlas_01",
+                        "texture_dir": str(texture_dir),
+                        "files": shared_files,
+                        "missing_roles": [],
+                    },
+                }
+            )
+            arbitrary_intents.append(intent)
+        arbitrary_envelope = {"material_intents": arbitrary_intents}
+        arbitrary_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": arbitrary_envelope,
+            "bindings": handoff_contract.texture_bindings_from_envelope(
+                arbitrary_envelope
+            ),
+        }
+        arbitrary_object = make_mesh_object(
+            "ArbitraryCollectionSuffixObject", arbitrary_materials
+        )
+        arbitrary_result = consolidate_speedtree_group_materials(
+            [arbitrary_object], texture_contract=arbitrary_contract
+        )
+        arbitrary_names = [
+            material.name for material in arbitrary_object.data.materials if material
+        ]
+        if arbitrary_names != ["M_Leaf_arbitrary_grass_01"]:
+            raise AssertionError((arbitrary_names, arbitrary_result))
+        arbitrary_normalization = normalize_speedtree_material_textures(
+            [arbitrary_object], texture_contract=arbitrary_contract
+        )
+        if arbitrary_normalization.get("status") != "ok":
+            raise AssertionError(arbitrary_normalization)
+
+        distinct_materials = [
+            bpy.data.materials.new("M_Leaf_distinct_grass_01_wet_custom"),
+            bpy.data.materials.new("M_Leaf_distinct_grass_01_dry_custom"),
+        ]
+        for material in distinct_materials:
+            material["codex_source_fbx"] = str(source_fbx)
+        distinct_bindings = []
+        for material, files in zip(distinct_materials, (shared_files, green)):
+            distinct_bindings.append(
+                {
+                    "material": material.name,
+                    "production_group_base": "M_Leaf_distinct_grass_01",
+                    "texture_source_mode": "managed_texture_set",
+                    "status": "ok",
+                    "set_key": material.name,
+                    "texture_base": material.name.replace("M_", "T_", 1),
+                    "files": {role: str(path) for role, path in files.items()},
+                    "missing_roles": [],
+                }
+            )
+        distinct_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": {"material_intents": []},
+            "bindings": distinct_bindings,
+        }
+        distinct_object = make_mesh_object(
+            "DistinctSourceSignatureObject", distinct_materials
+        )
+        distinct_result = consolidate_speedtree_group_materials(
+            [distinct_object], texture_contract=distinct_contract
+        )
+        if len(distinct_object.data.materials) != 2 or not (
+            distinct_result.get("skipped_groups")
+        ):
+            raise AssertionError(distinct_result)
+
+        isolated_objects = []
+        isolated_sources = []
+        for source_index in (1, 2):
+            isolated_asset = asset / f"isolated_{source_index}"
+            isolated_fbx = isolated_asset / "fbx" / "source.fbx"
+            isolated_fbx.parent.mkdir(parents=True)
+            isolated_fbx.write_bytes(f"source-{source_index}".encode("ascii"))
+            touch_texture_set(
+                isolated_asset / "texture" / "substance",
+                "T_Leaf_source_guard_01",
+            )
+            isolated_materials = [
+                bpy.data.materials.new("M_Leaf_source_guard_01_fresh"),
+                bpy.data.materials.new("M_Leaf_source_guard_01_winter"),
+            ]
+            for material in isolated_materials:
+                material["codex_source_fbx"] = str(isolated_fbx)
+            isolated_objects.append(
+                make_mesh_object(
+                    f"SourceIsolationObject{source_index}", isolated_materials
+                )
+            )
+            isolated_sources.append(str(isolated_fbx.resolve()).casefold())
+        isolated_result = consolidate_speedtree_group_materials(isolated_objects)
+        isolated_targets = [
+            obj.data.materials[0] for obj in isolated_objects
+        ]
+        if any(len(obj.data.materials) != 1 for obj in isolated_objects):
+            raise AssertionError(isolated_result)
+        if isolated_targets[0] == isolated_targets[1]:
+            raise AssertionError("different source FBXs shared one consolidated material")
+        if {
+            str(material.get("codex_source_fbx", "")).casefold()
+            for material in isolated_targets
+        } != set(isolated_sources):
+            raise AssertionError(isolated_result)
+
+        manifest_material = bpy.data.materials.new(
+            "M_Leaf_manifest_grass_01_winter_dry"
+        )
+        manifest_material["codex_source_fbx"] = str(source_fbx)
+        manifest_path = asset / "speedtree_import_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "source_collection": "Atlas_Leaf_Meshes",
+                    "blend_file": str(asset / "M_Leaf_manifest_grass_01.blend"),
+                    "material": None,
+                    "material_groups": [
+                        {
+                            "collection": "Fresh Custom",
+                            "material": "M_Leaf_manifest_grass_01_fresh_custom",
+                        },
+                        {
+                            "collection": "Winter Dry",
+                            "material": "M_Leaf_manifest_grass_01_winter_dry",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest_stmat = {
+            "materials": {
+                "mleafmanifestgrass01winterdry": {
+                    "user_data": {},
+                    "source_paths": [],
+                }
+            }
+        }
+        manifest_binding = speedtree_manifest_binding(
+            source_fbx, manifest_material, stmat_data=manifest_stmat
+        )
+        if not manifest_binding or manifest_binding.get("target_name") != (
+            "M_Leaf_manifest_grass_01"
+        ):
+            raise AssertionError(manifest_binding)
+
         profile_materials = [
             bpy.data.materials.new("M_Profile_stem_01"),
             bpy.data.materials.new("M_Profile_leaf_01"),
@@ -609,6 +779,12 @@ def run_contract_smoke(
             "canonical_files": {role: str(path) for role, path in canonical.items()},
             "canonical_consolidation": canonical_result,
             "canonical_materials": canonical_names,
+            "arbitrary_suffix_consolidation": arbitrary_result,
+            "arbitrary_suffix_materials": arbitrary_names,
+            "arbitrary_suffix_normalization": arbitrary_normalization,
+            "distinct_signature_not_consolidated": distinct_result,
+            "source_isolation_consolidation": isolated_result,
+            "legacy_manifest_binding": manifest_binding,
             "instance_profile": profile_result,
             "strict_contract_load": {
                 "contract_path": loaded_strict_contract.get("contract_path"),
@@ -642,6 +818,7 @@ def main():
     try:
         addon_utils.enable("speedtree_bone_weight_repair", default_set=False)
         from speedtree_bone_weight_repair.core import (
+            _speedtree_manifest_binding,
             apply_speedtree_material_intents,
             apply_spm_unreal_instance_profile,
             consolidate_speedtree_group_materials,
@@ -657,6 +834,7 @@ def main():
             result = run_contract_smoke(
                 normalize_speedtree_material_textures,
                 consolidate_speedtree_group_materials,
+                _speedtree_manifest_binding,
                 apply_speedtree_material_intents,
                 handoff_contract,
                 load_speedtree_texture_readiness_contract,

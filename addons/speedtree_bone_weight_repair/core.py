@@ -441,6 +441,33 @@ def _speedtree_material_name_key(value):
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def _fallback_production_group_parts(value):
+    """Mirror the shared numeric-boundary rule for standalone installs."""
+    name = re.sub(r"(\.\d{3})$", "", str(value or "").strip())
+    if name.casefold().endswith("_mat"):
+        name = name[:-4]
+    numeric_segments = list(
+        re.finditer(r"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])", name)
+    )
+    if not numeric_segments:
+        return name, ""
+    boundary = numeric_segments[-1]
+    suffix_match = re.fullmatch(r"[_. -]+(.+)", name[boundary.end() :])
+    if not suffix_match:
+        return name, ""
+    suffix = suffix_match.group(1).strip().casefold()
+    return (name[: boundary.end()], suffix) if suffix else (name, "")
+
+
+def _production_group_parts(value):
+    try:
+        tokens = handoff_contract.production_group_tokens(value)
+        base = handoff_contract.production_group_base_name(value)
+        return base, tokens[0] if tokens else ""
+    except RuntimeError:
+        return _fallback_production_group_parts(value)
+
+
 def _speedtree_stmat_materials(source_fbx_path):
     """Read authoritative material provenance from SpeedTree's FBX sidecar."""
     stmat_path = Path(source_fbx_path).resolve().with_suffix(".stmat")
@@ -615,6 +642,45 @@ def _load_speedtree_import_manifest(path):
     return data if isinstance(data, dict) else None
 
 
+def _speedtree_manifest_target_name(manifest):
+    """Return a manifest-proven atlas base without using a collection label."""
+    explicit = str(
+        manifest.get("atlas_asset_name") or manifest.get("material") or ""
+    ).strip()
+    if explicit:
+        return explicit
+
+    group_parts = []
+    for group in manifest.get("material_groups") or []:
+        material_name = str(group.get("material") or "").strip()
+        if not material_name:
+            return ""
+        base_name, group_suffix = _production_group_parts(material_name)
+        if not base_name or not group_suffix:
+            return ""
+        group_parts.append((base_name, group_suffix))
+    if len(group_parts) < 2:
+        return ""
+
+    common_keys = {
+        _speedtree_material_name_key(base_name)
+        for base_name, _group_suffix in group_parts
+    }
+    if len(common_keys) != 1:
+        return ""
+    common_base = group_parts[0][0]
+
+    blend_file = str(manifest.get("blend_file") or "").strip()
+    blend_stem = Path(blend_file.replace("\\", "/")).stem if blend_file else ""
+    if (
+        blend_stem
+        and _speedtree_material_name_key(blend_stem)
+        == _speedtree_material_name_key(common_base)
+    ):
+        return blend_stem
+    return common_base
+
+
 def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, manifest_cache=None):
     """Resolve an intermediate atlas group material to its final atlas material."""
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
@@ -633,10 +699,11 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
         manifest_scope = str(manifest.get("export_scope_id") or "").strip()
         if stmat_scope and manifest_scope and stmat_scope != manifest_scope:
             continue
-        # A one-group export already has its final material name. Multi-group
-        # atlases intentionally set ``material`` to null and collapse back to
-        # the source collection name during repair.
-        target_name = str(manifest.get("material") or manifest.get("source_collection") or "").strip()
+        # New manifests persist atlas_asset_name. For legacy multi-group
+        # manifests, prove the target from their shared numeric-boundary base
+        # (and prefer a matching .blend stem). A generic source_collection such
+        # as Atlas_Leaf_Meshes is ownership metadata, not a material name.
+        target_name = _speedtree_manifest_target_name(manifest)
         if not target_name:
             continue
         for group in manifest.get("material_groups") or []:
@@ -655,7 +722,8 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
 
 def _speedtree_material_texture_dirs(source_fbx_path, material, stmat_data=None):
     """Return managed texture locations, including shared paths recorded by SpeedTree."""
-    paths = [_speedtree_texture_dir(source_fbx_path)]
+    texture_root = _speedtree_texture_dir(source_fbx_path)
+    paths = [texture_root, texture_root / "substance"]
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
     stmat_material = stmat_data.get("materials", {}).get(
         _speedtree_material_name_key(material.name), {}
@@ -826,6 +894,23 @@ def _complete_speedtree_texture_set(
             },
         }
     return None
+
+
+def _speedtree_texture_file_signature(texture_set):
+    if not texture_set:
+        return ()
+    files = texture_set.get("files") or {}
+    if not all(role in files for role in SPEEDTREE_TEXTURE_ROLES):
+        return ()
+    return tuple(
+        (
+            role,
+            os.path.normcase(
+                os.path.normpath(os.path.abspath(os.path.expanduser(str(files[role]))))
+            ).casefold(),
+        )
+        for role in SPEEDTREE_TEXTURE_ROLES
+    )
 
 
 def _remove_speedtree_image_nodes(material):
@@ -1316,43 +1401,18 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
     }
 
 
-MATERIAL_GROUP_TOKENS = {"green", "yellow", "twig", "twigs", "stem", "stems", "dead"}
-
-
-def material_name_tokens(name):
-    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", name or "").lower()
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    return [token for token in normalized.split("_") if token]
-
-
 def material_group_token(material):
-    try:
-        tokens = handoff_contract.production_group_tokens(
-            material.name if material else ""
-        )
-        return tokens[0] if tokens else ""
-    except RuntimeError:
-        # Legacy/local installs without the shared repo keep the existing rule.
-        pass
-    tokens = material_name_tokens(material.name if material else "")
-    for token in tokens:
-        if token in MATERIAL_GROUP_TOKENS:
-            return "twig" if token == "twigs" else "stem" if token == "stems" else token
-    return ""
+    _base_name, group_suffix = _production_group_parts(
+        material.name if material else ""
+    )
+    return group_suffix
 
 
 def material_base_name(material):
     if material is None:
         return ""
-    try:
-        return handoff_contract.production_group_base_name(material.name)
-    except RuntimeError:
-        # Legacy/local installs without the shared repo keep the existing rule.
-        pass
-    name = re.sub(r"(\.\d{3})$", "", material.name)
-    parts = [part for part in re.split(r"[^a-zA-Z0-9]+", name) if part]
-    kept = [part for part in parts if part.lower() not in MATERIAL_GROUP_TOKENS]
-    return "_".join(kept).strip("_")
+    base_name, _group_suffix = _production_group_parts(material.name)
+    return base_name
 
 
 def material_texture_signature(material):
@@ -1419,16 +1479,28 @@ def _consolidate_speedtree_manifest_materials(mesh_objects):
                 target_key = _speedtree_texture_set_key(binding["target_name"])
                 texture_cache_key = (source_key, target_key)
                 if texture_cache_key not in target_texture_cache:
-                    target_match = _speedtree_texture_sets(
-                        _speedtree_texture_dir(source_fbx)
-                    ).get(target_key)
-                    target_texture_cache[texture_cache_key] = bool(
-                        target_match
-                        and len(target_match["bases"]) == 1
-                        and all(
-                            role in target_match["files"]
-                            for role in SPEEDTREE_TEXTURE_ROLES
+                    target_signatures = set()
+                    for texture_dir in _speedtree_material_texture_dirs(
+                        source_fbx, material, stmat_cache[source_key]
+                    ):
+                        target_match = _speedtree_texture_sets(texture_dir).get(
+                            target_key
                         )
+                        if not (
+                            target_match
+                            and len(target_match["bases"]) == 1
+                            and all(
+                                role in target_match["files"]
+                                for role in SPEEDTREE_TEXTURE_ROLES
+                            )
+                        ):
+                            continue
+                        target_signatures.add(
+                            _speedtree_texture_file_signature(target_match)
+                        )
+                    target_signatures.discard(())
+                    target_texture_cache[texture_cache_key] = (
+                        len(target_signatures) == 1
                     )
                 # The manifest describes the intended atlas relationship, but
                 # older assets may still only have group-specific T_ outputs.
@@ -1558,10 +1630,52 @@ def _consolidate_speedtree_manifest_materials(mesh_objects):
     }
 
 
-def consolidate_speedtree_group_materials(objects):
-    # SpeedTree FBX grouped by material can come back as Green/Twig/Stem slots
-    # even when they are all the same atlas texture. Collapse those slots before
-    # merge/weight export; do not touch object transforms, UVs, vertex groups, or weights.
+def _strict_consolidation_binding_signature(material, texture_contract):
+    candidates = [
+        binding
+        for binding in (texture_contract.get("bindings") or [])
+        if isinstance(binding, dict)
+        and _speedtree_material_name_key(binding.get("material"))
+        == _speedtree_material_name_key(material.name)
+    ]
+    signatures = set()
+    for binding in candidates:
+        if (
+            str(binding.get("texture_source_mode") or "")
+            != "managed_texture_set"
+            or str(binding.get("status") or "") != "ok"
+        ):
+            continue
+        files = binding.get("files") or {}
+        file_signature = _speedtree_texture_file_signature({"files": files})
+        if not file_signature:
+            continue
+        ready = True
+        for role in SPEEDTREE_TEXTURE_ROLES:
+            try:
+                path = Path(str(files.get(role) or ""))
+                if not path.is_file() or path.stat().st_size <= 0:
+                    ready = False
+                    break
+            except OSError:
+                ready = False
+                break
+        if not ready:
+            continue
+        signatures.add(
+            (
+                str(binding.get("set_key") or "").casefold(),
+                str(binding.get("texture_base") or "").casefold(),
+                file_signature,
+            )
+        )
+    return next(iter(signatures)) if len(signatures) == 1 else ()
+
+
+def consolidate_speedtree_group_materials(objects, texture_contract=None):
+    # Atlas Builder child collections become numeric-boundary material suffixes.
+    # Collapse proven shared-source slots before merge/weight export; do not
+    # touch object transforms, UVs, vertex groups, or weights.
     mesh_objects = [obj for obj in objects if obj.type == "MESH" and obj.data]
     if not mesh_objects:
         return {
@@ -1571,7 +1685,17 @@ def consolidate_speedtree_group_materials(objects):
             "skipped_groups": [],
         }
 
-    manifest_result = _consolidate_speedtree_manifest_materials(mesh_objects)
+    strict_contract = bool(
+        isinstance(texture_contract, dict)
+        and texture_contract.get("strict_speedtree_pipeline_contract")
+    )
+    # The validated contract is authoritative. Legacy manifest consolidation
+    # must not mutate a strict scene before its binding signatures are checked.
+    manifest_result = (
+        {"groups": [], "changed_object_count": 0, "changed_face_count": 0}
+        if strict_contract
+        else _consolidate_speedtree_manifest_materials(mesh_objects)
+    )
     stmat_cache = {}
     texture_index_cache = {}
     skipped_groups = []
@@ -1582,17 +1706,26 @@ def consolidate_speedtree_group_materials(objects):
             group_token = material_group_token(material)
             if not group_token:
                 continue
-            # SpeedTree material-group exports often write separate Green/Stem/Twig
-            # image files even when they came from the same atlas. The normalized
-            # base material name is therefore the primary grouping key; texture
-            # paths stay in the report as diagnostics instead of blocking the merge.
             base_name = material_base_name(material)
-            key = ("base", base_name) if base_name else ("texture", material_texture_signature(material))
-            grouped[key].append((obj, slot_index, material, group_token))
+            source_key = normalized_source_fbx_path(
+                material.get("codex_source_fbx", "") if material else ""
+            )
+            texture_signature = material_texture_signature(material)
+            if source_key:
+                provenance = ("source_fbx", source_key)
+            elif texture_signature:
+                provenance = ("texture_signature", texture_signature)
+            else:
+                # A parsed suffix is metadata only; without provenance it does
+                # not authorize merging materials by name.
+                continue
+            grouped[(provenance, base_name)].append(
+                (obj, slot_index, material, group_token)
+            )
 
     reports = []
-    for (key_type, key_value), entries in grouped.items():
-        base_name = key_value if key_type == "base" else ""
+    for (provenance, base_name), entries in grouped.items():
+        provenance_type, provenance_value = provenance
         group_tokens = sorted({entry[3] for entry in entries})
         if len(group_tokens) < 2:
             continue
@@ -1607,29 +1740,73 @@ def consolidate_speedtree_group_materials(objects):
 
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
         target_name = unified_material_name(base_name, source_materials)
-        canonical_sets = [
-            _complete_speedtree_texture_set(
-                material,
-                target_name,
-                stmat_cache=stmat_cache,
-                texture_index_cache=texture_index_cache,
+        if strict_contract:
+            binding_signatures = [
+                _strict_consolidation_binding_signature(
+                    material, texture_contract
+                )
+                for material in source_materials
+            ]
+            binding_ready = bool(
+                all(binding_signatures)
+                and len(set(binding_signatures)) == 1
             )
-            for material in source_materials
-        ]
-        if not all(canonical_sets):
+            readiness_mode = "strict_texture_contract"
+        else:
+            canonical_sets = [
+                _complete_speedtree_texture_set(
+                    material,
+                    target_name,
+                    stmat_cache=stmat_cache,
+                    texture_index_cache=texture_index_cache,
+                )
+                for material in source_materials
+            ]
+            canonical_signatures = [
+                _speedtree_texture_file_signature(texture_set)
+                for texture_set in canonical_sets
+            ]
+            binding_ready = bool(
+                all(canonical_signatures)
+                and len(set(canonical_signatures)) == 1
+            )
+            readiness_mode = "canonical_texture_set"
+        if not binding_ready:
             skipped_groups.append(
                 {
-                    "mode": "name_tokens",
+                    "mode": "production_group_suffix",
                     "target_material": target_name,
                     "source_materials": [
                         material.name for material in source_materials
                     ],
                     "group_tokens": group_tokens,
-                    "reason": "canonical target T_ six-map set is not complete",
+                    "provenance_type": provenance_type,
+                    "reason": (
+                        "strict bindings do not prove one shared managed six-map set"
+                        if strict_contract
+                        else "canonical target T_ six-map set is not complete or differs by source"
+                    ),
                 }
             )
             continue
-        target_material = bpy.data.materials.get(target_name)
+        target_material = next(
+            (
+                candidate
+                for candidate in bpy.data.materials
+                if _speedtree_material_name_key(candidate.name)
+                == _speedtree_material_name_key(target_name)
+                and (
+                    normalized_source_fbx_path(
+                        candidate.get("codex_source_fbx", "")
+                    )
+                    == provenance_value
+                    if provenance_type == "source_fbx"
+                    else material_texture_signature(candidate)
+                    == provenance_value
+                )
+            ),
+            None,
+        )
         if target_material is None:
             target_material = source_materials[0].copy()
             target_material.name = target_name
@@ -1669,11 +1846,17 @@ def consolidate_speedtree_group_materials(objects):
 
         reports.append(
             {
-                "mode": "name_tokens",
+                "mode": "production_group_suffix",
                 "target_material": target_material.name,
                 "source_materials": [material.name for material in source_materials],
                 "group_tokens": group_tokens,
-                "key_type": key_type,
+                "provenance_type": provenance_type,
+                "source_fbx": (
+                    str(source_materials[0].get("codex_source_fbx", ""))
+                    if provenance_type == "source_fbx"
+                    else ""
+                ),
+                "readiness_mode": readiness_mode,
                 "texture_signatures": [list(signature) for signature in texture_signatures],
                 "object_count": len(changed_objects),
                 "objects": changed_objects[:200],
@@ -1831,7 +2014,9 @@ def run_import_source_fbx(
         ensure_only_collection(obj, source_collection)
     tag_speedtree_import_materials(imported, path)
     renamed_materials = strip_speedtree_material_suffixes(imported)
-    material_consolidation = consolidate_speedtree_group_materials(imported)
+    material_consolidation = consolidate_speedtree_group_materials(
+        imported, texture_contract=texture_contract
+    )
     material_intents = apply_speedtree_material_intents(
         imported, texture_contract=texture_contract
     )
@@ -4779,7 +4964,9 @@ def run_full_pipeline(settings):
             {"name": "normalize_material_names", "status": "applied", "renamed": renamed_materials}
         )
 
-    material_consolidation = consolidate_speedtree_group_materials(source_import_meshes)
+    material_consolidation = consolidate_speedtree_group_materials(
+        source_import_meshes, texture_contract=texture_contract
+    )
     reports["steps"].append(
         {
             "name": "consolidate_speedtree_group_materials",

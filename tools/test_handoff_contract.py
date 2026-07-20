@@ -144,6 +144,27 @@ class BwrHandoffContractTests(unittest.TestCase):
             self.assertEqual(consolidated["tree_shading"], "foliage")
             self.assertEqual(consolidated["instance_profile"], "dead")
 
+    def test_arbitrary_collection_suffix_uses_numeric_boundary(self):
+        self.assertEqual(
+            adapter.production_group_base_name(
+                "M_Leaf_common_grass_01_winter_dry"
+            ),
+            "M_Leaf_common_grass_01",
+        )
+        self.assertEqual(
+            adapter.production_group_tokens(
+                "M_Leaf_common_grass_01_winter_dry"
+            ),
+            ["winter_dry"],
+        )
+        self.assertEqual(
+            adapter.production_group_base_name("M_stem_common_01"),
+            "M_stem_common_01",
+        )
+        self.assertEqual(
+            adapter.production_group_tokens("M_stem_common_01"), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
