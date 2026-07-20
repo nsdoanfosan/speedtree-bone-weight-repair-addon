@@ -675,8 +675,22 @@ def _speedtree_material_texture_dirs(source_fbx_path, material, stmat_data=None)
     return unique
 
 
+def _canonical_speedtree_texture_base(spelling_counts):
+    """Pick one canonical spelling among case-variant texture base names.
+
+    Windows filesystems treat differently cased spellings as one managed set,
+    so the spelling used by the most role files wins; a single stray file such
+    as ``T_leaf_x_atlas_02_extra`` cannot rename or split the set.
+    """
+    return min(spelling_counts, key=lambda name: (-spelling_counts[name], name))
+
+
 def _speedtree_texture_sets(texture_dir):
-    """Index only the managed top-level T_<set>_<role> batch outputs."""
+    """Index only the managed top-level T_<set>_<role> batch outputs.
+
+    Base names that differ only by case are one set; ``bases`` holds one
+    canonical spelling per set.
+    """
     texture_dir = Path(texture_dir)
     indexed = defaultdict(lambda: {"bases": set(), "files": {}})
     if not texture_dir.is_dir():
@@ -686,6 +700,7 @@ def _speedtree_texture_sets(texture_dir):
     extension_rank = {
         extension: index for index, extension in enumerate(SPEEDTREE_TEXTURE_EXTENSIONS)
     }
+    base_spellings = defaultdict(dict)
     for path in texture_dir.iterdir():
         if not path.is_file() or path.suffix.lower() not in extension_rank:
             continue
@@ -695,10 +710,16 @@ def _speedtree_texture_sets(texture_dir):
         texture_base, role = match.group(1), match.group(2).lower()
         key = _speedtree_texture_set_key(texture_base)
         row = indexed[key]
-        row["bases"].add(texture_base)
+        spelling_counts = base_spellings[key].setdefault(texture_base.casefold(), {})
+        spelling_counts[texture_base] = spelling_counts.get(texture_base, 0) + 1
         current = row["files"].get(role)
         if current is None or extension_rank[path.suffix.lower()] < extension_rank[current.suffix.lower()]:
             row["files"][role] = path
+    for key, variants in base_spellings.items():
+        indexed[key]["bases"] = {
+            _canonical_speedtree_texture_base(spelling_counts)
+            for spelling_counts in variants.values()
+        }
     return indexed
 
 
@@ -736,7 +757,9 @@ def _speedtree_stmat_texture_set(source_fbx_path, material, stmat_data=None):
         row = referenced[
             (os.path.normcase(str(path.parent)), _speedtree_texture_set_key(texture_base))
         ]
-        row["bases"].add(texture_base)
+        # Case-variant spellings of one base are one reference on Windows;
+        # the canonical spelling comes from the directory scan below.
+        row["bases"].add(texture_base.casefold())
         row["roles"].add(role)
 
     complete = []
