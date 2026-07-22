@@ -1,5 +1,6 @@
 import colorsys
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -2633,17 +2634,151 @@ def build_dynamic_wind_groups(simulation_groups, flexibility=1.0, ground_cover=F
     return groups
 
 
-def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.25, ground_cover=False, flexibility=1.0):
-    joints = []
+def build_final_skeleton_wind_contract(bone_records, import_root_name):
+    """Build the UE FBX identity, including the armature-object root bone.
+
+    Send2UE exports the Blender armature object as the UE reference skeleton's
+    index-0 root. The isolated Elm pilot proves the concrete mapping used by
+    this pipeline: armature object ``Root`` followed by all Blender bones with
+    indices shifted by one. The live armature object name is used here rather
+    than guessing a constant.
+    """
+    blender_bones = []
     for bone in bone_records or []:
-        name = bone.get("name")
+        name = str(bone.get("name") or "")
+        if not name or bone.get("bone_index") is None:
+            raise RuntimeError(
+                "Cannot build DynamicWind skeleton contract: missing final bone name/index."
+            )
+        blender_bones.append(
+            {
+                "name": name,
+                "bone_index": int(bone["bone_index"]),
+                "parent_index": int(bone.get("parent_index", -1)),
+                "group": bone.get("group"),
+            }
+        )
+
+    blender_bones.sort(key=lambda item: item["bone_index"])
+    expected_indices = list(range(len(blender_bones)))
+    actual_indices = [item["bone_index"] for item in blender_bones]
+    if not blender_bones or actual_indices != expected_indices:
+        raise RuntimeError(
+            "Cannot build DynamicWind skeleton contract: final bone indices "
+            "must be unique and contiguous from zero."
+        )
+    root_name = str(import_root_name or "").strip()
+    if not root_name:
+        raise RuntimeError(
+            "Cannot build DynamicWind skeleton contract: armature object root name missing."
+        )
+    names = [item["name"] for item in blender_bones]
+    if root_name in names:
+        raise RuntimeError(
+            "Cannot build DynamicWind skeleton contract: armature object root "
+            f"duplicates a Blender bone name ({root_name})."
+        )
+    if len(set(names)) != len(names):
+        raise RuntimeError(
+            "Cannot build DynamicWind skeleton contract: duplicate final bone names."
+        )
+    for item in blender_bones:
+        parent_index = item["parent_index"]
+        if parent_index < -1 or parent_index >= len(blender_bones):
+            raise RuntimeError(
+                "Cannot build DynamicWind skeleton contract: parent index out of range "
+                f"for {item['name']}: {parent_index}."
+            )
+        if parent_index == item["bone_index"]:
+            raise RuntimeError(
+                "Cannot build DynamicWind skeleton contract: bone cannot parent itself "
+                f"({item['name']})."
+            )
+
+    final_bones = [
+        {
+            "name": root_name,
+            "bone_index": 0,
+            "parent_index": -1,
+            "group": None,
+            "identity_source": "blender_armature_object",
+        }
+    ]
+    for item in blender_bones:
+        final_bones.append(
+            {
+                "name": item["name"],
+                "bone_index": item["bone_index"] + 1,
+                "parent_index": (
+                    item["parent_index"] + 1
+                    if item["parent_index"] >= 0
+                    else 0
+                ),
+                "group": item["group"],
+                "identity_source": "blender_armature_bone",
+            }
+        )
+
+    digest = hashlib.sha1()
+    identity_rows = []
+    for item in final_bones:
+        digest.update(
+            (
+                f"{item['bone_index']}\0{item['name']}\0"
+                f"{item['parent_index']}\n"
+            ).encode("utf-8")
+        )
+        identity_rows.append(
+            {
+                "BoneName": item["name"],
+                "BoneIndex": item["bone_index"],
+                "ParentIndex": item["parent_index"],
+            }
+        )
+    return final_bones, {
+        "SchemaVersion": 2,
+        "BoneCount": len(final_bones),
+        "BoneNameIndexParentSha1": digest.hexdigest(),
+        "Bones": identity_rows,
+        "ImportRoot": {
+            "BoneName": root_name,
+            "BoneIndex": 0,
+            "ParentIndex": -1,
+            "Source": "blender_armature_object",
+            "ExportContract": "send2ue_fbx_armature_object_root",
+        },
+    }
+
+
+def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.25, ground_cover=False, flexibility=1.0, import_root_name=None):
+    indexed, skeleton_contract = build_final_skeleton_wind_contract(
+        bone_records, import_root_name
+    )
+    joints = []
+    for bone in indexed:
         group = bone.get("group")
-        if not name or group is None:
+        if group is None:
+            # Import roots and intentionally non-simulated bones remain in the
+            # full identity contract but are not DynamicWind joints.
             continue
-        joints.append({"JointName": name, "SimulationGroupIndex": int(group)})
+        group_index = int(group)
+        if group_index < 0:
+            raise RuntimeError(
+                "Cannot build dynamic wind JSON: simulation group index is negative "
+                f"for {bone['name']}: {group_index}."
+            )
+        joints.append(
+            {
+                "JointName": bone["name"],
+                "BoneIndex": bone["bone_index"],
+                "ParentIndex": bone["parent_index"],
+                "SimulationGroupIndex": group_index,
+            }
+        )
     if not joints:
         raise RuntimeError("Cannot build dynamic wind JSON: no joint→group entries (needs the SpeedTree XML).")
     return {
+        "SkeletonContract": skeleton_contract,
         "Joints": joints,
         "SimulationGroups": build_dynamic_wind_groups(simulation_groups or [], flexibility, ground_cover),
         "bIsGroundCover": bool(ground_cover),
@@ -2655,10 +2790,17 @@ def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.
 
 
 def build_armature_fallback_metadata(xml_path, armature, reason):
-    names = [bone.name for bone in armature.data.bones]
+    bones = list(armature.data.bones)
+    names = [bone.name for bone in bones]
     records = [
         {
-            "name": name,
+            "name": bone.name,
+            "bone_index": index,
+            "parent_index": (
+                armature.data.bones.find(bone.parent.name)
+                if bone.parent is not None
+                else -1
+            ),
             "xml_id": None,
             "generator": "RigidFallback",
             "mass": 0.0,
@@ -2666,7 +2808,7 @@ def build_armature_fallback_metadata(xml_path, armature, reason):
             "group": 0,
             "match_distance": None,
         }
-        for name in names
+        for index, bone in enumerate(bones)
     ]
     group = {
         "index": 0,
@@ -2775,12 +2917,14 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             gust_attenuation=settings.get("dynamic_wind_gust_attenuation", 0.25),
             ground_cover=settings.get("dynamic_wind_ground_cover", False),
             flexibility=settings.get("dynamic_wind_flexibility", 1.0),
+            import_root_name=armature.name,
         )
         write_report(dynamic_wind_path, dynamic_wind)
         result["dynamic_wind_path"] = dynamic_wind_path
         result["dynamic_wind"] = {
             "joint_count": len(dynamic_wind["Joints"]),
             "simulation_group_count": len(dynamic_wind["SimulationGroups"]),
+            "skeleton_contract": dynamic_wind["SkeletonContract"],
         }
     return result
 
@@ -4082,6 +4226,12 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
         bone_records.append(
             {
                 "name": name,
+                "bone_index": index,
+                "parent_index": (
+                    armature.data.bones.find(armature.data.bones[index].parent.name)
+                    if armature.data.bones[index].parent is not None
+                    else -1
+                ),
                 "xml_id": xml_bone["id"],
                 "generator": xml_bone["generator"],
                 "mass": xml_bone["mass"],
