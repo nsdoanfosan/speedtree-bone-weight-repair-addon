@@ -28,6 +28,10 @@ JSON_PREVIEW_ATTR_NAME = "Codex_JSON_Group_Preview"
 JSON_PREVIEW_SCENE_KEY = "codex_json_preview_active"
 JSON_PREVIEW_COLLECTION_HIDE_KEY = "codex_json_preview_original_hide_viewport"
 JSON_PREVIEW_ARMATURE_HIDE_KEY = "codex_json_preview_armature_prev_hide"
+CLUSTER_NORMALIZER_GENERATED_KEYS = (
+    "speedtree_cluster_generated",
+    "atlas_leaf_cluster_generated",
+)
 SPEEDTREE_MODEL_USER_DATA_PROPERTY = "SpeedTree SDK:User data"
 UNREAL_INSTANCE_PROFILE_PROPERTY = "unreal_instance_profile"
 UNREAL_INSTANCE_PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -47,6 +51,13 @@ def write_report(path, data):
         return
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def is_cluster_normalizer_generated(data_block):
+    return bool(
+        data_block
+        and any(data_block.get(key) for key in CLUSTER_NORMALIZER_GENERATED_KEYS)
+    )
 
 
 def load_speedtree_texture_readiness_contract(
@@ -290,6 +301,17 @@ def run_speedtree_cli_export(
             timeout_seconds=timeout_seconds,
         )
 
+    bundle_mtime_sync = None
+    if "fbx" in results and "xml" in results:
+        bundle_minimum_mtime = max(
+            spm.stat().st_mtime_ns,
+            Path(results["fbx"]["path"]).stat().st_mtime_ns,
+        )
+        bundle_mtime_sync = speedtree_cli.synchronize_result_mtime(
+            results["xml"],
+            bundle_minimum_mtime,
+        )
+
     return {
         "speedtree_exe": str(exe),
         "spm": str(spm),
@@ -299,6 +321,7 @@ def run_speedtree_cli_export(
         "spm_has_enabled_bones": has_enabled_bones,
         "spm_bone_generators": bone_status,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
+        "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
     }
 
@@ -370,6 +393,45 @@ def belongs_to_source_fbx(datablock, source_fbx_path):
     return bool(tagged_path) and (
         normalized_source_fbx_path(tagged_path)
         == normalized_source_fbx_path(source_fbx_path)
+    )
+
+
+def source_fbx_cleanup_lineage(source_fbx_path):
+    """Return canonical FBX plus its retired unprefixed compatibility alias.
+
+    Cluster output names are now canonicalized to ``SK_*``.  Older repair runs
+    may still have Blender datablocks tagged with the sibling FBX name without
+    that prefix.  The alias is used only by the idempotent cleanup pass and only
+    for ``Cluster/fbx`` outputs; normal provenance checks remain exact-path
+    checks.
+    """
+    if not source_fbx_path:
+        return set()
+    source_path = Path(source_fbx_path)
+    paths = {normalized_source_fbx_path(source_path)}
+    is_cluster_output = (
+        source_path.parent.name.casefold() == "fbx"
+        and source_path.parent.parent.name.casefold() == "cluster"
+    )
+    if (
+        is_cluster_output
+        and source_path.stem.lower().startswith("sk_")
+        and len(source_path.stem) > 3
+    ):
+        legacy_path = source_path.with_name(
+            source_path.stem[3:] + source_path.suffix
+        )
+        paths.add(normalized_source_fbx_path(legacy_path))
+    return paths
+
+
+def belongs_to_source_fbx_cleanup_lineage(datablock, source_fbx_path):
+    if datablock is None:
+        return False
+    tagged_path = datablock.get("codex_source_fbx", "")
+    return bool(tagged_path) and (
+        normalized_source_fbx_path(tagged_path)
+        in source_fbx_cleanup_lineage(source_fbx_path)
     )
 
 
@@ -1673,6 +1735,203 @@ def _strict_consolidation_binding_signature(material, texture_contract):
     return next(iter(signatures)) if len(signatures) == 1 else ()
 
 
+def _blender_numeric_material_base(value):
+    name = str(value or "").strip()
+    return re.sub(r"(\.\d{3})$", "", name)
+
+
+def _numeric_material_equivalence(left, right, texture_contract):
+    """Return the proof that two Blender-collision materials are identical.
+
+    A ``.001`` suffix is never accepted as an Unreal export name by itself.
+    It only identifies a candidate pair.  The actual merge still requires
+    shared source provenance, one strict managed texture binding, or the exact
+    same non-empty image-file signature.
+    """
+    if left is None or right is None:
+        return ""
+    left_source = normalized_source_fbx_path(
+        left.get("codex_source_fbx", "")
+    )
+    right_source = normalized_source_fbx_path(
+        right.get("codex_source_fbx", "")
+    )
+    if left_source and left_source == right_source:
+        return "source_fbx"
+
+    if (
+        isinstance(texture_contract, dict)
+        and texture_contract.get("strict_speedtree_pipeline_contract")
+    ):
+        left_binding = _strict_consolidation_binding_signature(
+            left, texture_contract
+        )
+        right_binding = _strict_consolidation_binding_signature(
+            right, texture_contract
+        )
+        if left_binding and left_binding == right_binding:
+            return "strict_texture_contract"
+
+    left_textures = material_texture_signature(left)
+    right_textures = material_texture_signature(right)
+    if left_textures and left_textures == right_textures:
+        return "texture_signature"
+    return ""
+
+
+def _consolidate_blender_numeric_material_duplicates(
+    mesh_objects, texture_contract=None
+):
+    """Remap proven ``Material``/``Material.001`` collisions to one datablock."""
+    used_materials = []
+    seen_materials = set()
+    numeric_bases = set()
+    for obj in mesh_objects:
+        for material in obj.data.materials:
+            if material is None or material in seen_materials:
+                continue
+            seen_materials.add(material)
+            used_materials.append(material)
+            base_name = _blender_numeric_material_base(material.name)
+            if base_name != material.name:
+                numeric_bases.add(base_name.casefold())
+
+    if not numeric_bases:
+        return {
+            "groups": [],
+            "skipped_groups": [],
+            "changed_object_count": 0,
+            "changed_face_count": 0,
+        }
+
+    all_materials = list(used_materials)
+    all_materials.extend(
+        material
+        for material in bpy.data.materials
+        if material not in seen_materials
+    )
+    targets_by_base = defaultdict(list)
+    for material in all_materials:
+        base_name = _blender_numeric_material_base(material.name)
+        if (
+            base_name == material.name
+            and base_name.casefold() in numeric_bases
+        ):
+            targets_by_base[base_name.casefold()].append(material)
+
+    material_targets = {}
+    proofs = {}
+    skipped_groups = []
+    for material in used_materials:
+        base_name = _blender_numeric_material_base(material.name)
+        if base_name == material.name:
+            continue
+        candidates = []
+        for target in targets_by_base.get(base_name.casefold(), []):
+            proof = _numeric_material_equivalence(
+                material, target, texture_contract
+            )
+            if proof:
+                candidates.append((target, proof))
+        if len(candidates) == 1:
+            target, proof = candidates[0]
+            material_targets[material] = target
+            proofs[material] = proof
+            continue
+        skipped_groups.append(
+            {
+                "mode": "blender_numeric_collision",
+                "target_material": base_name,
+                "source_materials": [material.name],
+                "reason": (
+                    "no proven canonical material match"
+                    if not candidates
+                    else "multiple proven canonical material matches"
+                ),
+            }
+        )
+
+    if not material_targets:
+        return {
+            "groups": [],
+            "skipped_groups": skipped_groups,
+            "changed_object_count": 0,
+            "changed_face_count": 0,
+        }
+
+    changed_objects = defaultdict(set)
+    changed_faces = defaultdict(int)
+    for obj in mesh_objects:
+        old_materials = list(obj.data.materials)
+        if not any(material in material_targets for material in old_materials):
+            continue
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        mesh = obj.data
+        old_materials = list(mesh.materials)
+        replacements = [
+            material_targets.get(material, material)
+            for material in old_materials
+        ]
+        for polygon in mesh.polygons:
+            if old_materials[polygon.material_index] in material_targets:
+                changed_faces[
+                    material_targets[old_materials[polygon.material_index]]
+                ] += 1
+
+        if any(material is None for material in replacements):
+            # Preserve empty-slot indices for the later explicit preflight.
+            # Only replace the proven collision slots in place.
+            for index, replacement in enumerate(replacements):
+                if old_materials[index] in material_targets:
+                    mesh.materials[index] = replacement
+        else:
+            slot_map = {}
+            new_materials = []
+            new_indices = {}
+            for old_index, replacement in enumerate(replacements):
+                if replacement not in new_indices:
+                    new_indices[replacement] = len(new_materials)
+                    new_materials.append(replacement)
+                slot_map[old_index] = new_indices[replacement]
+            remap_mesh_materials(mesh, slot_map, new_materials)
+
+        for source, target in material_targets.items():
+            if source in old_materials:
+                changed_objects[target].add(obj.name)
+
+    reports = []
+    for target, objects in changed_objects.items():
+        sources = [
+            source
+            for source, candidate in material_targets.items()
+            if candidate == target
+        ]
+        reports.append(
+            {
+                "mode": "blender_numeric_collision",
+                "target_material": target.name,
+                "source_materials": sorted(
+                    source.name for source in sources
+                ),
+                "proofs": sorted({proofs[source] for source in sources}),
+                "object_count": len(objects),
+                "objects": sorted(objects)[:200],
+                "changed_faces": changed_faces[target],
+            }
+        )
+    return {
+        "groups": reports,
+        "skipped_groups": skipped_groups,
+        "changed_object_count": sum(
+            group["object_count"] for group in reports
+        ),
+        "changed_face_count": sum(
+            group["changed_faces"] for group in reports
+        ),
+    }
+
+
 def consolidate_speedtree_group_materials(objects, texture_contract=None):
     # Atlas Builder child collections become numeric-boundary material suffixes.
     # Collapse proven shared-source slots before merge/weight export; do not
@@ -1690,6 +1949,9 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
     )
+    numeric_result = _consolidate_blender_numeric_material_duplicates(
+        mesh_objects, texture_contract=texture_contract
+    )
     # The validated contract is authoritative. Legacy manifest consolidation
     # must not mutate a strict scene before its binding signatures are checked.
     manifest_result = (
@@ -1699,7 +1961,7 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
     )
     stmat_cache = {}
     texture_index_cache = {}
-    skipped_groups = []
+    skipped_groups = list(numeric_result["skipped_groups"])
 
     grouped = defaultdict(list)
     for obj in mesh_objects:
@@ -1865,17 +2127,23 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             }
         )
 
-    all_reports = list(manifest_result["groups"]) + reports
+    all_reports = (
+        list(numeric_result["groups"])
+        + list(manifest_result["groups"])
+        + reports
+    )
     return {
         "status": "applied" if all_reports else "skipped",
         "groups": all_reports,
         "skipped_groups": skipped_groups,
         "changed_object_count": (
-            manifest_result["changed_object_count"]
+            numeric_result["changed_object_count"]
+            + manifest_result["changed_object_count"]
             + sum(group["object_count"] for group in reports)
         ),
         "changed_face_count": (
-            manifest_result["changed_face_count"]
+            numeric_result["changed_face_count"]
+            + manifest_result["changed_face_count"]
             + sum(group["changed_faces"] for group in reports)
         ),
     }
@@ -1989,6 +2257,485 @@ def build_rigid_fallback_armature(objects, armature_name="Root", bone_name="Bone
     }
 
 
+CLUSTER_XML_SCALE_CANDIDATES = (100.0, 1.0, 3.28084, 30.48, 0.01)
+CLUSTER_AXIS_BONE_RE = re.compile(
+    r"^Bone_(\d+)_(Start|End)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _cluster_xml_number(value, label):
+    text = str("" if value is None else value).strip()
+    if not text:
+        raise RuntimeError(f"Cluster XML {label} is empty.")
+    if "," in text:
+        if "." in text or text.count(",") != 1:
+            raise RuntimeError(
+                f"Cluster XML {label} has ambiguous decimal separators: {text!r}"
+            )
+        text = text.replace(",", ".")
+    number = float(text)
+    if not math.isfinite(number):
+        raise RuntimeError(f"Cluster XML {label} is not finite: {value!r}")
+    return number
+
+
+def _cluster_xml_structural_roots(xml_path):
+    path = Path(str(xml_path or "")).expanduser()
+    if not path.is_file():
+        raise RuntimeError(
+            "Cluster source skin normalization requires the matching Raw XML: "
+            f"{path}"
+        )
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise RuntimeError(f"Cluster Raw XML could not be parsed: {path} ({exc})") from exc
+
+    bones = []
+    for element in root.iter("Bone"):
+        attrs = element.attrib
+        required = (
+            "ID",
+            "ParentID",
+            "StartX",
+            "StartY",
+            "StartZ",
+            "EndX",
+            "EndY",
+            "EndZ",
+        )
+        missing = [name for name in required if name not in attrs]
+        if missing:
+            raise RuntimeError(
+                "Cluster Raw XML Bone is missing required attributes: "
+                + ", ".join(missing)
+            )
+        bones.append(
+            {
+                "id": int(attrs["ID"]),
+                "parent_id": int(attrs["ParentID"]),
+                "generator": str(attrs.get("Generator") or ""),
+                "start_raw": Vector(
+                    (
+                        _cluster_xml_number(attrs["StartX"], "StartX"),
+                        _cluster_xml_number(attrs["StartY"], "StartY"),
+                        _cluster_xml_number(attrs["StartZ"], "StartZ"),
+                    )
+                ),
+                "end_raw": Vector(
+                    (
+                        _cluster_xml_number(attrs["EndX"], "EndX"),
+                        _cluster_xml_number(attrs["EndY"], "EndY"),
+                        _cluster_xml_number(attrs["EndZ"], "EndZ"),
+                    )
+                ),
+            }
+        )
+    if not bones:
+        raise RuntimeError(f"Cluster Raw XML contains no Bone entries: {path}")
+    roots = [bone for bone in bones if bone["parent_id"] == -1]
+    if not roots:
+        raise RuntimeError(
+            f"Cluster Raw XML contains no structural root (ParentID=-1): {path}"
+        )
+    return roots
+
+
+def _cluster_geometry_scale(meshes):
+    points = [
+        obj.matrix_world @ Vector(corner)
+        for obj in meshes
+        for corner in obj.bound_box
+    ]
+    if not points:
+        return 0.0
+    return max(
+        max(point[axis] for point in points)
+        - min(point[axis] for point in points)
+        for axis in range(3)
+    )
+
+
+def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
+    """Replace SpeedTree Start/End markers with one real axis bone per XML root.
+
+    Stage 1 authors Raw XML structural roots only for the first *renderable*
+    Branch below each Tree root. Meshless Trunk/Branch placement splines are
+    therefore absent from this contract. This function consumes those roots by
+    coordinates; generator names are report-only and never select a bone.
+    """
+    roots = _cluster_xml_structural_roots(xml_path)
+    axes = {}
+    unexpected = []
+    for bone in armature.data.bones:
+        match = CLUSTER_AXIS_BONE_RE.fullmatch(bone.name)
+        if match is None:
+            unexpected.append(bone.name)
+            continue
+        ordinal = int(match.group(1))
+        role = match.group(2).casefold()
+        row = axes.setdefault(ordinal, {"ordinal": ordinal})
+        if role in row:
+            raise RuntimeError(
+                f"Cluster armature has duplicate {role} axis bone ordinal {ordinal}."
+            )
+        row[role] = bone
+    if unexpected:
+        raise RuntimeError(
+            "Cluster armature contains non-axis bones after Stage 1 calibration: "
+            + ", ".join(sorted(unexpected))
+        )
+    if not axes:
+        raise RuntimeError(
+            "Cluster armature contains no numbered Start/End axis bones."
+        )
+    expected_ordinals = list(range(1, len(axes) + 1))
+    if sorted(axes) != expected_ordinals:
+        raise RuntimeError(
+            "Cluster axis bone ordinals must be consecutive 1..N; found "
+            f"{sorted(axes)}."
+        )
+    if len(roots) != len(axes):
+        raise RuntimeError(
+            "Cluster Raw XML structural-root count does not match imported axis "
+            f"count: {len(roots)} roots vs {len(axes)} axes."
+        )
+
+    world_heads = [
+        armature.matrix_world @ bone.head_local
+        for bone in armature.data.bones
+    ]
+    scale_scores = []
+    for scale in CLUSTER_XML_SCALE_CANDIDATES:
+        endpoints = [
+            point / scale
+            for root in roots
+            for point in (root["start_raw"], root["end_raw"])
+        ]
+        distances = [
+            min((head - endpoint).length for endpoint in endpoints)
+            for head in world_heads
+        ]
+        ordered = sorted(float(value) for value in distances)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) * 0.5
+        )
+        scale_scores.append(
+            {
+                "scale": float(scale),
+                "median_nearest": float(median),
+                "max_nearest": float(max(ordered)),
+            }
+        )
+    scale_scores.sort(
+        key=lambda row: (
+            row["median_nearest"],
+            row["max_nearest"],
+            row["scale"],
+        )
+    )
+    xml_scale = scale_scores[0]["scale"]
+    world_roots = [
+        {
+            **root,
+            "start_world": root["start_raw"] / xml_scale,
+            "end_world": root["end_raw"] / xml_scale,
+        }
+        for root in roots
+    ]
+
+    candidates = []
+    for ordinal, axis in axes.items():
+        start_bone = axis.get("start")
+        end_bone = axis.get("end")
+        if start_bone is None and end_bone is None:
+            raise RuntimeError(f"Cluster axis {ordinal} has no Start or End marker.")
+        if start_bone is not None:
+            source_start = armature.matrix_world @ start_bone.head_local
+            source_end = (
+                armature.matrix_world @ end_bone.head_local
+                if end_bone is not None
+                else armature.matrix_world @ start_bone.tail_local
+            )
+            policy = "start_and_endpoint_match"
+        else:
+            source_start = None
+            source_end = armature.matrix_world @ end_bone.head_local
+            policy = "orphan_end_recovers_missing_start"
+        for root_index, root in enumerate(world_roots):
+            start_error = (
+                float((source_start - root["start_world"]).length)
+                if source_start is not None
+                else 0.0
+            )
+            end_error = float((source_end - root["end_world"]).length)
+            candidates.append(
+                {
+                    "ordinal": ordinal,
+                    "root_index": root_index,
+                    "cost": start_error + end_error,
+                    "start_error": start_error,
+                    "end_error": end_error,
+                    "policy": policy,
+                }
+            )
+    geometry_scale = _cluster_geometry_scale(meshes)
+    tolerance = max(geometry_scale * 1.0e-4, 1.0e-6)
+    candidates_by_axis = defaultdict(list)
+    for candidate in candidates:
+        if (
+            candidate["start_error"] <= tolerance
+            and candidate["end_error"] <= tolerance
+        ):
+            candidates_by_axis[candidate["ordinal"]].append(candidate)
+    ambiguous_axes = {
+        ordinal: rows
+        for ordinal, rows in candidates_by_axis.items()
+        if len(rows) != 1
+    }
+    missing_axes = [
+        ordinal for ordinal in axes if ordinal not in candidates_by_axis
+    ]
+    if ambiguous_axes or missing_axes:
+        details = []
+        for ordinal in sorted(axes):
+            rows = candidates_by_axis.get(ordinal) or []
+            details.append(
+                f"axis {ordinal}: candidate XML IDs "
+                f"{[world_roots[row['root_index']]['id'] for row in rows]}"
+            )
+        raise RuntimeError(
+            "Cluster XML axis matching is missing or ambiguous at geometry-relative "
+            f"tolerance {tolerance:.9g}: " + "; ".join(details)
+        )
+    matches = [
+        candidates_by_axis[ordinal][0]
+        for ordinal in sorted(axes)
+    ]
+    matched_root_indices = [row["root_index"] for row in matches]
+    if len(set(matched_root_indices)) != len(matched_root_indices):
+        duplicates = sorted(
+            world_roots[index]["id"]
+            for index, count in Counter(matched_root_indices).items()
+            if count > 1
+        )
+        raise RuntimeError(
+            "Multiple imported axes resolve to the same XML structural root: "
+            + ", ".join(str(value) for value in duplicates)
+        )
+
+    by_ordinal = {row["ordinal"]: row for row in matches}
+    ensure_object_mode()
+    deselect_all()
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        edit_bones = armature.data.edit_bones
+        for bone in list(edit_bones):
+            edit_bones.remove(bone)
+        world_to_armature = armature.matrix_world.inverted_safe()
+        for ordinal in sorted(by_ordinal):
+            match = by_ordinal[ordinal]
+            root = world_roots[match["root_index"]]
+            bone = edit_bones.new(f"Bone_{ordinal}_Start")
+            bone.head = world_to_armature @ root["start_world"]
+            bone.tail = world_to_armature @ root["end_world"]
+            bone.use_deform = True
+            if (bone.tail - bone.head).length <= max(tolerance * 1.0e-3, 1.0e-8):
+                raise RuntimeError(
+                    f"Cluster XML axis {ordinal} is geometrically degenerate."
+                )
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+        armature.select_set(False)
+
+    return {
+        "status": "canonicalized_xml_render_roots",
+        "xml_path": str(Path(xml_path).resolve()),
+        "xml_scale": float(xml_scale),
+        "xml_scale_scores": scale_scores,
+        "axis_count": len(matches),
+        "bone_names": [
+            f"Bone_{ordinal}_Start" for ordinal in sorted(by_ordinal)
+        ],
+        "geometry_scale": float(geometry_scale),
+        "match_tolerance": float(tolerance),
+        "axes": [
+            {
+                "ordinal": row["ordinal"],
+                "xml_bone_id": int(world_roots[row["root_index"]]["id"]),
+                "xml_generator": world_roots[row["root_index"]]["generator"],
+                "source_match_policy": row["policy"],
+                "start_error": float(row["start_error"]),
+                "end_error": float(row["end_error"]),
+                "start_world": [
+                    float(value)
+                    for value in world_roots[row["root_index"]]["start_world"]
+                ],
+                "end_world": [
+                    float(value)
+                    for value in world_roots[row["root_index"]]["end_world"]
+                ],
+            }
+            for row in sorted(matches, key=lambda item: item["ordinal"])
+        ],
+    }
+
+
+def ensure_cluster_source_skin_contract(
+    objects,
+    armature_name="Root",
+    xml_path="",
+):
+    """Canonicalize render-root axes and preserve authored Cluster skin.
+
+    Imported ``*_End`` joints are endpoint markers, not valid mesh-axis bones.
+    The matching Raw XML roots are converted to one complete ``*_Start`` deform
+    bone spanning Start->End for every renderable structural root.
+
+    Multi-piece authored skin remains partitioned across those axes. A
+    completely unskinned source is rigid-bound only when the XML contract has
+    exactly one render-root axis; multi-axis membership is never guessed.
+    """
+    armatures = [obj for obj in objects if obj.type == "ARMATURE"]
+    if len(armatures) != 1:
+        raise RuntimeError(
+            "Cluster source skin contract requires exactly one imported armature; "
+            f"found {len(armatures)}."
+        )
+    armature = armatures[0]
+    if armature_name and armature.name != armature_name:
+        raise RuntimeError(
+            "Cluster source skin contract imported an unexpected armature: "
+            f"expected {armature_name!r}, got {armature.name!r}."
+        )
+    meshes = [
+        obj
+        for obj in objects
+        if obj.type == "MESH" and obj.data and len(obj.data.vertices) > 0
+    ]
+    if not meshes:
+        raise RuntimeError(
+            "Cluster source skin contract found no imported mesh geometry."
+        )
+
+    axis_normalization = _canonicalize_cluster_axis_bones(
+        armature,
+        meshes,
+        xml_path,
+    )
+    deform_bones = [bone for bone in armature.data.bones if bone.use_deform]
+    deform_bone_names = {bone.name for bone in deform_bones}
+    skinned_meshes = []
+    unskinned_meshes = []
+    for obj in meshes:
+        has_armature_modifier = any(
+            modifier.type == "ARMATURE" and modifier.object == armature
+            for modifier in obj.modifiers
+        )
+        deform_group_indices = {
+            group.index
+            for group in obj.vertex_groups
+            if group.name in deform_bone_names
+        }
+        weighted_vertices = sum(
+            1
+            for vertex in obj.data.vertices
+            if any(
+                element.group in deform_group_indices
+                and float(element.weight) > 0.0
+                for element in vertex.groups
+            )
+        )
+        if has_armature_modifier and weighted_vertices:
+            skinned_meshes.append(
+                {
+                    "mesh": obj.name,
+                    "vertices": len(obj.data.vertices),
+                    "weighted_vertices": weighted_vertices,
+                    "deform_groups": [
+                        group.name
+                        for group in obj.vertex_groups
+                        if group.name in deform_bone_names
+                    ],
+                }
+            )
+        else:
+            unskinned_meshes.append(
+                {
+                    "mesh": obj.name,
+                    "vertices": len(obj.data.vertices),
+                    "has_armature_modifier": has_armature_modifier,
+                    "weighted_vertices": weighted_vertices,
+                }
+            )
+    if skinned_meshes:
+        return {
+            "status": "preserved_authored_skin",
+            "armature": armature.name,
+            "bone_count": len(armature.data.bones),
+            "deform_bone_count": len(deform_bones),
+            "deform_bones": [bone.name for bone in deform_bones],
+            "mesh_count": len(meshes),
+            "skinned_mesh_count": len(skinned_meshes),
+            "unskinned_mesh_count": len(unskinned_meshes),
+            "skinned_meshes": skinned_meshes,
+            "unskinned_meshes": unskinned_meshes,
+            "axis_normalization": axis_normalization,
+            "reason": (
+                "Authored Cluster axis weights are present and were preserved "
+                "for connected deform-cluster normalization"
+            ),
+        }
+
+    if len(deform_bones) != 1:
+        raise RuntimeError(
+            "Cluster source is completely unskinned, so the single-axis repair "
+            "requires exactly one deform bone; "
+            f"found {len(deform_bones)} in {armature.name!r}."
+        )
+    bone = deform_bones[0]
+    bound = []
+    for obj in meshes:
+        while obj.vertex_groups:
+            obj.vertex_groups.remove(obj.vertex_groups[0])
+        group = obj.vertex_groups.new(name=bone.name)
+        group.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        for modifier in list(obj.modifiers):
+            if modifier.type == "ARMATURE":
+                obj.modifiers.remove(modifier)
+        modifier = obj.modifiers.new(name=armature.name, type="ARMATURE")
+        modifier.object = armature
+        parent_keep_world(obj, armature)
+        bound.append(
+            {
+                "mesh": obj.name,
+                "vertices": len(obj.data.vertices),
+                "bone": bone.name,
+            }
+        )
+
+    return {
+        "status": "bound_unskinned_single_axis",
+        "armature": armature.name,
+        "bone": bone.name,
+        "bone_head": [float(value) for value in bone.head_local],
+        "bone_tail": [float(value) for value in bone.tail_local],
+        "mesh_count": len(bound),
+        "vertex_count": sum(row["vertices"] for row in bound),
+        "meshes": bound,
+        "axis_normalization": axis_normalization,
+        "reason": (
+            "Cluster FBX contained one XML render-root axis but no skin deformers"
+        ),
+    }
+
+
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
@@ -1997,6 +2744,8 @@ def run_import_source_fbx(
     true_root="Bone_1_Start",
     spm_path="",
     texture_contract=None,
+    cluster_source_skin_contract=False,
+    cluster_source_xml_path="",
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -2031,7 +2780,14 @@ def run_import_source_fbx(
     )
     removed_phantoms = remove_phantom_image_nodes(imported)
     rigid_fallback_result = None
-    if rigid_fallback:
+    cluster_source_skin_result = None
+    if cluster_source_skin_contract:
+        cluster_source_skin_result = ensure_cluster_source_skin_contract(
+            imported,
+            armature_name,
+            cluster_source_xml_path,
+        )
+    elif rigid_fallback:
         rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
         if rigid_fallback_result:
             armature = bpy.data.objects.get(rigid_fallback_result["armature"])
@@ -2055,6 +2811,7 @@ def run_import_source_fbx(
         "unreal_instance_profile": instance_profile,
         "texture_normalization": texture_normalization,
         "rigid_fallback": rigid_fallback_result,
+        "cluster_source_skin_contract": cluster_source_skin_result,
     }
 
 
@@ -4310,6 +5067,8 @@ def collect_loose_instances(armature, name_contains):
     for obj in bpy.context.scene.objects:
         if obj.type != "MESH":
             continue
+        if is_cluster_normalizer_generated(obj):
+            continue
         if needle and needle not in obj.name.lower():
             continue
         if len(obj.data.vertices) == 0:
@@ -4328,6 +5087,71 @@ def collect_loose_instances(armature, name_contains):
         # weight-repair stage will fill zero-weight vertices by nearest bone.
         instances.append((obj, None))
     return instances
+
+
+def normalize_loose_speedtree_uv_contract(obj):
+    """Promote authored loose-plane UVs into the final SpeedTree contract.
+
+    Blender-authored Cluster planes commonly carry one default ``UVMap``.
+    Joining that mesh ahead of imported SpeedTree geometry makes Blender keep
+    ``UVMap`` at index 0 and zero-fill the later ``uv0``/``blend_ao`` layers for
+    the plane faces.  Preserve the authored coordinates by renaming that sole
+    layer to ``uv0`` before the join, then append neutral blend/AO values.
+
+    Ambiguous layouts fail closed; this function never deletes or guesses
+    between multiple authored UV sets.
+    """
+    if obj is None or obj.type != "MESH" or not obj.data:
+        raise RuntimeError("Loose SpeedTree UV normalization requires a mesh")
+    uv_layers = obj.data.uv_layers
+    names_before = [layer.name for layer in uv_layers]
+    uv0 = uv_layers.get("uv0")
+    legacy = uv_layers.get("UVMap")
+    renamed = False
+    if uv0 is None:
+        if legacy is None:
+            raise RuntimeError(
+                f"Loose SpeedTree plane has no uv0/UVMap layer: {obj.name}"
+            )
+        legacy.name = "uv0"
+        uv0 = legacy
+        renamed = True
+    if len(uv_layers) == 0 or uv_layers[0] != uv0:
+        raise RuntimeError(
+            f"Loose SpeedTree plane uv0 is not index 0: {obj.name}: "
+            + ", ".join(layer.name for layer in uv_layers)
+        )
+
+    blend_ao = uv_layers.get("blend_ao")
+    created_blend_ao = False
+    if blend_ao is None:
+        if len(uv_layers) != 1:
+            raise RuntimeError(
+                f"Loose SpeedTree plane has ambiguous UV layers: {obj.name}: "
+                + ", ".join(layer.name for layer in uv_layers)
+            )
+        blend_ao = uv_layers.new(name="blend_ao")
+        neutral_values = [1.0] * (len(blend_ao.data) * 2)
+        try:
+            blend_ao.data.foreach_set("uv", neutral_values)
+        except (AttributeError, TypeError, ValueError):
+            for item in blend_ao.data:
+                item.uv = (1.0, 1.0)
+        created_blend_ao = True
+
+    names_after = [layer.name for layer in uv_layers]
+    if names_after != ["uv0", "blend_ao"]:
+        raise RuntimeError(
+            f"Loose SpeedTree plane UV contract is not uv0/blend_ao: "
+            f"{obj.name}: {', '.join(names_after)}"
+        )
+    return {
+        "status": "normalized" if renamed or created_blend_ao else "preserved",
+        "layers_before": names_before,
+        "layers_after": names_after,
+        "renamed_uvmap_to_uv0": renamed,
+        "created_neutral_blend_ao": created_blend_ao,
+    }
 
 
 def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, fallback_all_bones, leaf_targets=None):
@@ -4351,6 +5175,7 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
         duplicate.vertex_groups.clear()
         duplicate.hide_viewport = False
         duplicate.hide_render = False
+        uv_contract = normalize_loose_speedtree_uv_contract(duplicate)
         bpy.context.scene.collection.objects.link(duplicate)
         if skinned_parent:
             bone_name, bone_distance = choose_bone_for_instance(
@@ -4368,6 +5193,7 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
                 "bone": bone_name,
                 "vertex_count": len(obj.data.vertices),
                 "distance": bone_distance,
+                "uv_contract": uv_contract,
             }
         else:
             spm_assignment = assign_mesh_components_from_spm_leaf_targets(obj, duplicate, leaf_targets or [])
@@ -4381,6 +5207,7 @@ def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, f
                 "vertex_count": len(obj.data.vertices),
                 "distance": None,
                 "weighting": "deferred_to_weight_repair_nearest_bone",
+                "uv_contract": uv_contract,
             }
             if spm_assignment:
                 assignment.update(spm_assignment)
@@ -4922,12 +5749,76 @@ def structure_export_unit(
     }
 
 
+def park_cluster_source_full_reference(
+    armature,
+    merged_obj,
+    source_fbx_path,
+    export_collection_name="Export",
+    source_collection_name="SpeedTree_Source",
+):
+    """Keep the repaired Full SK reference out of Send2UE's Export collection.
+
+    Cluster Normalizer owns the actual export pivots and always names them
+    ``<source_stem>_01``, ``_02``, ... even when there is only one prototype.
+    BWR still needs its merged source for inspection and downstream repair
+    reports, but exposing that merge as the unsuffixed ``<source_stem>`` export
+    unit creates an extra Unreal asset and violates the normalized naming
+    contract.
+    """
+    source_collection = ensure_scene_collection(source_collection_name)
+    parent_keep_world(merged_obj, armature)
+    for obj in (armature, merged_obj):
+        ensure_only_collection(obj, source_collection)
+
+    removed_export_empties = []
+    export_collection = bpy.data.collections.get(export_collection_name)
+    source_stem = Path(source_fbx_path).stem if source_fbx_path else ""
+    if export_collection:
+        for obj in list(export_collection.objects):
+            if is_cluster_normalizer_generated(obj):
+                continue
+            owned = (
+                belongs_to_source_fbx_cleanup_lineage(obj, source_fbx_path)
+                if source_fbx_path
+                else False
+            )
+            canonical_empty = (
+                bool(source_stem)
+                and obj.type == "EMPTY"
+                and obj.name == source_stem
+            )
+            if obj.type == "EMPTY" and (owned or canonical_empty):
+                for child in list(obj.children):
+                    if child != merged_obj:
+                        parent_keep_world(child, armature)
+                    ensure_only_collection(child, source_collection)
+                if not obj.children:
+                    removed_export_empties.append(obj.name)
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                continue
+            if owned:
+                ensure_only_collection(obj, source_collection)
+
+    return {
+        "status": "parked_cluster_source_full_reference",
+        "collection": source_collection.name,
+        "hierarchy": [armature.name, merged_obj.name],
+        "removed_export_empties": removed_export_empties,
+        "reason": (
+            "Cluster Normalizer-generated ordinal pivots are the only "
+            "Send2UE export units for a Cluster source"
+        ),
+    }
+
+
 def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", include_hidden=False, report_path="", settings=None):
     armature = get_armature(armature_name)
     name_filter = compile_optional_regex(mesh_regex)
     source_objects = []
     for obj in bpy.context.scene.objects:
         if obj.type != "MESH":
+            continue
+        if is_cluster_normalizer_generated(obj):
             continue
         if obj.name == merged_name:
             continue
@@ -4950,6 +5841,30 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
     merged_obj, ranges, material_count, uv_names, removed_invalid_groups = merge_skinned_meshes(
         armature, source_objects, merged_name
     )
+    source_fbx_candidates = {
+        str(obj.get("codex_source_fbx", "") or "").strip()
+        for obj in source_objects
+        if str(obj.get("codex_source_fbx", "") or "").strip()
+    }
+    configured_source_fbx = str(
+        (settings or {}).get("source_fbx_path", "") or ""
+    ).strip()
+    if configured_source_fbx:
+        source_fbx_candidates.add(configured_source_fbx)
+    if len(source_fbx_candidates) > 1:
+        raise RuntimeError(
+            "Merged sources disagree about their FBX provenance: "
+            + ", ".join(sorted(source_fbx_candidates))
+        )
+    merged_source_fbx = (
+        next(iter(source_fbx_candidates)) if source_fbx_candidates else ""
+    )
+    if merged_source_fbx:
+        # Blender's object join does not reliably preserve custom properties
+        # from the chosen active copy. The Cluster Normalizer validates this
+        # exact source FBX against the matching Raw XML, so write it
+        # explicitly on the final merged mesh.
+        merged_obj["codex_source_fbx"] = merged_source_fbx
     zero_weight_vertices = count_zero_weight_vertices(merged_obj)
     roots = [bone.name for bone in armature.data.bones if bone.parent is None]
 
@@ -4971,27 +5886,37 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
         "uv_layers": uv_names,
         "color_attributes": [attr.name for attr in merged_obj.data.color_attributes],
         "merge_method": "join",
+        "source_fbx_provenance": merged_source_fbx,
         "sample_sources": ranges[:80],
     }
 
     make_export_structure = settings.get("make_export_structure", settings.get("make_handoff_structure", True)) if settings else False
     if settings and make_export_structure:
         source_fbx = settings.get("source_fbx_path", "")
-        unit_name = Path(source_fbx).stem if source_fbx else ""
-        if not unit_name:
-            unit_name = settings.get("name_stem", "") or (Path(bpy.data.filepath).stem if bpy.data.filepath else "")
-        if not unit_name:
-            unit_name = f"{armature.name}_ExportUnit"
-        mesh_unit_name = choose_mesh_unit_name(merged_obj.name, source_objects, unit_name)
-        report["export_structure"] = structure_export_unit(
-            armature,
-            merged_obj,
-            unit_name,
-            mesh_unit_name,
-            settings.get("export_collection_name", "Export"),
-            settings.get("source_collection_name", "SpeedTree_Source"),
-            source_fbx,
-        )
+        if settings.get("cluster_source_skin_contract", False):
+            report["export_structure"] = park_cluster_source_full_reference(
+                armature,
+                merged_obj,
+                source_fbx,
+                settings.get("export_collection_name", "Export"),
+                settings.get("source_collection_name", "SpeedTree_Source"),
+            )
+        else:
+            unit_name = Path(source_fbx).stem if source_fbx else ""
+            if not unit_name:
+                unit_name = settings.get("name_stem", "") or (Path(bpy.data.filepath).stem if bpy.data.filepath else "")
+            if not unit_name:
+                unit_name = f"{armature.name}_ExportUnit"
+            mesh_unit_name = choose_mesh_unit_name(merged_obj.name, source_objects, unit_name)
+            report["export_structure"] = structure_export_unit(
+                armature,
+                merged_obj,
+                unit_name,
+                mesh_unit_name,
+                settings.get("export_collection_name", "Export"),
+                settings.get("source_collection_name", "SpeedTree_Source"),
+                source_fbx,
+            )
 
     if fbx_path:
         require_in_view_layer(armature, "for FBX export selection")
@@ -5092,6 +6017,10 @@ def default_paths(settings):
         "export_blend": os.path.join(out_dir, f"{name_stem}_codex_merged_skinned_weights_fixed_export.blend"),
         "fbx": os.path.join(out_dir, f"{name_stem}_codex_merged_skinned_weights_fixed.fbx"),
         "reparent_report": os.path.join(reports_dir, f"{name_stem}_reparent_report_codex.json"),
+        "branch_plane_report": os.path.join(
+            reports_dir,
+            f"{name_stem}_branch_plane_skin_report_codex.json",
+        ),
         "leaf_report": os.path.join(reports_dir, f"{name_stem}_leaf_skin_report_codex.json"),
         "weight_report": os.path.join(reports_dir, f"{name_stem}_weight_repair_report_codex.json"),
         "export_report": os.path.join(reports_dir, f"{name_stem}_codex_merged_skinned_weights_fixed_export_report.json"),
@@ -5211,16 +6140,44 @@ def run_full_pipeline(settings):
             save_blend(path)
             reports["saved_blends"].append(path)
 
-    reparent = run_reparent_from_spm(
-        settings["spm_path"],
-        settings.get("armature_name", "Root"),
-        settings.get("true_root", "Bone_1_Start"),
-        settings.get("scale_value", "auto"),
-        settings.get("tolerance", 0.08),
-        apply=True,
-        strict=settings.get("strict_reparent", True),
-        report_path=paths["reparent_report"],
-    )
+    if settings.get("cluster_source_skin_contract", False):
+        cluster_armature = get_armature(
+            settings.get("armature_name", "Root")
+        )
+        cluster_roots = [
+            bone.name
+            for bone in cluster_armature.data.bones
+            if bone.parent is None
+        ]
+        if len(cluster_roots) != len(cluster_armature.data.bones):
+            raise RuntimeError(
+                "Cluster render-root axes must remain independent before "
+                "normalization; found parented axis bones."
+            )
+        reparent = {
+            "status": "skipped_cluster_independent_render_roots",
+            "spm": settings["spm_path"],
+            "armature": cluster_armature.name,
+            "bone_count": len(cluster_armature.data.bones),
+            "root_names_before": cluster_roots,
+            "root_names_after": cluster_roots,
+            "reason": (
+                "Cluster axes represent independent render components, not a "
+                "tree skeleton hierarchy"
+            ),
+        }
+        write_report(paths["reparent_report"], reparent)
+    else:
+        reparent = run_reparent_from_spm(
+            settings["spm_path"],
+            settings.get("armature_name", "Root"),
+            settings.get("true_root", "Bone_1_Start"),
+            settings.get("scale_value", "auto"),
+            settings.get("tolerance", 0.08),
+            apply=True,
+            strict=settings.get("strict_reparent", True),
+            report_path=paths["reparent_report"],
+        )
     reports["steps"].append({"name": "reparent", "status": reparent.get("status"), "report": paths["reparent_report"]})
     if reparent.get("status") == "blocked":
         write_report(paths["pipeline_report"], reports)
@@ -5231,6 +6188,35 @@ def run_full_pipeline(settings):
             )
         )
     stage_save(paths["fixed_blend"])
+
+    # Material-grouped SpeedTree exports leave branch/frond plane geometry as
+    # an unskinned M_branch_* mesh.  Unlike loose leaves, it was never converted
+    # to an armature-driven replacement and was therefore silently omitted by
+    # run_merge_export(), which accepts skinned sources only.  Skin each
+    # disconnected plane component rigidly to the nearest already-skinned bark
+    # surface so the authored M_branch_* material/geometry pair survives the
+    # final Full SK merge.
+    branch_planes = run_skin_loose_instances(
+        settings.get("armature_name", "Root"),
+        "branch",
+        "Branches_Skinned_Codex",
+        hide_originals=settings.get("hide_originals", True),
+        fallback_all_bones=settings.get("fallback_all_bones", False),
+        apply=True,
+        report_path=paths["branch_plane_report"],
+        spm_path="",
+        true_root=settings.get("true_root", "Bone_1_Start"),
+        scale_value=settings.get("scale_value", "auto"),
+    )
+    reports["steps"].append(
+        {
+            "name": "skin_branch_planes",
+            "status": branch_planes.get("status"),
+            "report": paths["branch_plane_report"],
+            "created_object": branch_planes.get("created_object", ""),
+            "created_faces": branch_planes.get("created_faces", 0),
+        }
+    )
 
     if settings.get("skip_leaf_skin", False):
         reports["steps"].append({"name": "skin_loose_instances", "status": "skipped"})
@@ -5320,8 +6306,9 @@ def clear_previous_codex_build(settings):
     # Idempotent "update": drop everything a previous run of this add-on created
     # so re-running from SpeedTree does not stack duplicate imports/merges. Every
     # imported object carries a "codex_source_fbx" id property (copies inherit
-    # it, so merged/leaf outputs are caught too); merged outputs are also matched
-    # by name as a belt-and-suspenders fallback.
+    # it, so merged/leaf outputs are caught too).  Cleanup also accepts the
+    # retired unprefixed sibling of a canonical SK_* FBX so an output-name
+    # normalization does not leave the former Export unit behind.
     if bpy.context.scene.get(JSON_PREVIEW_SCENE_KEY):
         restore_json_group_preview()
 
@@ -5331,7 +6318,7 @@ def clear_previous_codex_build(settings):
         obj
         for obj in list(bpy.data.objects)
         if (
-            belongs_to_source_fbx(obj, source_fbx_path)
+            belongs_to_source_fbx_cleanup_lineage(obj, source_fbx_path)
             if source_fbx_path
             else (
                 "codex_source_fbx" in obj
@@ -5353,7 +6340,9 @@ def clear_previous_codex_build(settings):
     legacy_unit_name = Path(source_fbx_path).stem if source_fbx_path else ""
     if export_collection:
         for obj in list(export_collection.objects):
-            owned_empty = belongs_to_source_fbx(obj, source_fbx_path)
+            owned_empty = belongs_to_source_fbx_cleanup_lineage(
+                obj, source_fbx_path
+            )
             legacy_empty = bool(legacy_unit_name) and obj.name == legacy_unit_name
             if obj.type == "EMPTY" and not obj.children and (owned_empty or legacy_empty):
                 removed_empties.append(obj.name)
@@ -5364,7 +6353,7 @@ def clear_previous_codex_build(settings):
         for material in bpy.data.materials
         if material.users == 0
         and (
-            belongs_to_source_fbx(material, source_fbx_path)
+            belongs_to_source_fbx_cleanup_lineage(material, source_fbx_path)
             if source_fbx_path
             else "codex_source_fbx" in material
         )
@@ -5408,10 +6397,15 @@ def run_import_and_repair(settings):
         settings["source_fbx_path"],
         settings.get("source_collection_name", "SpeedTree_Source"),
         rigid_fallback=True,
+        cluster_source_skin_contract=settings.get(
+            "cluster_source_skin_contract",
+            False,
+        ),
         armature_name=settings.get("armature_name", "Root"),
         true_root=settings.get("true_root", "Bone_1_Start"),
         spm_path=settings.get("spm_path", ""),
         texture_contract=texture_contract,
+        cluster_source_xml_path=settings.get("xml_path", ""),
     )
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:
@@ -5429,6 +6423,9 @@ def run_import_and_repair(settings):
         ),
         "unreal_instance_profile": imported.get("unreal_instance_profile", {}),
         "rigid_fallback": imported.get("rigid_fallback"),
+        "cluster_source_skin_contract": imported.get(
+            "cluster_source_skin_contract"
+        ),
     }
     pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
     if pipeline_path:

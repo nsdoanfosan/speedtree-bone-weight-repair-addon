@@ -6,6 +6,22 @@ Blender add-on for repairing SpeedTree skeletal export data before sending it to
 
 This repository is the working place for a staged SpeedTree-to-MegaPlant conversion process. The stages below are the intended order of work and should stay visible as the add-on grows.
 
+### Cluster source contract
+
+SK Batch can mark a repaired `Cluster/SK_*.spm` export with
+`cluster_source_skin_contract`. In that mode the add-on uses the matching Raw
+XML structural roots selected from the first rendered Branch geometry below
+each Tree root; Generator names and prototype counts are report data, not
+selection rules. Meshless placement splines are excluded.
+
+- Existing multi-axis weights are preserved and normalized by connected deform
+  cluster.
+- A completely unskinned source is rigid-bound only when the XML proves exactly
+  one render-root axis. Multi-axis membership is never guessed.
+- The repaired unsuffixed Full SK mesh stays in `SpeedTree_Source`.
+  Cluster Normalizer-generated ordinal pivots (`*_01`, `*_02`, ...) are the
+  only objects exposed through `Export`, including the one-prototype case.
+
 ### Pipeline Boundary
 
 The Blender add-on owns deterministic conversion artifacts:

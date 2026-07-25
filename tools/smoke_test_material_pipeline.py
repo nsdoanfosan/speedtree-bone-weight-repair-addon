@@ -333,6 +333,107 @@ def run_contract_smoke(
         ):
             raise AssertionError(strict_intent_result)
 
+        collision_source = fbx_dir / "collision_source.fbx"
+        collision_source.write_bytes(b"collision-source")
+        collision_material = bpy.data.materials.new(
+            "M_Bark_numeric_collision_01"
+        )
+        collision_duplicate = bpy.data.materials.new(
+            "M_Bark_numeric_collision_01"
+        )
+        collision_material["codex_source_fbx"] = str(source_fbx)
+        collision_duplicate["codex_source_fbx"] = str(collision_source)
+        collision_object = make_mesh_object(
+            "NumericCollisionObject",
+            [collision_material, collision_duplicate],
+        )
+        collision_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "bindings": [
+                {
+                    "material": collision_material.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "status": "ok",
+                    "set_key": "barknumericcollision01",
+                    "texture_base": "T_Bark_numeric_collision_01",
+                    "files": shared_files,
+                    "missing_roles": [],
+                }
+            ],
+        }
+        collision_result = consolidate_speedtree_group_materials(
+            [collision_object], texture_contract=collision_contract
+        )
+        if list(collision_object.data.materials) != [collision_material]:
+            raise AssertionError(collision_result)
+        collision_groups = [
+            group
+            for group in collision_result.get("groups", [])
+            if group.get("mode") == "blender_numeric_collision"
+        ]
+        if (
+            len(collision_groups) != 1
+            or collision_groups[0].get("target_material")
+            != collision_material.name
+            or collision_groups[0].get("proofs")
+            != ["strict_texture_contract"]
+        ):
+            raise AssertionError(collision_result)
+
+        distinct_collision_material = bpy.data.materials.new(
+            "M_Bark_distinct_collision_01"
+        )
+        distinct_collision_duplicate = bpy.data.materials.new(
+            "M_Bark_distinct_collision_01"
+        )
+        distinct_collision_material["codex_source_fbx"] = str(source_fbx)
+        distinct_collision_duplicate["codex_source_fbx"] = str(
+            collision_source
+        )
+        distinct_collision_object = make_mesh_object(
+            "DistinctNumericCollisionObject",
+            [
+                distinct_collision_material,
+                distinct_collision_duplicate,
+            ],
+        )
+        distinct_collision_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "bindings": [
+                {
+                    "material": distinct_collision_material.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "status": "ok",
+                    "set_key": "barkdistinctcollision01a",
+                    "texture_base": "T_Bark_distinct_collision_01_A",
+                    "files": shared_files,
+                    "missing_roles": [],
+                },
+                {
+                    "material": distinct_collision_duplicate.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "status": "ok",
+                    "set_key": "barkdistinctcollision01b",
+                    "texture_base": "T_Bark_distinct_collision_01_B",
+                    "files": {
+                        role: str(path) for role, path in green.items()
+                    },
+                    "missing_roles": [],
+                },
+            ],
+        }
+        distinct_collision_result = consolidate_speedtree_group_materials(
+            [distinct_collision_object],
+            texture_contract=distinct_collision_contract,
+        )
+        if (
+            len(distinct_collision_object.data.materials) != 2
+            or not distinct_collision_result.get("skipped_groups")
+        ):
+            raise AssertionError(distinct_collision_result)
+
         green_material = bpy.data.materials.new("M_Leaf_common_grass_01_green")
         dead_material = bpy.data.materials.new("M_Leaf_common_grass_01_dead")
         for material in (green_material, dead_material):

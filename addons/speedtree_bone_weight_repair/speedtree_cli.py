@@ -174,6 +174,49 @@ def _cache_hit(cache, fingerprint, kind, target):
     return _basic_output_is_valid(kind, target, parse_xml=False)
 
 
+def synchronize_result_mtime(result, minimum_mtime_ns):
+    """Advance a verified cached output and its receipt as one export bundle.
+
+    ``export_target`` has already proven the artifact hash and current input
+    fingerprint. This is used when a sibling output (for example FBX) was
+    regenerated later than a still-valid XML cache hit. Downstream consumers
+    can then keep a strict XML-not-older-than-FBX contract without forcing an
+    otherwise redundant SpeedTree export.
+    """
+    target = Path(str((result or {}).get("path") or ""))
+    if not target.is_file():
+        raise RuntimeError(f"Cannot synchronize a missing export artifact: {target}")
+    stat = target.stat()
+    minimum_mtime_ns = int(minimum_mtime_ns)
+    if stat.st_mtime_ns >= minimum_mtime_ns:
+        return {
+            "changed": False,
+            "path": str(target),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    os.utime(target, ns=(stat.st_atime_ns, minimum_mtime_ns))
+    cache_path = Path(
+        str((result or {}).get("cache_path") or _cache_path(target))
+    )
+    cache = _load_cache(cache_path)
+    if cache:
+        records = cache.get("artifacts") or []
+        for record in records:
+            if record.get("relative_path") == target.name:
+                record["mtime_ns"] = minimum_mtime_ns
+        _write_cache(cache_path, cache)
+        result["artifacts"] = records
+    result["bundle_mtime_synchronized"] = True
+    result["bundle_mtime_ns"] = minimum_mtime_ns
+    return {
+        "changed": True,
+        "path": str(target),
+        "mtime_ns": minimum_mtime_ns,
+        "cache_path": str(cache_path),
+    }
+
+
 def _fresh_existing_artifacts(kind, target, inputs):
     """Return seed records for a trustworthy pre-cache export.
 

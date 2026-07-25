@@ -59,6 +59,35 @@ def write_staged_fbx(command, content=b"fbx-v1"):
 
 
 class SpeedTreeCliTests(unittest.TestCase):
+    def test_bundle_mtime_sync_updates_verified_artifact_and_cache_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "xml" / "SK_test.xml"
+            target.parent.mkdir(parents=True)
+            target.write_text("<SpeedTreeRaw />", encoding="utf-8")
+            cache_path = speedtree_cli._cache_path(target)
+            cache = {
+                "version": speedtree_cli.EXPORT_CACHE_VERSION,
+                "artifacts": [
+                    speedtree_cli._artifact_record(target, target.parent)
+                ],
+            }
+            speedtree_cli._write_cache(cache_path, cache)
+            minimum = target.stat().st_mtime_ns + 1_000_000_000
+            result = {
+                "path": str(target),
+                "cache_path": str(cache_path),
+                "artifacts": cache["artifacts"],
+            }
+
+            sync = speedtree_cli.synchronize_result_mtime(result, minimum)
+
+            self.assertTrue(sync["changed"])
+            self.assertEqual(target.stat().st_mtime_ns, minimum)
+            self.assertTrue(result["bundle_mtime_synchronized"])
+            refreshed = speedtree_cli._load_cache(cache_path)
+            self.assertEqual(refreshed["artifacts"][0]["mtime_ns"], minimum)
+
     def test_regular_file_logs_and_fingerprint_cache_skip_second_export(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
