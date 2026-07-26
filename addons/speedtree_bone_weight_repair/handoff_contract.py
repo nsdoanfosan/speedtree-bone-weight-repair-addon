@@ -19,6 +19,7 @@ from pathlib import Path
 CENTRAL_MODULE_NAME = "speedtree_handoff_contract.py"
 CENTRAL_MODULE_ENV = "SPEEDTREE_HANDOFF_CONTRACT_PATH"
 PIPELINE_ENVELOPE_FIELD = "speedtree_pipeline_contract"
+CONTENT_FINGERPRINT_POLICY = "canonical_path_sha256_size_v1"
 SOURCE_MODES = {
     "managed_texture_set",
     "preserve_declared_sources",
@@ -79,9 +80,31 @@ def envelope_field():
     return configured or PIPELINE_ENVELOPE_FIELD
 
 
-def source_fingerprint(source):
+def _content_identity(value):
+    if isinstance(value, dict):
+        return {
+            key: _content_identity(item)
+            for key, item in sorted(value.items())
+            if key != "mtime_ns"
+        }
+    if isinstance(value, list):
+        return [_content_identity(item) for item in value]
+    return value
+
+
+def source_fingerprint(source, policy=""):
+    if policy not in ("", CONTENT_FINGERPRINT_POLICY):
+        raise ValueError(
+            "unsupported SpeedTree preflight source fingerprint policy: "
+            + str(policy)
+        )
+    payload = (
+        _content_identity(source)
+        if policy == CONTENT_FINGERPRINT_POLICY
+        else source
+    )
     encoded = json.dumps(
-        source, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -219,7 +242,10 @@ def validate_live_preflight_envelope(
 
     source = validated["source"]
     recorded_fingerprint = str(validated.get("source_fingerprint") or "").casefold()
-    if recorded_fingerprint != source_fingerprint(source):
+    fingerprint_policy = str(
+        validated.get("source_fingerprint_policy") or ""
+    )
+    if recorded_fingerprint != source_fingerprint(source, fingerprint_policy):
         raise RuntimeError("SpeedTree preflight source fingerprint mismatch")
 
     live = {
