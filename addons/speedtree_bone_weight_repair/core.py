@@ -260,6 +260,8 @@ def run_speedtree_cli_export(
     export_fbx=True,
     export_xml=True,
     timeout_seconds=900,
+    allow_boneless=False,
+    allow_manual_bones=False,
 ):
     spm = Path(spm_path)
     if not spm.exists():
@@ -271,12 +273,20 @@ def run_speedtree_cli_export(
 
     root = Path(output_root) if output_root else spm.parent
     stem = name_stem or spm.stem
-    bone_status = require_spm_sk_ready(spm)
+    bone_status = (
+        inspect_spm_bone_generators(spm)
+        if allow_boneless or allow_manual_bones
+        else require_spm_sk_ready(spm)
+    )
     has_enabled_bones = bone_status["enabled_branch_generators"] > 0
     targets = []
     if export_fbx:
         options = Path(fbx_export_options_path or export_options_path or default_speedtree_export_options(spm_path, "fbx"))
-        if not has_enabled_bones and BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS.exists():
+        if (
+            allow_boneless
+            and not has_enabled_bones
+            and BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS.exists()
+        ):
             options = BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS
         targets.append(("fbx", root / "fbx" / f"{stem}.fbx", options))
     if export_xml:
@@ -319,6 +329,7 @@ def run_speedtree_cli_export(
         "output_root": str(root),
         "name_stem": stem,
         "spm_has_enabled_bones": has_enabled_bones,
+        "manual_bones_preserved": bool(allow_manual_bones),
         "spm_bone_generators": bone_status,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "export_bundle_mtime_sync": bundle_mtime_sync,
