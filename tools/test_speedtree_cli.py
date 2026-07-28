@@ -47,7 +47,9 @@ def make_inputs(root):
     options = root / "Options.ini"
     exe.write_bytes(b"fake-exe")
     spm.write_bytes(b"spm-v1")
-    options.write_bytes(b"options-v1")
+    options.write_text(
+        "[Options]\nTextureSkipWriting=true\n", encoding="utf-8"
+    )
     return exe, spm, options
 
 
@@ -59,6 +61,36 @@ def write_staged_fbx(command, content=b"fbx-v1"):
 
 
 class SpeedTreeCliTests(unittest.TestCase):
+    def test_texture_writing_options_are_rejected_before_cache_or_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            options.write_text(
+                "[Options]\nTextureSkipWriting=false\n", encoding="utf-8"
+            )
+            temporary_copy = root / "_temporary" / options.name
+            temporary_copy.parent.mkdir()
+            temporary_copy.write_bytes(options.read_bytes())
+            target = root / "out" / "SK_test.fbx"
+
+            for preset in (options, temporary_copy):
+                before = preset.read_bytes()
+                with mock.patch.object(
+                    speedtree_cli.subprocess, "Popen"
+                ) as popen:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "TextureSkipWriting=false"
+                    ):
+                        speedtree_cli.export_target(
+                            exe, spm, preset, "fbx", target
+                        )
+                popen.assert_not_called()
+                self.assertEqual(preset.read_bytes(), before)
+                self.assertFalse(target.exists())
+                self.assertFalse(
+                    speedtree_cli._cache_path(target).exists()
+                )
+
     def test_export_gate_is_acquired_before_process_timeout_starts(self):
         events = []
 

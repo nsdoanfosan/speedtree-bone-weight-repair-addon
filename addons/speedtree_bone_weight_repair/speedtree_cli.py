@@ -9,6 +9,7 @@ waits only for the process handle.
 
 import ctypes
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -20,6 +21,31 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+try:
+    from .export_options_contract import require_texture_skip_writing
+except ImportError:
+    # Keep direct-file unit tests and maintenance scripts independent of bpy
+    # package initialization.
+    _EXPORT_OPTIONS_CONTRACT_PATH = (
+        Path(__file__).with_name("export_options_contract.py")
+    )
+    _EXPORT_OPTIONS_SPEC = importlib.util.spec_from_file_location(
+        "bwr_export_options_contract", _EXPORT_OPTIONS_CONTRACT_PATH
+    )
+    if _EXPORT_OPTIONS_SPEC is None or _EXPORT_OPTIONS_SPEC.loader is None:
+        raise RuntimeError(
+            "Could not load SpeedTree export-options contract: "
+            + str(_EXPORT_OPTIONS_CONTRACT_PATH)
+        )
+    _EXPORT_OPTIONS_MODULE = importlib.util.module_from_spec(
+        _EXPORT_OPTIONS_SPEC
+    )
+    _EXPORT_OPTIONS_SPEC.loader.exec_module(_EXPORT_OPTIONS_MODULE)
+    require_texture_skip_writing = (
+        _EXPORT_OPTIONS_MODULE.require_texture_skip_writing
+    )
 
 
 EXPORT_CACHE_VERSION = 1
@@ -466,6 +492,9 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
     options = Path(options)
     target = Path(target)
     kind = str(kind).lower()
+    require_texture_skip_writing(
+        options, purpose=f"SpeedTree {kind.upper()} export"
+    )
     target.parent.mkdir(parents=True, exist_ok=True)
 
     fingerprint, inputs = _input_fingerprint(exe, spm, options, kind, target)

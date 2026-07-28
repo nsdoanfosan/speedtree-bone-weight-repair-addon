@@ -96,6 +96,7 @@ def run_contract_smoke(
     normalize_speedtree_material_textures,
     consolidate_speedtree_group_materials,
     speedtree_manifest_binding,
+    speedtree_manifest_texture_binding,
     apply_speedtree_material_intents,
     handoff_contract,
     load_speedtree_texture_readiness_contract,
@@ -129,6 +130,31 @@ def run_contract_smoke(
             path = cluster_dir / filename
             path.write_bytes(b"cluster-contract")
             cluster_sources[role] = path
+        (
+            cluster_dir / "leaf_cluster_01_auto_capture_manifest.json"
+        ).write_text(
+            json.dumps({
+                "kind": "speedtree_cluster_blender_auto_capture",
+                "version": 2,
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "direct_uv_source":
+                    "same_blender_physical_capture_projection",
+                "material_id": "2",
+                "material_name": "M_leaf_cluster_01",
+                "physical_capture_contract_sha256": "c" * 64,
+                "maps": [
+                    {
+                        "role": role,
+                        "path": str(path),
+                        "sha256": hashlib.sha256(
+                            path.read_bytes()
+                        ).hexdigest(),
+                    }
+                    for role, path in cluster_sources.items()
+                ],
+            }),
+            encoding="utf-8",
+        )
 
         outside_source = asset / "texture" / "outside_cluster.tga"
         outside_source.parent.mkdir(parents=True, exist_ok=True)
@@ -682,6 +708,379 @@ def run_contract_smoke(
         ):
             raise AssertionError(manifest_binding)
 
+        canonical_asset = asset / "manifest_canonical"
+        canonical_fbx = canonical_asset / "fbx" / "canonical.fbx"
+        canonical_fbx.parent.mkdir(parents=True)
+        canonical_fbx.write_bytes(b"canonical-fbx")
+        canonical_texture_root = canonical_asset / "texture"
+        manifest_canonical_files = touch_texture_set(
+            canonical_texture_root, "T_Leaf_manifest_canonical_01"
+        )
+        canonical_manifest = canonical_asset / "speedtree_import_manifest.json"
+        canonical_manifest.write_text(
+            json.dumps(
+                {
+                    "atlas_asset_name": "M_Leaf_manifest_canonical_01",
+                    "texture_contract_status": "canonical_pcg_output",
+                    "canonical_texture_outputs": [
+                        {
+                            "texture_contract_status": "canonical_pcg_output",
+                            "material_name": "M_Leaf_manifest_canonical_01",
+                            "target_spm": str(
+                                canonical_asset / "canonical.spm"
+                            ),
+                            "texture_root": str(canonical_texture_root),
+                            "texture_base": "T_Leaf_manifest_canonical_01",
+                            "files": {
+                                role: str(path)
+                                for role, path in manifest_canonical_files.items()
+                            },
+                        }
+                    ],
+                    "material_groups": [
+                        {
+                            "material": "M_Leaf_manifest_canonical_01",
+                            "texture_contract_status": "canonical_pcg_output",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        canonical_material = bpy.data.materials.new(
+            "M_Leaf_manifest_canonical_01"
+        )
+        canonical_material["codex_source_fbx"] = str(canonical_fbx)
+        canonical_object = make_mesh_object(
+            "ManifestCanonicalObject", [canonical_material]
+        )
+        canonical_manifest_binding = speedtree_manifest_texture_binding(
+            canonical_fbx, canonical_material
+        )
+        canonical_manifest_result = normalize_speedtree_material_textures(
+            [canonical_object]
+        )
+        if (
+            canonical_manifest_binding.get("texture_contract_status")
+            != "canonical_pcg_output"
+            or canonical_manifest_result.get("status") != "ok"
+            or canonical_manifest_result["materials"][0].get("match_source")
+            != "atlas_import_manifest"
+        ):
+            raise AssertionError(
+                (canonical_manifest_binding, canonical_manifest_result)
+            )
+        strict_canonical_manifest_result = (
+            normalize_speedtree_material_textures(
+                [canonical_object],
+                texture_contract={
+                    "status": "ok",
+                    "strict_speedtree_pipeline_contract": True,
+                    "bindings": [{
+                        "material": canonical_material.name,
+                        "status": "not_managed",
+                        "texture_source_mode": (
+                            "preserve_declared_sources"
+                        ),
+                    }],
+                },
+            )
+        )
+        if (
+            strict_canonical_manifest_result.get("status") != "ok"
+            or strict_canonical_manifest_result["materials"][0].get(
+                "match_source"
+            )
+            != "atlas_import_manifest"
+        ):
+            raise AssertionError(strict_canonical_manifest_result)
+
+        provisional_asset = asset / "manifest_provisional"
+        provisional_fbx = provisional_asset / "fbx" / "provisional.fbx"
+        provisional_fbx.parent.mkdir(parents=True)
+        provisional_fbx.write_bytes(b"provisional-fbx")
+        original_root = asset / "original_atlas_sources"
+        original_root.mkdir()
+        sample_tga = next(iter(manifest_canonical_files.values())).read_bytes()
+        original_sources = {
+            "albedo": original_root / "leaf_albedo.tga",
+            "alpha": original_root / "leaf_opacity.tga",
+            "normal": original_root / "leaf_normal.tga",
+        }
+        for path in original_sources.values():
+            path.write_bytes(sample_tga)
+        promoted_texture_root = provisional_asset / "texture"
+        expected_t_paths = {
+            role: str(
+                promoted_texture_root
+                / f"T_Leaf_manifest_provisional_01_{role}.tga"
+            )
+            for role in TEXTURE_ROLES
+        }
+        provisional_manifest = (
+            provisional_asset / "speedtree_import_manifest.json"
+        )
+        provisional_payload = {
+            "atlas_asset_name": "M_Leaf_manifest_provisional_01",
+            "texture_contract_status": (
+                "source_fallback_needs_pcg_generation"
+            ),
+            "source_texture_fallbacks": [
+                {
+                    "texture_contract_status": (
+                        "source_fallback_needs_pcg_generation"
+                    ),
+                    "material": "M_Leaf_manifest_provisional_01",
+                    "source_origin": "atlas_mesh_build_source",
+                    "source_paths": {
+                        role: str(path)
+                        for role, path in original_sources.items()
+                    },
+                    "source_roles": sorted(original_sources),
+                    "expected_t_paths": expected_t_paths,
+                    "expected_texture_base": (
+                        "T_Leaf_manifest_provisional_01"
+                    ),
+                    "remediation": "run PCG ST9 Texture",
+                    "warning": "canonical T_* is not generated yet",
+                    "provisional_receipt": {
+                        "kind": "speedtree_texture_provisional_receipt",
+                        "version": 1,
+                        "status": (
+                            "source_fallback_needs_pcg_generation"
+                        ),
+                        "source_origin": "atlas_mesh_build_source",
+                        "material": "M_Leaf_manifest_provisional_01",
+                        "target_spm": str(
+                            provisional_asset / "provisional.spm"
+                        ),
+                        "source_roles": sorted(original_sources),
+                        "warning": "canonical T_* is not generated yet",
+                        "remediation": "run PCG ST9 Texture",
+                        "canonical_promotion_required": True,
+                    },
+                }
+            ],
+            "material_groups": [
+                {
+                    "material": "M_Leaf_manifest_provisional_01",
+                    "texture_contract_status": (
+                        "source_fallback_needs_pcg_generation"
+                    ),
+                }
+            ],
+        }
+        provisional_manifest.write_text(
+            json.dumps(provisional_payload), encoding="utf-8"
+        )
+        provisional_material = bpy.data.materials.new(
+            "M_Leaf_manifest_provisional_01"
+        )
+        provisional_material["codex_source_fbx"] = str(provisional_fbx)
+        provisional_object = make_mesh_object(
+            "ManifestProvisionalObject", [provisional_material]
+        )
+        provisional_result = normalize_speedtree_material_textures(
+            [provisional_object]
+        )
+        provisional_signature = {
+            str(path.resolve()).casefold()
+            for path in original_sources.values()
+        }
+        provisional_node_signature = {
+            str(
+                Path(
+                    bpy.path.abspath(
+                        node.image.filepath_raw or node.image.filepath
+                    )
+                ).resolve()
+            ).casefold()
+            for node in provisional_material.node_tree.nodes
+            if node.type == "TEX_IMAGE" and node.image
+        }
+        if (
+            provisional_result.get("status")
+            != "needs_pcg_generation"
+            or provisional_result.get("needs_pcg_generation_count") != 1
+            or provisional_node_signature != provisional_signature
+        ):
+            raise AssertionError(provisional_result)
+        strict_provisional_manifest_result = (
+            normalize_speedtree_material_textures(
+                [provisional_object],
+                texture_contract={
+                    "status": "ok",
+                    "strict_speedtree_pipeline_contract": True,
+                    "bindings": [{
+                        "material": provisional_material.name,
+                        "status": "not_managed",
+                        "texture_source_mode": (
+                            "preserve_declared_sources"
+                        ),
+                    }],
+                },
+            )
+        )
+        if (
+            strict_provisional_manifest_result.get("status")
+            != "needs_pcg_generation"
+            or strict_provisional_manifest_result.get(
+                "needs_pcg_generation_count"
+            )
+            != 1
+        ):
+            raise AssertionError(strict_provisional_manifest_result)
+
+        promoted_files = touch_texture_set(
+            promoted_texture_root, "T_Leaf_manifest_provisional_01"
+        )
+        provisional_payload["texture_contract_status"] = (
+            "canonical_pcg_output"
+        )
+        provisional_payload.pop("source_texture_fallbacks")
+        provisional_payload["canonical_texture_outputs"] = [
+            {
+                "texture_contract_status": "canonical_pcg_output",
+                "material_name": "M_Leaf_manifest_provisional_01",
+                "target_spm": str(
+                    provisional_asset / "provisional.spm"
+                ),
+                "texture_root": str(promoted_texture_root),
+                "texture_base": "T_Leaf_manifest_provisional_01",
+                "files": {
+                    role: str(path)
+                    for role, path in promoted_files.items()
+                },
+            }
+        ]
+        provisional_payload["material_groups"][0][
+            "texture_contract_status"
+        ] = "canonical_pcg_output"
+        provisional_manifest.write_text(
+            json.dumps(provisional_payload), encoding="utf-8"
+        )
+        promoted_result = normalize_speedtree_material_textures(
+            [provisional_object]
+        )
+        promoted_signature = {
+            str(path.resolve()).casefold() for path in promoted_files.values()
+        }
+        promoted_node_signature = {
+            str(
+                Path(
+                    bpy.path.abspath(
+                        node.image.filepath_raw or node.image.filepath
+                    )
+                ).resolve()
+            ).casefold()
+            for node in provisional_material.node_tree.nodes
+            if node.type == "TEX_IMAGE" and node.image
+        }
+        if (
+            promoted_result.get("status") != "ok"
+            or promoted_node_signature != promoted_signature
+        ):
+            raise AssertionError((promoted_result, promoted_signature))
+
+        malformed_asset = asset / "manifest_malformed"
+        malformed_fbx = malformed_asset / "fbx" / "malformed.fbx"
+        malformed_fbx.parent.mkdir(parents=True)
+        malformed_fbx.write_bytes(b"malformed-fbx")
+        (malformed_asset / "speedtree_import_manifest.json").write_text(
+            "{ malformed json",
+            encoding="utf-8",
+        )
+        malformed_material = bpy.data.materials.new(
+            "M_Leaf_manifest_malformed_01"
+        )
+        malformed_material["codex_source_fbx"] = str(malformed_fbx)
+        malformed_material.use_nodes = True
+        malformed_sentinel = malformed_material.node_tree.nodes.new(
+            "ShaderNodeTexImage"
+        )
+        malformed_sentinel.name = "MalformedManifestSentinel"
+        malformed_sentinel.image = bpy.data.images.new(
+            "MalformedManifestSentinelImage", width=1, height=1
+        )
+        malformed_object = make_mesh_object(
+            "ManifestMalformedObject", [malformed_material]
+        )
+        malformed_manifest_blocked = False
+        try:
+            normalize_speedtree_material_textures([malformed_object])
+        except RuntimeError as exc:
+            malformed_manifest_blocked = "malformed" in str(exc).casefold()
+        if (
+            not malformed_manifest_blocked
+            or malformed_material.node_tree.nodes.get(
+                "MalformedManifestSentinel"
+            )
+            is None
+        ):
+            raise AssertionError(
+                "malformed authoritative manifest did not fail before "
+                "node mutation"
+            )
+
+        invalid_asset = asset / "manifest_invalid"
+        invalid_fbx = invalid_asset / "fbx" / "invalid.fbx"
+        invalid_fbx.parent.mkdir(parents=True)
+        invalid_fbx.write_bytes(b"invalid-fbx")
+        copied_root = invalid_asset / "cache"
+        copied_root.mkdir()
+        copied_albedo = copied_root / "copied_albedo.png"
+        copied_albedo.write_bytes(sample_tga)
+        (invalid_asset / "speedtree_import_manifest.json").write_text(
+            json.dumps(
+                {
+                    "texture_contract_status": (
+                        "source_fallback_needs_pcg_generation"
+                    ),
+                    "source_texture_fallbacks": [
+                        {
+                            "material": "M_Leaf_manifest_invalid_01",
+                            "source_paths": {
+                                "albedo": str(copied_albedo)
+                            },
+                            "expected_t_paths": {},
+                            "remediation": "run PCG ST9 Texture",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        invalid_material = bpy.data.materials.new(
+            "M_Leaf_manifest_invalid_01"
+        )
+        invalid_material["codex_source_fbx"] = str(invalid_fbx)
+        invalid_material.use_nodes = True
+        invalid_sentinel = invalid_material.node_tree.nodes.new(
+            "ShaderNodeTexImage"
+        )
+        invalid_sentinel.name = "InvalidManifestSentinel"
+        invalid_sentinel.image = bpy.data.images.new(
+            "InvalidManifestSentinelImage", width=1, height=1
+        )
+        invalid_object = make_mesh_object(
+            "ManifestInvalidObject", [invalid_material]
+        )
+        invalid_manifest_blocked = False
+        try:
+            normalize_speedtree_material_textures([invalid_object])
+        except RuntimeError as exc:
+            invalid_manifest_blocked = "never fall back" in str(exc)
+        if (
+            not invalid_manifest_blocked
+            or invalid_material.node_tree.nodes.get(
+                "InvalidManifestSentinel"
+            )
+            is None
+        ):
+            raise AssertionError(
+                "invalid Atlas manifest did not fail before node mutation"
+            )
+
         profile_materials = [
             bpy.data.materials.new("M_Profile_stem_01"),
             bpy.data.materials.new("M_Profile_leaf_01"),
@@ -967,6 +1366,17 @@ def run_contract_smoke(
             "distinct_signature_not_consolidated": distinct_result,
             "source_isolation_consolidation": isolated_result,
             "legacy_manifest_binding": manifest_binding,
+            "canonical_manifest_rewire": canonical_manifest_result,
+            "strict_canonical_manifest_rewire": (
+                strict_canonical_manifest_result
+            ),
+            "provisional_manifest_rewire": provisional_result,
+            "strict_provisional_manifest_rewire": (
+                strict_provisional_manifest_result
+            ),
+            "provisional_manifest_promoted": promoted_result,
+            "malformed_manifest_blocked": malformed_manifest_blocked,
+            "invalid_manifest_blocked": invalid_manifest_blocked,
             "instance_profile": profile_result,
             "strict_contract_load": {
                 "contract_path": loaded_strict_contract.get("contract_path"),
@@ -1002,6 +1412,7 @@ def main():
         addon_utils.enable("speedtree_bone_weight_repair", default_set=False)
         from speedtree_bone_weight_repair.core import (
             _speedtree_manifest_binding,
+            _speedtree_manifest_texture_binding,
             apply_speedtree_material_intents,
             apply_spm_unreal_instance_profile,
             consolidate_speedtree_group_materials,
@@ -1019,6 +1430,7 @@ def main():
                 normalize_speedtree_material_textures,
                 consolidate_speedtree_group_materials,
                 _speedtree_manifest_binding,
+                _speedtree_manifest_texture_binding,
                 apply_speedtree_material_intents,
                 handoff_contract,
                 load_speedtree_texture_readiness_contract,
