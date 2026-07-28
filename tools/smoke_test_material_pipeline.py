@@ -102,6 +102,7 @@ def run_contract_smoke(
     inspect_spm_unreal_instance_profile,
     apply_spm_unreal_instance_profile,
     merge_skinned_meshes,
+    clear_previous_codex_build,
 ):
     with tempfile.TemporaryDirectory(prefix="bwr_material_contract_") as temporary:
         asset = Path(temporary) / "asset"
@@ -141,6 +142,7 @@ def run_contract_smoke(
         dead = touch_texture_set(texture_dir, "T_Leaf_common_grass_01_dead")
         shared = touch_texture_set(texture_dir, "T_Leaf_Grass_atlas_01")
         stmat_maps = {
+            "M_Material": {},
             "M_leaf_cluster_01": cluster_sources,
             "M_leaf_outside_cluster_01": outside_cluster_sources,
             "M_leaf_missing_cluster_01": missing_cluster_sources,
@@ -215,6 +217,39 @@ def run_contract_smoke(
             raise AssertionError(strict_preserved_cluster)
         if preserved_material.node_tree.nodes.get("ClusterSentinelNode") is None:
             raise AssertionError("strict contract removed a preserved Cluster node")
+
+        source_free_material = bpy.data.materials.new("M_Material")
+        source_free_material["codex_source_fbx"] = str(source_fbx)
+        source_free_object = make_mesh_object(
+            "SourceFreeDeclaredObject", [source_free_material]
+        )
+        source_free_contract = {
+            "status": "ok",
+            "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": {"material_intents": []},
+            "bindings": [{
+                "material": source_free_material.name,
+                "material_key": "mmaterial",
+                "production_group_base": source_free_material.name,
+                "status": "not_managed",
+                "texture_source_mode": "preserve_declared_sources",
+                "files": {},
+                "missing_roles": [],
+            }],
+        }
+        source_free_result = normalize_speedtree_material_textures(
+            [source_free_object], texture_contract=source_free_contract
+        )
+        if source_free_result.get("status") != "ok":
+            raise AssertionError(source_free_result)
+        source_free_rows = source_free_result.get("materials") or []
+        if (
+            not source_free_rows
+            or source_free_rows[0].get("status")
+            != "preserved_declared_sources"
+            or source_free_rows[0].get("source_free") is not True
+        ):
+            raise AssertionError(source_free_result)
 
         outside_material = bpy.data.materials.new("M_leaf_outside_cluster_01")
         outside_material.use_nodes = True
@@ -865,6 +900,52 @@ def run_contract_smoke(
         if invalid_profile.get("status") != "inspection_error":
             raise AssertionError(invalid_profile)
 
+        stable_source_identity = asset / "Cluster" / "SK_contract.spm"
+        canonical_source_fbx = asset / "Cluster" / "fbx" / "SK_contract.fbx"
+        current_cache_fbx = (
+            asset
+            / "Cluster"
+            / ".sk_batch_isolated_bark"
+            / "current"
+            / "SK_contract.fbx"
+        )
+        old_cache_fbx = (
+            asset
+            / "Cluster"
+            / ".sk_batch_isolated_bark"
+            / "old"
+            / "SK_contract.fbx"
+        )
+        alias_owned = bpy.data.objects.new("Cleanup_Alias_Owned", None)
+        alias_owned["codex_source_fbx"] = str(canonical_source_fbx)
+        bpy.context.scene.collection.objects.link(alias_owned)
+        alias_owned_name = alias_owned.name
+        identity_owned = bpy.data.objects.new("Cleanup_Identity_Owned", None)
+        identity_owned["codex_source_fbx"] = str(old_cache_fbx)
+        identity_owned["codex_source_identity"] = str(stable_source_identity)
+        bpy.context.scene.collection.objects.link(identity_owned)
+        identity_owned_name = identity_owned.name
+        unrelated = bpy.data.objects.new("Cleanup_Unrelated", None)
+        unrelated["codex_source_fbx"] = str(old_cache_fbx)
+        unrelated["codex_source_identity"] = str(asset / "other.spm")
+        bpy.context.scene.collection.objects.link(unrelated)
+        unrelated_name = unrelated.name
+        cleanup_result = clear_previous_codex_build(
+            {
+                "source_fbx_path": str(current_cache_fbx),
+                "source_fbx_cleanup_aliases": [str(canonical_source_fbx)],
+                "source_identity_path": str(stable_source_identity),
+                "out_dir": str(asset),
+                "name_stem": "SK_contract",
+            }
+        )
+        if bpy.data.objects.get(alias_owned_name) is not None:
+            raise AssertionError(cleanup_result)
+        if bpy.data.objects.get(identity_owned_name) is not None:
+            raise AssertionError(cleanup_result)
+        if bpy.data.objects.get(unrelated_name) is None:
+            raise AssertionError(cleanup_result)
+
         return {
             "preserved_cluster": normalization,
             "strict_preserved_cluster": strict_preserved_cluster,
@@ -906,6 +987,7 @@ def run_contract_smoke(
             "name_only_material_groups": name_only_result,
             "cleared_instance_profile": cleared_profile_result,
             "invalid_instance_profile": invalid_profile,
+            "stable_source_cleanup": cleanup_result,
         }
 
 
@@ -928,6 +1010,7 @@ def main():
             merge_skinned_meshes,
             normalize_speedtree_material_textures,
             run_import_source_fbx,
+            clear_previous_codex_build,
         )
         from speedtree_bone_weight_repair import handoff_contract
 
@@ -942,6 +1025,7 @@ def main():
                 inspect_spm_unreal_instance_profile,
                 apply_spm_unreal_instance_profile,
                 merge_skinned_meshes,
+                clear_previous_codex_build,
             )
         elif args.blend:
             bpy.ops.wm.open_mainfile(filepath=str(source_path))

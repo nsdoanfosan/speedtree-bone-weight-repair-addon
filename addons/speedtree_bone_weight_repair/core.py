@@ -373,9 +373,15 @@ def collect_object_materials(objects):
     return materials
 
 
-def tag_speedtree_import_materials(objects, source_fbx_path):
+def tag_speedtree_import_materials(
+    objects,
+    source_fbx_path,
+    source_identity_path="",
+):
     for material in collect_object_materials(objects):
         material["codex_source_fbx"] = str(source_fbx_path)
+        if source_identity_path:
+            material["codex_source_identity"] = str(source_identity_path)
 
 
 def normalized_source_fbx_path(value):
@@ -393,6 +399,16 @@ def belongs_to_source_fbx(datablock, source_fbx_path):
     return bool(tagged_path) and (
         normalized_source_fbx_path(tagged_path)
         == normalized_source_fbx_path(source_fbx_path)
+    )
+
+
+def belongs_to_source_identity(datablock, source_identity_path):
+    if datablock is None or not source_identity_path:
+        return False
+    tagged_path = datablock.get("codex_source_identity", "")
+    return bool(tagged_path) and (
+        normalized_source_fbx_path(tagged_path)
+        == normalized_source_fbx_path(source_identity_path)
     )
 
 
@@ -656,12 +672,22 @@ def _speedtree_preserved_declared_sources(
 ):
     """Verify non-managed STMAT sources without guessing a managed T_ set."""
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
-    stmat_material = stmat_data.get("materials", {}).get(
-        _speedtree_material_name_key(material.name), {}
-    )
+    materials = stmat_data.get("materials", {})
+    material_key = _speedtree_material_name_key(material.name)
+    if material_key not in materials:
+        return None
+    stmat_material = materials[material_key]
     source_paths = stmat_material.get("source_paths") or []
     if not source_paths:
-        return None
+        # A declared STMAT material can intentionally consist only of constant
+        # map values (Color/Gloss/etc.).  Its empty Source set is a complete
+        # declaration, not a stale file reference.  The exact STMAT name is
+        # still required above, so an unmatched Blender placeholder does not
+        # receive this exemption.
+        return {
+            "declared_sources": [],
+            "source_free": True,
+        }
     resolved = []
     for value in source_paths:
         try:
@@ -1785,22 +1811,70 @@ def _consolidate_blender_numeric_material_duplicates(
     """Remap proven ``Material``/``Material.001`` collisions to one datablock."""
     used_materials = []
     seen_materials = set()
-    numeric_bases = set()
     for obj in mesh_objects:
         for material in obj.data.materials:
             if material is None or material in seen_materials:
                 continue
             seen_materials.add(material)
             used_materials.append(material)
-            base_name = _blender_numeric_material_base(material.name)
-            if base_name != material.name:
-                numeric_bases.add(base_name.casefold())
+
+    # A previous rebuild can remove the original ``Material`` datablock after
+    # Blender has already named the replacement ``Material.001``.  With no
+    # canonical peer left there is nothing to merge, but keeping the numeric
+    # collision suffix would publish the stale Blender accident as an Unreal
+    # material-slot identity.  A single used survivor is therefore the
+    # canonical material and can be renamed without changing any slot, face,
+    # texture, or provenance.
+    suffixed_by_base = defaultdict(list)
+    for material in used_materials:
+        base_name = _blender_numeric_material_base(material.name)
+        if base_name != material.name:
+            suffixed_by_base[base_name.casefold()].append(material)
+    canonical_keys = {
+        material.name.casefold()
+        for material in bpy.data.materials
+        if _blender_numeric_material_base(material.name) == material.name
+    }
+    orphan_renames = []
+    for base_key, materials in sorted(suffixed_by_base.items()):
+        if base_key in canonical_keys or len(materials) != 1:
+            continue
+        material = materials[0]
+        old_name = material.name
+        target_name = _blender_numeric_material_base(old_name)
+        objects = sorted(
+            obj.name
+            for obj in mesh_objects
+            if material in obj.data.materials[:]
+        )
+        material.name = target_name
+        orphan_renames.append(
+            {
+                "mode": "blender_orphan_numeric_suffix",
+                "target_material": material.name,
+                "source_materials": [old_name],
+                "proofs": ["single_used_survivor"],
+                "object_count": len(objects),
+                "objects": objects[:200],
+                "changed_faces": 0,
+                "removed_source_materials": [],
+            }
+        )
+        canonical_keys.add(material.name.casefold())
+
+    numeric_bases = {
+        _blender_numeric_material_base(material.name).casefold()
+        for material in used_materials
+        if _blender_numeric_material_base(material.name) != material.name
+    }
 
     if not numeric_bases:
         return {
-            "groups": [],
+            "groups": orphan_renames,
             "skipped_groups": [],
-            "changed_object_count": 0,
+            "changed_object_count": sum(
+                group["object_count"] for group in orphan_renames
+            ),
             "changed_face_count": 0,
         }
 
@@ -1853,9 +1927,11 @@ def _consolidate_blender_numeric_material_duplicates(
 
     if not material_targets:
         return {
-            "groups": [],
+            "groups": orphan_renames,
             "skipped_groups": skipped_groups,
-            "changed_object_count": 0,
+            "changed_object_count": sum(
+                group["object_count"] for group in orphan_renames
+            ),
             "changed_face_count": 0,
         }
 
@@ -1920,12 +1996,26 @@ def _consolidate_blender_numeric_material_duplicates(
                 "changed_faces": changed_faces[target],
             }
         )
+    removed_source_materials = []
+    for source in list(material_targets):
+        if source.users != 0:
+            continue
+        removed_source_materials.append(source.name)
+        bpy.data.materials.remove(source)
+    if removed_source_materials:
+        for report in reports:
+            report["removed_source_materials"] = sorted(
+                name
+                for name in removed_source_materials
+                if _blender_numeric_material_base(name).casefold()
+                == report["target_material"].casefold()
+            )
     return {
-        "groups": reports,
+        "groups": orphan_renames + reports,
         "skipped_groups": skipped_groups,
         "changed_object_count": sum(
             group["object_count"] for group in reports
-        ),
+        ) + sum(group["object_count"] for group in orphan_renames),
         "changed_face_count": sum(
             group["changed_faces"] for group in reports
         ),
@@ -2746,6 +2836,7 @@ def run_import_source_fbx(
     texture_contract=None,
     cluster_source_skin_contract=False,
     cluster_source_xml_path="",
+    source_identity_path="",
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -2761,8 +2852,14 @@ def run_import_source_fbx(
     source_collection = ensure_scene_collection(source_collection_name)
     for obj in imported:
         obj["codex_source_fbx"] = str(path)
+        if source_identity_path:
+            obj["codex_source_identity"] = str(source_identity_path)
         ensure_only_collection(obj, source_collection)
-    tag_speedtree_import_materials(imported, path)
+    tag_speedtree_import_materials(
+        imported,
+        path,
+        source_identity_path=source_identity_path,
+    )
     renamed_materials = strip_speedtree_material_suffixes(imported)
     material_consolidation = consolidate_speedtree_group_materials(
         imported, texture_contract=texture_contract
@@ -5568,6 +5665,208 @@ def merge_skinned_meshes(armature, source_objects, merged_name):
     return merged_obj, source_ranges, len(merged_obj.data.materials), uv_names, removed_invalid_groups
 
 
+def _strict_material_intents_for_name(material_name, envelope):
+    """Return the authoritative intent rows matching one final slot name."""
+    api = handoff_contract.central_contract_api()
+    intents = list(envelope.get("material_intents") or [])
+    material_key = api.normalize_material_key(material_name)
+    exact = [
+        row for row in intents
+        if api.normalize_material_key(row.get("material_key")) == material_key
+    ]
+    if exact:
+        return exact
+    base_key = api.normalize_material_key(
+        api.production_group_base_name(material_name)
+    )
+    if not base_key:
+        return []
+    return [
+        row for row in intents
+        if api.normalize_material_key(row.get("production_group_base"))
+        == base_key
+    ]
+
+
+def _is_unmanaged_empty_default_intent(intent):
+    api = handoff_contract.central_contract_api()
+    binding = intent.get("texture_binding")
+    files = binding.get("files") if isinstance(binding, dict) else None
+    return bool(
+        api.normalize_material_key(intent.get("material_key")) == "default"
+        and str(intent.get("texture_source_mode") or "")
+        != "managed_texture_set"
+        and not files
+    )
+
+
+def _is_ready_managed_bark_intent(intent):
+    binding = intent.get("texture_binding")
+    if not isinstance(binding, dict):
+        return False
+    if (
+        str(intent.get("tree_part") or "") != "bark"
+        or str(intent.get("texture_source_mode") or "")
+        != "managed_texture_set"
+        or str(binding.get("status") or "") != "ok"
+    ):
+        return False
+    files = binding.get("files")
+    if not isinstance(files, dict):
+        return False
+    for role in SPEEDTREE_TEXTURE_ROLES:
+        path = Path(str(files.get(role) or ""))
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def normalize_merged_speedtree_placeholder_material(
+    merged_obj, texture_contract=None
+):
+    """Replace a proven Default/None slot with the one proven managed bark slot.
+
+    This is deliberately a post-merge operation.  The final mesh's real
+    material slots are the mutation boundary, while the strict preflight
+    envelope supplies the only accepted semantic evidence.  No material name
+    other than the central exact ``default`` key is treated as a placeholder,
+    and a ``None`` slot is accepted only at the one STMAT Default ordinal.
+    """
+    if not isinstance(texture_contract, dict) or not texture_contract.get(
+        "strict_speedtree_pipeline_contract"
+    ):
+        return {
+            "status": "not_applicable",
+            "reason": "strict_speedtree_pipeline_contract_not_present",
+        }
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        raise RuntimeError(
+            "Strict SpeedTree placeholder normalization has no envelope"
+        )
+    if merged_obj is None or merged_obj.type != "MESH" or merged_obj.data is None:
+        raise RuntimeError(
+            "Strict SpeedTree placeholder normalization requires a merged mesh"
+        )
+
+    api = handoff_contract.central_contract_api()
+    intents = list(envelope.get("material_intents") or [])
+    default_intents = [
+        row for row in intents if _is_unmanaged_empty_default_intent(row)
+    ]
+    all_default_intents = [
+        row for row in intents
+        if api.normalize_material_key(row.get("material_key")) == "default"
+    ]
+    old_materials = list(merged_obj.data.materials)
+    placeholder_slots = []
+
+    default_stmat_index = None
+    if len(default_intents) == 1:
+        try:
+            default_stmat_index = int(default_intents[0]["stmat_material_index"])
+        except (KeyError, TypeError, ValueError):
+            default_stmat_index = None
+
+    for slot_index, material in enumerate(old_materials):
+        if material is None:
+            if (
+                len(default_intents) == 1
+                and default_stmat_index is not None
+                and slot_index == default_stmat_index
+            ):
+                placeholder_slots.append(slot_index)
+            # A None slot at any other ordinal is not evidence of the STMAT
+            # Default placeholder. Leave it unchanged for the ordinary
+            # face-assigned empty-slot validator below the merge/export
+            # boundary; that validator can distinguish an unused join artifact
+            # from an actual authored material omission.
+            continue
+        if api.normalize_material_key(material.name) != "default":
+            continue
+        matching = _strict_material_intents_for_name(material.name, envelope)
+        if len(matching) == 1 and _is_unmanaged_empty_default_intent(
+            matching[0]
+        ):
+            placeholder_slots.append(slot_index)
+        else:
+            raise RuntimeError(
+                "SpeedTree merged Default material is not uniquely proven by "
+                "the strict STMAT Default intent; slot: "
+                + str(slot_index)
+            )
+    if not placeholder_slots:
+        return {
+            "status": "not_applicable",
+            "reason": "no_default_or_none_placeholder_slots",
+        }
+    if len(all_default_intents) != 1 or len(default_intents) != 1:
+        raise RuntimeError(
+            "SpeedTree merged Default placeholder requires exactly one "
+            "unmanaged, source-empty STMAT Default intent"
+        )
+
+    candidate_materials = []
+    seen_candidates = set()
+    for material in old_materials:
+        if material is None or material.as_pointer() in seen_candidates:
+            continue
+        if str(material.get(UNREAL_TREE_PART_PROPERTY) or "") != "bark":
+            continue
+        matching = _strict_material_intents_for_name(material.name, envelope)
+        if len(matching) != 1 or not _is_ready_managed_bark_intent(matching[0]):
+            continue
+        seen_candidates.add(material.as_pointer())
+        candidate_materials.append(material)
+    if len(candidate_materials) != 1:
+        raise RuntimeError(
+            "SpeedTree merged Default placeholder requires exactly one actual "
+            "managed bark material slot with a ready binding; found "
+            + str(len(candidate_materials))
+        )
+    target_material = candidate_materials[0]
+
+    if merged_obj.data.users > 1:
+        merged_obj.data = merged_obj.data.copy()
+    mesh = merged_obj.data
+    old_materials = list(mesh.materials)
+    placeholder_set = set(placeholder_slots)
+    new_materials = []
+    slot_map = {}
+    target_new_index = None
+    for old_index, material in enumerate(old_materials):
+        if old_index in placeholder_set:
+            continue
+        new_index = len(new_materials)
+        new_materials.append(material)
+        slot_map[old_index] = new_index
+        if material is target_material and target_new_index is None:
+            target_new_index = new_index
+    if target_new_index is None:
+        raise RuntimeError(
+            "Managed bark candidate disappeared before placeholder remap"
+        )
+    for slot_index in placeholder_slots:
+        slot_map[slot_index] = target_new_index
+    changed_faces = sum(
+        1 for polygon in mesh.polygons
+        if polygon.material_index in placeholder_set
+    )
+    remap_mesh_materials(mesh, slot_map, new_materials)
+    return {
+        "status": "applied",
+        "proof": "strict_stmat_default_to_unique_managed_bark",
+        "placeholder_slots": placeholder_slots,
+        "target_material": target_material.name,
+        "changed_face_count": changed_faces,
+        "material_count_before": len(old_materials),
+        "material_count_after": len(mesh.materials),
+    }
+
+
 def count_zero_weight_vertices(obj):
     zero = 0
     for vertex in obj.data.vertices:
@@ -5690,6 +5989,11 @@ def structure_export_unit(
         renamed_conflicts.append({"requested": mesh_unit_name, "renamed_to": renamed})
     if source_fbx_path:
         mesh_unit_empty["codex_source_fbx"] = str(source_fbx_path)
+    source_identity_path = str(
+        merged_obj.get("codex_source_identity", "") or ""
+    ).strip()
+    if source_identity_path:
+        mesh_unit_empty["codex_source_identity"] = source_identity_path
 
     if armature.parent is not None:
         parent_keep_world(armature, None)
@@ -5811,7 +6115,16 @@ def park_cluster_source_full_reference(
     }
 
 
-def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", include_hidden=False, report_path="", settings=None):
+def run_merge_export(
+    armature_name,
+    merged_name,
+    fbx_path="",
+    mesh_regex="",
+    include_hidden=False,
+    report_path="",
+    settings=None,
+    texture_contract=None,
+):
     armature = get_armature(armature_name)
     name_filter = compile_optional_regex(mesh_regex)
     source_objects = []
@@ -5838,8 +6151,13 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
 
     source_object_names = [obj.name for obj in source_objects]
 
-    merged_obj, ranges, material_count, uv_names, removed_invalid_groups = merge_skinned_meshes(
+    merged_obj, ranges, _material_count, uv_names, removed_invalid_groups = merge_skinned_meshes(
         armature, source_objects, merged_name
+    )
+    placeholder_material_normalization = (
+        normalize_merged_speedtree_placeholder_material(
+            merged_obj, texture_contract=texture_contract
+        )
     )
     source_fbx_candidates = {
         str(obj.get("codex_source_fbx", "") or "").strip()
@@ -5865,6 +6183,28 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
         # exact source FBX against the matching Raw XML, so write it
         # explicitly on the final merged mesh.
         merged_obj["codex_source_fbx"] = merged_source_fbx
+    source_identity_candidates = {
+        str(obj.get("codex_source_identity", "") or "").strip()
+        for obj in source_objects
+        if str(obj.get("codex_source_identity", "") or "").strip()
+    }
+    configured_source_identity = str(
+        (settings or {}).get("source_identity_path", "") or ""
+    ).strip()
+    if configured_source_identity:
+        source_identity_candidates.add(configured_source_identity)
+    if len(source_identity_candidates) > 1:
+        raise RuntimeError(
+            "Merged sources disagree about their stable source identity: "
+            + ", ".join(sorted(source_identity_candidates))
+        )
+    merged_source_identity = (
+        next(iter(source_identity_candidates))
+        if source_identity_candidates
+        else ""
+    )
+    if merged_source_identity:
+        merged_obj["codex_source_identity"] = merged_source_identity
     zero_weight_vertices = count_zero_weight_vertices(merged_obj)
     roots = [bone.name for bone in armature.data.bones if bone.parent is None]
 
@@ -5882,7 +6222,10 @@ def run_merge_export(armature_name, merged_name, fbx_path="", mesh_regex="", inc
         "merged_vertex_groups": len(merged_obj.vertex_groups),
         "zero_weight_vertices": zero_weight_vertices,
         "removed_invalid_groups": removed_invalid_groups,
-        "material_count": material_count,
+        "material_count": len(merged_obj.data.materials),
+        "placeholder_material_normalization": (
+            placeholder_material_normalization
+        ),
         "uv_layers": uv_names,
         "color_attributes": [attr.name for attr in merged_obj.data.color_attributes],
         "merge_method": "join",
@@ -6262,6 +6605,7 @@ def run_full_pipeline(settings):
         include_hidden=settings.get("include_hidden", False),
         report_path=paths["export_report"],
         settings=settings,
+        texture_contract=texture_contract,
     )
     reports["steps"].append(
         {
@@ -6270,6 +6614,9 @@ def run_full_pipeline(settings):
             "report": paths["export_report"],
             "zero_weight_vertices": export.get("zero_weight_vertices"),
             "removed_invalid_groups": export.get("removed_invalid_groups"),
+            "placeholder_material_normalization": export.get(
+                "placeholder_material_normalization", {}
+            ),
             "export_structure": export.get("export_structure", {}),
         }
     )
@@ -6313,13 +6660,32 @@ def clear_previous_codex_build(settings):
         restore_json_group_preview()
 
     source_fbx_path = settings.get("source_fbx_path", "")
+    source_identity_path = settings.get("source_identity_path", "")
+    cleanup_source_fbx_paths = [source_fbx_path]
+    cleanup_source_fbx_paths.extend(
+        settings.get("source_fbx_cleanup_aliases", []) or []
+    )
+    cleanup_source_fbx_paths = [
+        str(path)
+        for path in cleanup_source_fbx_paths
+        if str(path or "").strip()
+    ]
+
+    def owned_by_current_source(datablock):
+        if belongs_to_source_identity(datablock, source_identity_path):
+            return True
+        return any(
+            belongs_to_source_fbx_cleanup_lineage(datablock, path)
+            for path in cleanup_source_fbx_paths
+        )
+
     target_merged_name = default_paths(settings)["merged_name"]
     doomed = [
         obj
         for obj in list(bpy.data.objects)
         if (
-            belongs_to_source_fbx_cleanup_lineage(obj, source_fbx_path)
-            if source_fbx_path
+            owned_by_current_source(obj)
+            if cleanup_source_fbx_paths or source_identity_path
             else (
                 "codex_source_fbx" in obj
                 or is_codex_merged_output_name(obj.name)
@@ -6337,13 +6703,13 @@ def clear_previous_codex_build(settings):
     # ownership tag was added.
     removed_empties = []
     export_collection = bpy.data.collections.get(settings.get("export_collection_name", "Export"))
-    legacy_unit_name = Path(source_fbx_path).stem if source_fbx_path else ""
+    legacy_unit_names = {
+        Path(path).stem for path in cleanup_source_fbx_paths
+    }
     if export_collection:
         for obj in list(export_collection.objects):
-            owned_empty = belongs_to_source_fbx_cleanup_lineage(
-                obj, source_fbx_path
-            )
-            legacy_empty = bool(legacy_unit_name) and obj.name == legacy_unit_name
+            owned_empty = owned_by_current_source(obj)
+            legacy_empty = obj.name in legacy_unit_names
             if obj.type == "EMPTY" and not obj.children and (owned_empty or legacy_empty):
                 removed_empties.append(obj.name)
                 bpy.data.objects.remove(obj, do_unlink=True)
@@ -6353,8 +6719,8 @@ def clear_previous_codex_build(settings):
         for material in bpy.data.materials
         if material.users == 0
         and (
-            belongs_to_source_fbx_cleanup_lineage(material, source_fbx_path)
-            if source_fbx_path
+            owned_by_current_source(material)
+            if cleanup_source_fbx_paths or source_identity_path
             else "codex_source_fbx" in material
         )
     ]
@@ -6375,6 +6741,8 @@ def clear_previous_codex_build(settings):
         bpy.data.materials.remove(material)
 
     return {
+        "source_identity_path": str(source_identity_path or ""),
+        "source_fbx_cleanup_paths": cleanup_source_fbx_paths,
         "removed_objects": removed_objects,
         "removed_empties": removed_empties,
         "removed_materials": removed_materials,
@@ -6406,6 +6774,7 @@ def run_import_and_repair(settings):
         spm_path=settings.get("spm_path", ""),
         texture_contract=texture_contract,
         cluster_source_xml_path=settings.get("xml_path", ""),
+        source_identity_path=settings.get("source_identity_path", ""),
     )
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:

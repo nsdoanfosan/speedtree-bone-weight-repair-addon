@@ -59,6 +59,48 @@ def write_staged_fbx(command, content=b"fbx-v1"):
 
 
 class SpeedTreeCliTests(unittest.TestCase):
+    def test_export_gate_is_acquired_before_process_timeout_starts(self):
+        events = []
+
+        class Gate:
+            def __enter__(self):
+                events.append("gate-enter")
+
+            def __exit__(self, *_args):
+                events.append("gate-exit")
+
+        class Process:
+            pid = 40001
+
+            def wait(self, timeout=None):
+                events.append(("wait", timeout))
+                return 0
+
+        def popen(_command, **_kwargs):
+            events.append("popen")
+            return Process()
+
+        with mock.patch.object(
+            speedtree_cli, "speedtree_export_gate", return_value=Gate()
+        ), mock.patch.object(
+            speedtree_cli.subprocess, "Popen", side_effect=popen
+        ):
+            result = speedtree_cli._run_process(
+                ["SpeedTree.exe"], ".", timeout_seconds=17
+            )
+
+        self.assertEqual(result, (0, "", ""))
+        self.assertEqual(
+            events,
+            ["gate-enter", "popen", ("wait", 17), "gate-exit"],
+        )
+
+    def test_mutex_name_matches_sk_batch_contract(self):
+        self.assertEqual(
+            speedtree_cli.SPEEDTREE_EXPORT_MUTEX_DEFAULT,
+            r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0",
+        )
+
     def test_bundle_mtime_sync_updates_verified_artifact_and_cache_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

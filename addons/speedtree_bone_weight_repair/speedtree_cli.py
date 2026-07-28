@@ -7,6 +7,7 @@ headless Blender process.  This module redirects output to regular files and
 waits only for the process handle.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -16,12 +17,75 @@ import subprocess
 import tempfile
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 EXPORT_CACHE_VERSION = 1
 _HASH_CHUNK_SIZE = 1024 * 1024
+SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
+SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
+    r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
+)
+
+
+@contextmanager
+def speedtree_export_gate():
+    """Share one machine-wide Modeler export slot with SK Batch."""
+    name = os.environ.get(
+        SPEEDTREE_EXPORT_MUTEX_ENV, SPEEDTREE_EXPORT_MUTEX_DEFAULT
+    )
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_bool,
+            ctypes.c_wchar_p,
+        )
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        )
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+        kernel32.ReleaseMutex.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        acquired = False
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+            if result not in {0x00000000, 0x00000080}:
+                if result == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                raise RuntimeError(
+                    f"SpeedTree export mutex wait returned {result:#x}"
+                )
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(handle)
+            kernel32.CloseHandle(handle)
+        return
+
+    import fcntl
+
+    safe_name = "".join(
+        character if character.isalnum() or character in "_.-" else "_"
+        for character in name
+    )
+    lock_path = Path(tempfile.gettempdir()) / f"{safe_name}.lock"
+    with lock_path.open("a+b") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _utc_timestamp():
@@ -302,29 +366,32 @@ def _run_process(command, cwd, timeout_seconds):
     else:
         popen_kwargs["start_new_session"] = True
 
-    # Regular files are deliberate: Popen.wait() observes the process handle,
-    # not EOF on a pipe inherited by a SpeedTree descendant.
-    with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
-        mode="w+b"
-    ) as stderr_file:
-        process = subprocess.Popen(
-            command,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            **popen_kwargs,
-        )
-        try:
-            returncode = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _terminate_process_tree(process)
+    # Queue for the single Modeler slot before Popen/wait. Gate wait time is
+    # intentionally outside the export timeout.
+    with speedtree_export_gate():
+        # Regular files are deliberate: Popen.wait() observes the process
+        # handle, not EOF on a pipe inherited by a SpeedTree descendant.
+        with tempfile.TemporaryFile(
+            mode="w+b"
+        ) as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            process = subprocess.Popen(
+                command,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                **popen_kwargs,
+            )
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(process)
+                stdout = _read_process_log(stdout_file)
+                stderr = _read_process_log(stderr_file)
+                error = subprocess.TimeoutExpired(command, timeout_seconds)
+                error.stdout = stdout
+                error.stderr = stderr
+                raise error
             stdout = _read_process_log(stdout_file)
             stderr = _read_process_log(stderr_file)
-            error = subprocess.TimeoutExpired(command, timeout_seconds)
-            error.stdout = stdout
-            error.stderr = stderr
-            raise error
-        stdout = _read_process_log(stdout_file)
-        stderr = _read_process_log(stderr_file)
     return returncode, stdout, stderr
 
 
