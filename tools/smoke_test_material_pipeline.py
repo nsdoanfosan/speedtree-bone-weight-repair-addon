@@ -795,6 +795,80 @@ def run_contract_smoke(
         ):
             raise AssertionError(strict_canonical_manifest_result)
 
+        scoped_payload = json.loads(
+            canonical_manifest.read_text(encoding="utf-8")
+        )
+        scoped_payload["export_scope_id"] = "atlas-scope-owned-by-leaf"
+        canonical_manifest.write_text(
+            json.dumps(scoped_payload), encoding="utf-8"
+        )
+        scoped_manifest_dir = (
+            canonical_asset / ".atlas_leaf_speedtree_scopes"
+        )
+        scoped_manifest_dir.mkdir()
+        consumer_scoped_manifest = (
+            scoped_manifest_dir
+            / "atlas-scope-owned-by-leaf__canonical.json"
+        )
+        consumer_scoped_manifest.write_text(
+            json.dumps(scoped_payload), encoding="utf-8"
+        )
+        consumer_scoped_binding = speedtree_manifest_texture_binding(
+            canonical_fbx,
+            canonical_material,
+            stmat_data={
+                "materials": {
+                    "mleafmanifestcanonical01": {
+                        "user_data": {},
+                        "source_paths": [],
+                    }
+                }
+            },
+        )
+        if (
+            consumer_scoped_binding.get("texture_contract_status")
+            != "canonical_pcg_output"
+            or Path(
+                consumer_scoped_binding.get("manifest_path", "")
+            ).resolve()
+            != consumer_scoped_manifest.resolve()
+        ):
+            raise AssertionError(consumer_scoped_binding)
+        unrelated_material = bpy.data.materials.new(
+            "M_bark_unrelated_to_atlas"
+        )
+        unrelated_material["codex_source_fbx"] = str(canonical_fbx)
+        unrelated_stmat = {
+            "materials": {
+                "mbarkunrelatedtoatlas": {
+                    "user_data": {},
+                    "source_paths": [],
+                }
+            }
+        }
+        scoped_unrelated_texture_binding = (
+            speedtree_manifest_texture_binding(
+                canonical_fbx,
+                unrelated_material,
+                stmat_data=unrelated_stmat,
+            )
+        )
+        scoped_unrelated_group_binding = speedtree_manifest_binding(
+            canonical_fbx,
+            unrelated_material,
+            stmat_data=unrelated_stmat,
+        )
+        if (
+            scoped_unrelated_texture_binding is not None
+            or scoped_unrelated_group_binding is not None
+        ):
+            raise AssertionError(
+                (
+                    scoped_unrelated_texture_binding,
+                    scoped_unrelated_group_binding,
+                )
+            )
+
         provisional_asset = asset / "manifest_provisional"
         provisional_fbx = provisional_asset / "fbx" / "provisional.fbx"
         provisional_fbx.parent.mkdir(parents=True)

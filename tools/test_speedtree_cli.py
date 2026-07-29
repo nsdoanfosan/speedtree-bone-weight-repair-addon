@@ -268,6 +268,118 @@ class SpeedTreeCliTests(unittest.TestCase):
             self.assertEqual(manual.read_text(encoding="utf-8"), "keep")
             self.assertFalse((target.parent / "M_leaf_Color.png").exists())
 
+    def test_access_violation_retries_with_fresh_staging_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.xml"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    return FakeProcess(
+                        command,
+                        kwargs["stdout"],
+                        kwargs["stderr"],
+                        returncode=-1073741819,
+                    )
+                Path(command[-1]).write_text(
+                    "<SpeedTreeRaw />", encoding="utf-8"
+                )
+                return FakeProcess(
+                    command, kwargs["stdout"], kwargs["stderr"]
+                )
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ):
+                result = speedtree_cli.export_target(
+                    exe, spm, options, "xml", target
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertNotEqual(
+                Path(calls[0][-1]).parent,
+                Path(calls[1][-1]).parent,
+            )
+            self.assertTrue(target.is_file())
+            self.assertEqual(
+                [row["windows_exit_code"] for row in result["export_attempts"]],
+                ["0xC0000005", "0x00000000"],
+            )
+
+    def test_access_violation_exhaustion_is_classified_and_transactional(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.fbx"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"manual-fbx")
+            target.with_suffix(".stmat").write_text(
+                "<Materials Manual='1' />", encoding="utf-8"
+            )
+            spm.write_bytes(b"spm-v2-needs-export")
+            future_ns = target.stat().st_mtime_ns + 1_000_000_000
+            os.utime(spm, ns=(future_ns, future_ns))
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                write_staged_fbx(command, b"crashed-new-fbx")
+                return FakeProcess(
+                    command,
+                    kwargs["stdout"],
+                    kwargs["stderr"],
+                    returncode=3221225477,
+                )
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "failure_kind=process_exporter_crash; attempts=3",
+                ):
+                    speedtree_cli.export_target(
+                        exe, spm, options, "fbx", target
+                    )
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(target.read_bytes(), b"manual-fbx")
+            self.assertIn(
+                "Manual='1'",
+                target.with_suffix(".stmat").read_text(),
+            )
+
+    def test_non_crash_export_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.xml"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                return FakeProcess(
+                    command,
+                    kwargs["stdout"],
+                    kwargs["stderr"],
+                    returncode=7,
+                )
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "failed with code 7"
+                ):
+                    speedtree_cli.export_target(
+                        exe, spm, options, "xml", target
+                    )
+
+            self.assertEqual(len(calls), 1)
+
     def test_timeout_invokes_process_tree_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

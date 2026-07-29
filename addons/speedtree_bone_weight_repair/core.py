@@ -542,6 +542,18 @@ ATLAS_BLOCKED_TEXTURE_PATH_PARTS = {
 }
 
 
+def _has_authoritative_fallback_evidence(binding):
+    if not isinstance(binding, dict):
+        return False
+    evidence = str(binding.get("source_evidence") or "").strip()
+    if evidence == "authoritative_global_original_root":
+        return True
+    return bool(
+        str(binding.get("manifest_path") or "").strip()
+        and evidence
+    )
+
+
 def _speedtree_texture_set_key(value):
     """Canonical comparison key shared by M_ materials and T_ output sets."""
     value = re.sub(r"(\.\d{3})$", "", str(value or "").strip())
@@ -1152,6 +1164,26 @@ def _speedtree_manifest_paths(source_fbx_path, stmat_material=None):
             seen.add(key)
             unique.append(path)
     return unique
+
+
+def _speedtree_consumer_scoped_manifest_path(
+    source_fbx_path, manifest
+):
+    scope = str((manifest or {}).get("export_scope_id") or "").strip()
+    if not scope:
+        return None
+    safe_scope = (
+        re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._")
+        or "AtlasLeaf"
+    )
+    consumer = Path(source_fbx_path).stem
+    if not consumer:
+        return None
+    return (
+        _speedtree_asset_root(source_fbx_path)
+        / ".atlas_leaf_speedtree_scopes"
+        / f"{safe_scope}__{consumer}.json"
+    )
 
 
 def _load_speedtree_import_manifest(path):
@@ -1811,6 +1843,52 @@ def _speedtree_manifest_texture_binding(
         manifest = manifest_cache[cache_key]
         if not manifest or not manifest.get("texture_contract_status"):
             continue
+        manifest_scope = str(
+            manifest.get("export_scope_id") or ""
+        ).strip()
+        consumer_scoped_identity = False
+        if manifest_scope:
+            consumer_path = _speedtree_consumer_scoped_manifest_path(
+                source_fbx_path, manifest
+            )
+            consumer_key = os.path.normcase(str(consumer_path or ""))
+            if consumer_path is not None and consumer_path.is_file():
+                if consumer_key not in manifest_cache:
+                    manifest_cache[consumer_key] = (
+                        _load_speedtree_import_manifest(consumer_path)
+                    )
+                consumer_manifest = manifest_cache[consumer_key]
+                if (
+                    consumer_manifest
+                    and str(
+                        consumer_manifest.get("export_scope_id") or ""
+                    ).strip()
+                    == manifest_scope
+                ):
+                    manifest_path = consumer_path
+                    manifest = consumer_manifest
+                    cache_key = consumer_key
+                    consumer_scoped_identity = True
+        entries = _manifest_texture_entries(manifest)
+        material_key = _speedtree_material_name_key(material.name)
+        exact_entries = [
+            entry
+            for entry in entries
+            if _speedtree_material_name_key(
+                entry.get("material_name")
+            )
+            == material_key
+        ]
+        target_name = _speedtree_manifest_target_name(manifest)
+        target_matches = (
+            _speedtree_material_name_key(target_name) == material_key
+        )
+        if not exact_entries and not target_matches:
+            # A root-level Atlas manifest can be visible to every FBX
+            # material in the asset.  Its scope is authoritative only for
+            # mappings it actually owns; unrelated bark/stem materials must
+            # continue through their own declared-source contract.
+            continue
         manifest_scope = str(manifest.get("export_scope_id") or "").strip()
         if expected_scope and manifest_scope != expected_scope:
             identity_errors.append(
@@ -1826,7 +1904,11 @@ def _speedtree_manifest_texture_binding(
                     + identity_errors[-1]
                 )
             continue
-        if not expected_scope and manifest_scope:
+        if (
+            not expected_scope
+            and manifest_scope
+            and not consumer_scoped_identity
+        ):
             identity_errors.append(
                 f"{Path(manifest_path).resolve()}: "
                 f"consumer_scope=missing, manifest_scope={manifest_scope!r}"
@@ -1834,7 +1916,7 @@ def _speedtree_manifest_texture_binding(
             continue
         authoritative_seen.append(str(Path(manifest_path).resolve()))
 
-        entries = _manifest_texture_entries(manifest)
+        candidate_entries = exact_entries or entries
         validated = [
             (
                 _validate_atlas_canonical_entry(
@@ -1849,9 +1931,8 @@ def _speedtree_manifest_texture_binding(
                     source_fbx_path=source_fbx_path,
                 )
             )
-            for entry in entries
+            for entry in candidate_entries
         ]
-        material_key = _speedtree_material_name_key(material.name)
         matches = [
             row
             for row in validated
@@ -1859,7 +1940,6 @@ def _speedtree_manifest_texture_binding(
             == material_key
         ]
         if not matches:
-            target_name = _speedtree_manifest_target_name(manifest)
             signatures = {
                 _atlas_manifest_contract_signature(row)
                 for row in validated
@@ -1966,6 +2046,45 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
         manifest = manifest_cache[cache_key]
         if not manifest:
             continue
+        manifest_scope = str(
+            manifest.get("export_scope_id") or ""
+        ).strip()
+        consumer_scoped_identity = False
+        if manifest_scope:
+            consumer_path = _speedtree_consumer_scoped_manifest_path(
+                source_fbx_path, manifest
+            )
+            consumer_key = os.path.normcase(str(consumer_path or ""))
+            if consumer_path is not None and consumer_path.is_file():
+                if consumer_key not in manifest_cache:
+                    manifest_cache[consumer_key] = (
+                        _load_speedtree_import_manifest(consumer_path)
+                    )
+                consumer_manifest = manifest_cache[consumer_key]
+                if (
+                    consumer_manifest
+                    and str(
+                        consumer_manifest.get("export_scope_id") or ""
+                    ).strip()
+                    == manifest_scope
+                ):
+                    manifest_path = consumer_path
+                    manifest = consumer_manifest
+                    cache_key = consumer_key
+                    consumer_scoped_identity = True
+        matching_groups = [
+            group
+            for group in manifest.get("material_groups") or []
+            if (
+                isinstance(group, dict)
+                and _speedtree_material_name_key(group.get("material"))
+                == material_key
+            )
+        ]
+        if not matching_groups:
+            # The shared root manifest does not own this material.  Do not
+            # impose its Atlas export scope on unrelated bark/stem slots.
+            continue
         manifest_scope = str(manifest.get("export_scope_id") or "").strip()
         if expected_scope and manifest_scope != expected_scope:
             identity_errors.append(
@@ -1974,7 +2093,11 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
                 f"manifest_scope={manifest_scope!r}"
             )
             continue
-        if not expected_scope and manifest_scope:
+        if (
+            not expected_scope
+            and manifest_scope
+            and not consumer_scoped_identity
+        ):
             identity_errors.append(
                 f"{Path(manifest_path).resolve()}: "
                 f"consumer_scope=missing, manifest_scope={manifest_scope!r}"
@@ -2015,9 +2138,7 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
         target_name = _speedtree_manifest_target_name(manifest)
         if not target_name:
             continue
-        for group in manifest.get("material_groups") or []:
-            if _speedtree_material_name_key(group.get("material")) != material_key:
-                continue
+        for group in matching_groups:
             if _speedtree_material_name_key(target_name) == material_key:
                 return None
             return {
@@ -2580,6 +2701,38 @@ def preflight_speedtree_material_texture_contracts(
             effective["texture_source_mode"] = (
                 "preserve_declared_sources"
             )
+        if (
+            effective is not None
+            and effective.get("texture_contract_status")
+            == ATLAS_SOURCE_FALLBACK_STATUS
+            and not str(effective.get("source_evidence") or "").strip()
+        ):
+            source_paths = effective.get("source_paths") or {}
+            source_files = []
+            if isinstance(source_paths, dict):
+                for value in source_paths.values():
+                    try:
+                        path = Path(str(value)).expanduser().resolve()
+                        ready = path.is_file() and path.stat().st_size > 0
+                    except (OSError, ValueError):
+                        ready = False
+                        path = None
+                    if (
+                        not ready
+                        or path is None
+                        or _blocked_atlas_texture_path(path)
+                        or not any(
+                            _path_is_under(path, root)
+                            for root in SPEEDTREE_ORIGINAL_TEXTURE_ROOTS
+                        )
+                    ):
+                        source_files = []
+                        break
+                    source_files.append(path)
+            if source_files:
+                effective["source_evidence"] = (
+                    "authoritative_global_original_root"
+                )
         if strict_contract and effective is None:
             reason = "missing" if not existing else "ambiguous"
             raise RuntimeError(
@@ -2643,10 +2796,7 @@ def preflight_speedtree_material_texture_contracts(
             effective is not None
             and effective.get("texture_contract_status")
             == ATLAS_SOURCE_FALLBACK_STATUS
-            and not (
-                str(effective.get("manifest_path") or "").strip()
-                and str(effective.get("source_evidence") or "").strip()
-            )
+            and not _has_authoritative_fallback_evidence(effective)
         ):
             raise RuntimeError(
                 "Provisional SpeedTree binding lacks authoritative original "
@@ -2844,10 +2994,7 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 binding.get("texture_contract_status")
                 == ATLAS_SOURCE_FALLBACK_STATUS
             ):
-                if not (
-                    str(binding.get("manifest_path") or "").strip()
-                    and str(binding.get("source_evidence") or "").strip()
-                ):
+                if not _has_authoritative_fallback_evidence(binding):
                     raise RuntimeError(
                         "Normalized provisional SpeedTree binding has no "
                         "authoritative evidence: "

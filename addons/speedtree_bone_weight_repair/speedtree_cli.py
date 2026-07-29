@@ -50,6 +50,8 @@ except ImportError:
 
 EXPORT_CACHE_VERSION = 1
 _HASH_CHUNK_SIZE = 1024 * 1024
+_WINDOWS_ACCESS_VIOLATION = 0xC0000005
+_CRASH_RETRY_ATTEMPTS = 3
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -116,6 +118,15 @@ def speedtree_export_gate():
 
 def _utc_timestamp():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _windows_exit_code(returncode):
+    """Return the unsigned Windows process status for signed/unsigned APIs."""
+    return int(returncode) & 0xFFFFFFFF
+
+
+def _is_retryable_exporter_crash(returncode):
+    return _windows_exit_code(returncode) == _WINDOWS_ACCESS_VIOLATION
 
 
 def _sha256_file(path):
@@ -557,40 +568,83 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
 
     stdout = ""
     stderr = ""
-    with tempfile.TemporaryDirectory(prefix=f"bwr_speedtree_{kind}_") as temp_dir:
-        staging_root = Path(temp_dir)
-        staged_target = staging_root / target.name
-        command = [
-            str(exe),
-            str(spm),
-            "-export_options",
-            str(options),
-            "-export",
-            str(staged_target),
-        ]
-        try:
-            returncode, stdout, stderr = _run_process(
-                command, cwd=spm.parent, timeout_seconds=timeout_seconds
+    export_attempts = []
+    promoted = []
+    for attempt in range(1, _CRASH_RETRY_ATTEMPTS + 1):
+        with tempfile.TemporaryDirectory(
+            prefix=f"bwr_speedtree_{kind}_"
+        ) as temp_dir:
+            staging_root = Path(temp_dir)
+            staged_target = staging_root / target.name
+            command = [
+                str(exe),
+                str(spm),
+                "-export_options",
+                str(options),
+                "-export",
+                str(staged_target),
+            ]
+            try:
+                returncode, stdout, stderr = _run_process(
+                    command,
+                    cwd=spm.parent,
+                    timeout_seconds=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                detail = (
+                    str(exc.stderr or "") or str(exc.stdout or "")
+                )[-1000:]
+                suffix = f" Last output: {detail}" if detail else ""
+                raise RuntimeError(
+                    f"SpeedTree {kind.upper()} export timed out after "
+                    f"{timeout_seconds} seconds; its process tree was "
+                    f"terminated.{suffix}"
+                ) from exc
+
+            attempt_record = {
+                "attempt": attempt,
+                "returncode": returncode,
+                "windows_exit_code": (
+                    f"0x{_windows_exit_code(returncode):08X}"
+                ),
+            }
+            export_attempts.append(attempt_record)
+            if returncode != 0:
+                retryable_crash = _is_retryable_exporter_crash(returncode)
+                attempt_record["failure_kind"] = (
+                    "process_exporter_crash"
+                    if retryable_crash
+                    else "process_export_failed"
+                )
+                if (
+                    retryable_crash
+                    and attempt < _CRASH_RETRY_ATTEMPTS
+                ):
+                    continue
+                detail = (stderr or stdout)[-1000:]
+                if retryable_crash:
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} export failed; "
+                        "failure_kind=process_exporter_crash; "
+                        f"attempts={attempt}; "
+                        "windows_exit_code="
+                        f"0x{_windows_exit_code(returncode):08X}: {detail}"
+                    )
+                raise RuntimeError(
+                    f"SpeedTree {kind.upper()} export failed with code "
+                    f"{returncode}: {detail}"
+                )
+            if not _basic_output_is_valid(
+                kind, staged_target, parse_xml=True
+            ):
+                raise RuntimeError(
+                    f"SpeedTree {kind.upper()} export finished but did not "
+                    f"create a valid staged file: {staged_target}"
+                )
+            promoted = _transactional_promote(
+                staging_root, target.parent
             )
-        except subprocess.TimeoutExpired as exc:
-            detail = (str(exc.stderr or "") or str(exc.stdout or ""))[-1000:]
-            suffix = f" Last output: {detail}" if detail else ""
-            raise RuntimeError(
-                f"SpeedTree {kind.upper()} export timed out after "
-                f"{timeout_seconds} seconds; its process tree was terminated.{suffix}"
-            ) from exc
-        if returncode != 0:
-            detail = (stderr or stdout)[-1000:]
-            raise RuntimeError(
-                f"SpeedTree {kind.upper()} export failed with code "
-                f"{returncode}: {detail}"
-            )
-        if not _basic_output_is_valid(kind, staged_target, parse_xml=True):
-            raise RuntimeError(
-                f"SpeedTree {kind.upper()} export finished but did not create "
-                f"a valid staged file: {staged_target}"
-            )
-        promoted = _transactional_promote(staging_root, target.parent)
+            break
 
     if not _basic_output_is_valid(kind, target, parse_xml=True):
         raise RuntimeError(
@@ -628,4 +682,5 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
         "cache_path": str(cache_path),
         "input_fingerprint": fingerprint,
         "artifacts": artifacts,
+        "export_attempts": export_attempts,
     }
