@@ -870,7 +870,9 @@ def run_contract_smoke(
             )
 
         provisional_asset = asset / "manifest_provisional"
-        provisional_fbx = provisional_asset / "fbx" / "provisional.fbx"
+        provisional_fbx = (
+            provisional_asset / "cluster" / "fbx" / "provisional.fbx"
+        )
         provisional_fbx.parent.mkdir(parents=True)
         provisional_fbx.write_bytes(b"provisional-fbx")
         original_root = asset / "original_atlas_sources"
@@ -880,6 +882,8 @@ def run_contract_smoke(
             "albedo": original_root / "leaf_albedo.tga",
             "alpha": original_root / "leaf_opacity.tga",
             "normal": original_root / "leaf_normal.tga",
+            "gloss": original_root / "leaf_gloss.tga",
+            "roughness": original_root / "leaf_roughness.tga",
         }
         for path in original_sources.values():
             path.write_bytes(sample_tga)
@@ -892,7 +896,9 @@ def run_contract_smoke(
             for role in TEXTURE_ROLES
         }
         provisional_manifest = (
-            provisional_asset / "speedtree_import_manifest.json"
+            provisional_asset
+            / "cluster"
+            / "speedtree_import_manifest.json"
         )
         provisional_payload = {
             "atlas_asset_name": "M_Leaf_manifest_provisional_01",
@@ -926,7 +932,9 @@ def run_contract_smoke(
                         "source_origin": "atlas_mesh_build_source",
                         "material": "M_Leaf_manifest_provisional_01",
                         "target_spm": str(
-                            provisional_asset / "provisional.spm"
+                            provisional_asset
+                            / "cluster"
+                            / "provisional.spm"
                         ),
                         "source_roles": sorted(original_sources),
                         "warning": "canonical T_* is not generated yet",
@@ -958,8 +966,8 @@ def run_contract_smoke(
             [provisional_object]
         )
         provisional_signature = {
-            str(path.resolve()).casefold()
-            for path in original_sources.values()
+            str(original_sources[role].resolve()).casefold()
+            for role in ("albedo", "alpha", "normal", "roughness")
         }
         provisional_node_signature = {
             str(
@@ -991,6 +999,15 @@ def run_contract_smoke(
                         "texture_source_mode": (
                             "preserve_declared_sources"
                         ),
+                        "source_paths": {
+                            role: str(original_sources[role])
+                            for role in (
+                                "albedo",
+                                "alpha",
+                                "normal",
+                                "gloss",
+                            )
+                        },
                     }],
                 },
             )
@@ -1017,7 +1034,7 @@ def run_contract_smoke(
                 "texture_contract_status": "canonical_pcg_output",
                 "material_name": "M_Leaf_manifest_provisional_01",
                 "target_spm": str(
-                    provisional_asset / "provisional.spm"
+                    provisional_asset / "cluster" / "provisional.spm"
                 ),
                 "texture_root": str(promoted_texture_root),
                 "texture_base": "T_Leaf_manifest_provisional_01",

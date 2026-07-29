@@ -171,4 +171,87 @@ with tempfile.TemporaryDirectory(
     assert unknown_result["status"] == "not_applicable", unknown_result
     assert list(unknown_none.data.materials) == unknown_before
 
+    tree_root = texture_dir / "tree"
+    cluster_fbx = tree_root / "cluster" / "fbx" / "SK_leaf_test.fbx"
+    cluster_fbx.parent.mkdir(parents=True)
+    cluster_fbx.write_bytes(b"fbx")
+    cluster_dirs = core._speedtree_material_texture_dirs(
+        cluster_fbx,
+        bark_material,
+        {"materials": {}},
+    )
+    assert tree_root / "texture" in cluster_dirs, cluster_dirs
+    assert tree_root / "texture" / "substance" in cluster_dirs, cluster_dirs
+    assert tree_root / "cluster" / "texture" in cluster_dirs, cluster_dirs
+
+    canonical_base = "T_leaf_test_atlas_01"
+    canonical_files = {}
+    canonical_texture_dir = tree_root / "texture"
+    canonical_texture_dir.mkdir(parents=True, exist_ok=True)
+    for role in core.SPEEDTREE_TEXTURE_ROLES:
+        path = canonical_texture_dir / f"{canonical_base}_{role}.tga"
+        path.write_bytes(role.encode("ascii"))
+        canonical_files[role] = path
+
+    canonical_material = bpy.data.materials.new("M_leaf_test_atlas_01")
+    canonical_material.use_nodes = True
+    canonical_material["codex_source_fbx"] = str(cluster_fbx)
+    canonical_material["codex_source_identity"] = str(
+        tree_root / "cluster" / "SK_leaf_test.spm"
+    )
+    canonical_material["codex_speedtree_texture_base"] = canonical_base
+    core._replace_speedtree_material_nodes(
+        canonical_material,
+        canonical_files,
+    )
+
+    isolated_root = (
+        tree_root
+        / "cluster"
+        / ".sk_batch_isolated_bark"
+        / "hash"
+        / "tree"
+        / "cluster"
+        / "fbx"
+    )
+    isolated_root.mkdir(parents=True)
+    isolated_material = bpy.data.materials.new(
+        "M_leaf_test_atlas_01_green"
+    )
+    isolated_material.use_nodes = True
+    isolated_material["codex_source_fbx"] = str(
+        isolated_root / "SK_leaf_test.fbx"
+    )
+    isolated_image_path = isolated_root / "M_leaf_test_green.png"
+    isolated_image_path.write_bytes(b"image")
+    isolated_image = bpy.data.images.load(str(isolated_image_path))
+    isolated_node = isolated_material.node_tree.nodes.new(
+        "ShaderNodeTexImage"
+    )
+    isolated_node.image = isolated_image
+    isolated_object = mesh_object(
+        "IsolatedPrototype",
+        [isolated_material],
+    )
+
+    rebound = core.rebind_blocked_speedtree_group_variants(
+        [isolated_object]
+    )
+    assert rebound["status"] == "ok", rebound
+    assert rebound["rebound_count"] == 1, rebound
+    assert (
+        isolated_material["codex_source_fbx"] == str(cluster_fbx)
+    ), rebound
+    assert not any(
+        core._blocked_atlas_texture_path(path)
+        for path in core.material_texture_signature(isolated_material)
+    ), rebound
+    assert {
+        Path(path).name.casefold()
+        for path in core.material_texture_signature(isolated_material)
+    } == {
+        f"{canonical_base}_{role}.tga".casefold()
+        for role in core.SPEEDTREE_TEXTURE_ROLES
+    }, rebound
+
 print("PLACEHOLDER_MATERIAL_SMOKE_OK")

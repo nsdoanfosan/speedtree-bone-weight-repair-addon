@@ -740,22 +740,12 @@ def _texture_semantic_role(value):
     return aliases.get(role, role)
 
 
-def _normalized_role_paths(source_paths, *, manifest_path=None):
-    normalized = {}
-    for raw_role, raw_path in (source_paths or {}).items():
-        role = _texture_semantic_role(raw_role)
-        path = (
-            _manifest_path_value(raw_path, manifest_path)
-            if manifest_path is not None
-            else Path(str(raw_path)).expanduser().resolve()
-        )
-        if role in normalized and _path_identity(normalized[role]) != _path_identity(path):
-            raise RuntimeError(
-                "Texture contract maps one semantic role to multiple paths: "
-                f"role={role}, left={normalized[role]}, right={path}"
-            )
-        normalized[role] = path
-    return normalized
+def _atlas_provisional_source_role(value):
+    """Normalize Atlas inputs without collapsing distinct PBR source maps."""
+    role = re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+    if role in {"rough", "roughness"}:
+        return "roughness"
+    return _texture_semantic_role(role)
 
 
 def _file_sha256(path):
@@ -1210,22 +1200,32 @@ def _manifest_texture_entries(manifest):
     status = str(manifest.get("texture_contract_status") or "").strip()
     if not status:
         return []
-    if status not in {
-        ATLAS_CANONICAL_TEXTURE_STATUS,
-        ATLAS_SOURCE_FALLBACK_STATUS,
-    }:
+    status_fields = {
+        ATLAS_CANONICAL_TEXTURE_STATUS: (
+            "canonical_texture_outputs",
+            "canonical_texture_output",
+            "files",
+        ),
+        ATLAS_SOURCE_FALLBACK_STATUS: (
+            "source_texture_fallbacks",
+            "source_texture_fallback",
+            "source_paths",
+        ),
+        ATLAS_BLENDER_CLUSTER_BAKE_STATUS: (
+            "blender_cluster_bake_textures",
+            "blender_cluster_bake_texture",
+            "files",
+        ),
+    }
+    if status not in status_fields:
         raise RuntimeError(
             "Atlas import manifest has an unknown texture_contract_status: "
             + repr(status)
         )
 
+    top_level_field, nested_field, payload_field = status_fields[status]
     rows = []
-    if status == ATLAS_CANONICAL_TEXTURE_STATUS:
-        rows.extend(manifest.get("canonical_texture_outputs") or [])
-        nested_field = "canonical_texture_output"
-    else:
-        rows.extend(manifest.get("source_texture_fallbacks") or [])
-        nested_field = "source_texture_fallback"
+    rows.extend(manifest.get(top_level_field) or [])
     for group in manifest.get("material_groups") or []:
         if not isinstance(group, dict):
             continue
@@ -1234,8 +1234,8 @@ def _manifest_texture_entries(manifest):
         ).strip()
         if group_status != status:
             raise RuntimeError(
-                "Atlas import manifest mixes canonical and provisional "
-                "texture states"
+                "Atlas import manifest mixes incompatible texture contract "
+                "states"
             )
         nested = group.get(nested_field)
         if isinstance(nested, dict):
@@ -1252,11 +1252,7 @@ def _manifest_texture_entries(manifest):
         material_name = str(
             row.get("material_name") or row.get("material") or ""
         ).strip()
-        payload = (
-            row.get("files")
-            if status == ATLAS_CANONICAL_TEXTURE_STATUS
-            else row.get("source_paths")
-        )
+        payload = row.get(payload_field)
         signature = json.dumps(
             {
                 "material": _speedtree_material_name_key(material_name),
@@ -1522,6 +1518,111 @@ def _validate_atlas_cluster_origin_receipt(
     return receipt
 
 
+def _validate_atlas_cluster_entry(
+    entry,
+    manifest_path,
+    source_fbx_path=None,
+):
+    """Validate one receipt-backed Blender physical Cluster texture bake."""
+    contract = entry["contract"]
+    material_name = str(
+        entry.get("material_name")
+        or contract.get("material_name")
+        or contract.get("material")
+        or ""
+    ).strip()
+    diagnostics = []
+    if (
+        contract.get("kind")
+        != "blender_cluster_bake_texture_contract"
+        or str(contract.get("version") or "") != "1"
+        or contract.get("texture_contract_status")
+        != ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+        or contract.get("source_origin")
+        != ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+    ):
+        diagnostics.append("contract=unsupported_identity")
+    if not material_name:
+        diagnostics.append("material=missing")
+
+    raw_files = contract.get("files")
+    if not isinstance(raw_files, dict) or not raw_files:
+        diagnostics.append("files=missing")
+        raw_files = {}
+    asset_root = _atlas_manifest_asset_root(manifest_path, contract)
+    cluster_root = asset_root / "cluster"
+    normalized = {}
+    for raw_role, raw_path in sorted(raw_files.items()):
+        role = _texture_semantic_role(raw_role)
+        path = _manifest_path_value(raw_path, manifest_path)
+        blocked = _blocked_atlas_texture_path(path)
+        try:
+            ready = path.is_file() and path.stat().st_size > 0
+        except OSError:
+            ready = False
+        if not role:
+            diagnostics.append(f"role={raw_role!r}, reason=missing")
+        elif blocked:
+            diagnostics.append(
+                f"role={role}, path={path}, blocked={','.join(blocked)}"
+            )
+        elif not _path_is_under(path, cluster_root):
+            diagnostics.append(
+                f"role={role}, path={path}, reason=outside_asset_cluster"
+            )
+        elif not ready:
+            diagnostics.append(
+                f"role={role}, path={path}, reason=missing_or_empty"
+            )
+        elif (
+            role in normalized
+            and _path_identity(normalized[role]) != _path_identity(path)
+        ):
+            diagnostics.append(
+                f"role={role}, reason=multiple_source_paths"
+            )
+        else:
+            normalized[role] = path
+
+    declared_roles = {
+        _texture_semantic_role(role)
+        for role in contract.get("source_roles") or []
+    }
+    if declared_roles != set(normalized):
+        diagnostics.append("source_roles=source_mapping_mismatch")
+    origin_receipt = _validate_atlas_cluster_origin_receipt(
+        contract,
+        normalized,
+        manifest_path,
+        asset_root,
+        material_name,
+        diagnostics,
+    )
+    if diagnostics:
+        raise RuntimeError(
+            "Atlas Blender Cluster bake texture mapping is invalid for "
+            f"material={material_name or '<unnamed>'}: "
+            + " | ".join(diagnostics)
+            + ". Invalid manifests never fall back to exported PNGs, cache, "
+            "or directory scanning."
+        )
+    return {
+        "material": material_name,
+        "status": "ok",
+        "texture_source_mode": "preserve_declared_sources",
+        "texture_contract_status": ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
+        "source_origin": ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
+        "source_evidence": "blender_cluster_bake_receipt",
+        "source_paths": {
+            role: str(path)
+            for role, path in normalized.items()
+        },
+        "source_roles": sorted(normalized),
+        "origin_receipt": dict(origin_receipt or {}),
+        "manifest_path": str(Path(manifest_path).resolve()),
+    }
+
+
 def _validate_atlas_provisional_entry(
     entry,
     manifest_path,
@@ -1544,11 +1645,33 @@ def _validate_atlas_provisional_entry(
     )
     asset_root = _atlas_manifest_asset_root(manifest_path, contract)
     texture_root_value = str(contract.get("texture_root") or "").strip()
-    texture_root = (
-        _manifest_path_value(texture_root_value, manifest_path)
-        if texture_root_value
-        else asset_root / "texture"
-    )
+    if texture_root_value:
+        texture_root = _manifest_path_value(
+            texture_root_value,
+            manifest_path,
+        )
+    else:
+        expected_parents = {
+            _manifest_path_value(value, manifest_path).parent
+            for value in (expected_t_paths or {}).values()
+            if str(value or "").strip()
+        }
+        inferred_root = (
+            next(iter(expected_parents))
+            if len(expected_parents) == 1
+            else None
+        )
+        allowed_asset_roots = {asset_root}
+        if asset_root.name.casefold() == "cluster":
+            allowed_asset_roots.add(asset_root.parent)
+        if (
+            inferred_root is not None
+            and inferred_root.name.casefold() in {"texture", "textures"}
+            and inferred_root.parent in allowed_asset_roots
+        ):
+            texture_root = inferred_root
+        else:
+            texture_root = asset_root / "texture"
     source_paths = contract.get("source_paths")
     if not isinstance(source_paths, dict):
         source_paths = {}
@@ -1644,7 +1767,7 @@ def _validate_atlas_provisional_entry(
                 f"role={role}, path={path}, reason=missing_or_empty"
             )
         else:
-            semantic_role = _texture_semantic_role(role)
+            semantic_role = _atlas_provisional_source_role(role)
             if (
                 semantic_role in normalized
                 and _path_identity(normalized[semantic_role])
@@ -1688,7 +1811,7 @@ def _validate_atlas_provisional_entry(
         ):
             diagnostics.append("provisional_receipt.material=mismatch")
         receipt_roles = {
-            _texture_semantic_role(role)
+            _atlas_provisional_source_role(role)
             for role in provisional_receipt.get("source_roles") or []
         }
         if receipt_roles != set(normalized):
@@ -1790,6 +1913,31 @@ def _atlas_manifest_contract_signature(binding):
                 for role, path in payload.items()
             )
         ),
+    )
+
+
+def _validate_atlas_manifest_entry(
+    entry,
+    manifest_path,
+    source_fbx_path=None,
+):
+    status = entry.get("status")
+    if status == ATLAS_CANONICAL_TEXTURE_STATUS:
+        return _validate_atlas_canonical_entry(
+            entry,
+            manifest_path,
+            source_fbx_path=source_fbx_path,
+        )
+    if status == ATLAS_BLENDER_CLUSTER_BAKE_STATUS:
+        return _validate_atlas_cluster_entry(
+            entry,
+            manifest_path,
+            source_fbx_path=source_fbx_path,
+        )
+    return _validate_atlas_provisional_entry(
+        entry,
+        manifest_path,
+        source_fbx_path=source_fbx_path,
     )
 
 
@@ -1918,18 +2066,10 @@ def _speedtree_manifest_texture_binding(
 
         candidate_entries = exact_entries or entries
         validated = [
-            (
-                _validate_atlas_canonical_entry(
-                    entry,
-                    manifest_path,
-                    source_fbx_path=source_fbx_path,
-                )
-                if entry["status"] == ATLAS_CANONICAL_TEXTURE_STATUS
-                else _validate_atlas_provisional_entry(
-                    entry,
-                    manifest_path,
-                    source_fbx_path=source_fbx_path,
-                )
+            _validate_atlas_manifest_entry(
+                entry,
+                manifest_path,
+                source_fbx_path=source_fbx_path,
             )
             for entry in candidate_entries
         ]
@@ -2106,18 +2246,10 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
         if manifest.get("texture_contract_status"):
             entries = _manifest_texture_entries(manifest)
             validated = [
-                (
-                    _validate_atlas_canonical_entry(
-                        entry,
-                        manifest_path,
-                        source_fbx_path=source_fbx_path,
-                    )
-                    if entry["status"] == ATLAS_CANONICAL_TEXTURE_STATUS
-                    else _validate_atlas_provisional_entry(
-                        entry,
-                        manifest_path,
-                        source_fbx_path=source_fbx_path,
-                    )
+                _validate_atlas_manifest_entry(
+                    entry,
+                    manifest_path,
+                    source_fbx_path=source_fbx_path,
                 )
                 for entry in entries
             ]
@@ -2160,6 +2292,22 @@ def _speedtree_material_texture_dirs(source_fbx_path, material, stmat_data=None)
     """Return managed texture locations, including shared paths recorded by SpeedTree."""
     texture_root = _speedtree_texture_dir(source_fbx_path)
     paths = [texture_root, texture_root / "substance"]
+    asset_root = _speedtree_asset_root(source_fbx_path)
+    if asset_root.name.casefold() == "cluster":
+        # A canonical Cluster source lives at <tree>/cluster/SK_*.spm while
+        # its SBS/PCG T_ outputs remain at <tree>/texture. SpeedTree preserves
+        # SPM-relative "../texture" references, but the exported STMAT is
+        # written one directory deeper at <tree>/cluster/fbx and can therefore
+        # make that same spelling look like <tree>/cluster/texture. Keep the
+        # explicit Blender Cluster bake exception receipt-driven; this sibling
+        # lookup is only another candidate location for canonical T_ sets.
+        sibling_texture_root = asset_root.parent / "texture"
+        paths.extend(
+            (
+                sibling_texture_root,
+                sibling_texture_root / "substance",
+            )
+        )
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
     stmat_material = stmat_data.get("materials", {}).get(
         _speedtree_material_name_key(material.name), {}
@@ -2536,18 +2684,15 @@ def _validate_atlas_overlay_compatibility(
     }:
         previous_paths = previous.get("source_paths") or {}
         if previous_paths:
-            previous_role_paths = _normalized_role_paths(previous_paths)
-            manifest_role_paths = _normalized_role_paths(
-                binding.get("source_paths") or {}
-            )
-            if (
-                set(previous_role_paths) != set(manifest_role_paths)
-                or any(
-                    _path_identity(previous_role_paths[role])
-                    != _path_identity(manifest_role_paths[role])
-                    for role in previous_role_paths
-                )
-            ):
+            previous_path_ids = {
+                _path_identity(path)
+                for path in previous_paths.values()
+            }
+            manifest_path_ids = {
+                _path_identity(path)
+                for path in (binding.get("source_paths") or {}).values()
+            }
+            if not previous_path_ids.issubset(manifest_path_ids):
                 raise RuntimeError(
                     "Atlas source texture manifest conflicts with the strict "
                     f"material binding: {material.name}"
@@ -3498,6 +3643,118 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         "preserved_cluster_count": preserved_cluster_count,
         "needs_pcg_generation_count": needs_pcg_generation_count,
         "changed_count": sum(1 for row in rows if row.get("changed")),
+    }
+
+
+def rebind_blocked_speedtree_group_variants(objects):
+    """Replace stale isolated variant images with one canonical T_ group set.
+
+    Cluster normalization can retain a generated material variant such as
+    ``M_leaf_x_atlas_01_green`` while a later canonical source repair creates
+    the authoritative base material ``M_leaf_x_atlas_01``.  A saved prototype
+    must not keep image paths inside ``.sk_batch_isolated_bark`` merely because
+    its material name includes that production-group suffix.
+    """
+    targets = collect_object_materials(objects)
+    stmat_cache = {}
+    texture_index_cache = {}
+    candidates_by_group = defaultdict(list)
+
+    for material in bpy.data.materials:
+        texture_base = str(
+            material.get("codex_speedtree_texture_base", "")
+        ).strip()
+        source_fbx = str(material.get("codex_source_fbx", "")).strip()
+        if (
+            not texture_base.casefold().startswith("t_")
+            or not source_fbx
+            or _blocked_atlas_texture_path(source_fbx)
+        ):
+            continue
+        group_base = handoff_contract.production_group_base_name(material.name)
+        group_key = _speedtree_material_name_key(group_base)
+        texture_set = _complete_speedtree_texture_set(
+            material,
+            texture_base,
+            stmat_cache=stmat_cache,
+            texture_index_cache=texture_index_cache,
+        )
+        if texture_set:
+            candidates_by_group[group_key].append(
+                {
+                    "material": material,
+                    "source_fbx": source_fbx,
+                    "source_identity": str(
+                        material.get("codex_source_identity", "")
+                    ),
+                    "texture_set": texture_set,
+                }
+            )
+
+    rows = []
+    for material in targets:
+        source_fbx = str(material.get("codex_source_fbx", "")).strip()
+        blocked_images = sorted(
+            {
+                blocked
+                for path in material_texture_signature(material)
+                for blocked in _blocked_atlas_texture_path(path)
+            }
+        )
+        blocked_source = _blocked_atlas_texture_path(source_fbx)
+        if not blocked_source and not blocked_images:
+            continue
+        group_base = handoff_contract.production_group_base_name(material.name)
+        group_key = _speedtree_material_name_key(group_base)
+        candidates = candidates_by_group.get(group_key, [])
+        if len(candidates) != 1:
+            rows.append(
+                {
+                    "material": material.name,
+                    "status": "unresolved",
+                    "production_group_base": group_base,
+                    "candidate_count": len(candidates),
+                    "blocked_source_parts": blocked_source,
+                    "blocked_image_parts": blocked_images,
+                }
+            )
+            continue
+        candidate = candidates[0]
+        texture_set = candidate["texture_set"]
+        texture_files = {
+            role: Path(path)
+            for role, path in texture_set["files"].items()
+        }
+        before = material_texture_signature(material)
+        _replace_speedtree_material_nodes(material, texture_files)
+        material["codex_source_fbx"] = candidate["source_fbx"]
+        if candidate["source_identity"]:
+            material["codex_source_identity"] = candidate[
+                "source_identity"
+            ]
+        material["codex_speedtree_texture_base"] = texture_set[
+            "texture_base"
+        ]
+        rows.append(
+            {
+                "material": material.name,
+                "status": "rebound",
+                "production_group_base": group_base,
+                "canonical_material": candidate["material"].name,
+                "texture_base": texture_set["texture_base"],
+                "source_fbx": candidate["source_fbx"],
+                "changed": before != material_texture_signature(material),
+            }
+        )
+
+    unresolved = [row for row in rows if row["status"] == "unresolved"]
+    return {
+        "status": "blocked" if unresolved else "ok",
+        "materials": rows,
+        "rebound_count": sum(
+            1 for row in rows if row["status"] == "rebound"
+        ),
+        "unresolved": unresolved,
     }
 
 
@@ -8254,7 +8511,13 @@ def run_merge_export(
     make_export_structure = settings.get("make_export_structure", settings.get("make_handoff_structure", True)) if settings else False
     if settings and make_export_structure:
         source_fbx = settings.get("source_fbx_path", "")
-        if settings.get("cluster_source_skin_contract", False):
+        if (
+            settings.get("cluster_source_skin_contract", False)
+            and settings.get(
+                "defer_cluster_export_to_normalizer",
+                False,
+            )
+        ):
             report["export_structure"] = park_cluster_source_full_reference(
                 armature,
                 merged_obj,
@@ -8496,6 +8759,31 @@ def run_full_pipeline(settings):
             "materials": texture_normalization.get("materials", []),
         }
     )
+    group_variant_rebinding = rebind_blocked_speedtree_group_variants(
+        bpy.context.scene.objects
+    )
+    reports["speedtree_group_variant_rebinding"] = (
+        group_variant_rebinding
+    )
+    reports["steps"].append(
+        {
+            "name": "rebind_blocked_speedtree_group_variants",
+            "status": group_variant_rebinding.get("status", "blocked"),
+            "rebound_count": group_variant_rebinding.get(
+                "rebound_count", 0
+            ),
+            "unresolved": group_variant_rebinding.get("unresolved", []),
+        }
+    )
+    if group_variant_rebinding.get("status") == "blocked":
+        raise RuntimeError(
+            "SpeedTree production-group material variants still reference "
+            "blocked isolated texture paths: "
+            + ", ".join(
+                row.get("material", "<unnamed>")
+                for row in group_variant_rebinding.get("unresolved", [])
+            )
+        )
 
     removed_phantoms = remove_phantom_image_nodes(bpy.context.scene.objects)
     if removed_phantoms:
