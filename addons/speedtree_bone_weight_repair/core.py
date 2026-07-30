@@ -508,6 +508,10 @@ ATLAS_SOURCE_FALLBACK_STATUS = (
 ATLAS_BLENDER_CLUSTER_BAKE_STATUS = "blender_cluster_bake"
 ATLAS_PROVISIONAL_RECEIPT_KIND = "speedtree_texture_provisional_receipt"
 ATLAS_CLUSTER_RECEIPT_KIND = "blender_cluster_bake_texture_origin_receipt"
+STMAT_MAP_INDEX_SPACE = "stmat_xml_map_order_v1"
+SOURCE_SPM_MAP_INDEX_SPACE = "source_spm_map_order_v1"
+_LEGACY_STMAT_MAP_INDEX_SPACE = "stmat_xml_map_order"
+_LEGACY_SOURCE_SPM_MAP_INDEX_SPACE = "source_spm_map_order"
 _DEFAULT_ORIGINAL_TEXTURE_ROOT = (
     r"D:\OneDrive\Forestportfolio\Texture"
 )
@@ -843,6 +847,23 @@ def _speedtree_preserved_cluster_sources(
         or str(expected_receipt.get("version") or "") != "1"
     ):
         return None
+    expected_index_space = str(
+        (expected_receipt or {}).get("slot_index_space")
+        or (expected_receipt or {}).get("map_index_space")
+        or ""
+    ).strip()
+    if expected_index_space not in {
+        "",
+        STMAT_MAP_INDEX_SPACE,
+        SOURCE_SPM_MAP_INDEX_SPACE,
+        _LEGACY_STMAT_MAP_INDEX_SPACE,
+        _LEGACY_SOURCE_SPM_MAP_INDEX_SPACE,
+    }:
+        return None
+    enforce_stmat_map_index = (
+        expected_index_space
+        in {STMAT_MAP_INDEX_SPACE, _LEGACY_STMAT_MAP_INDEX_SPACE}
+    )
 
     candidate_paths = set()
     expected_manifest = str(
@@ -997,6 +1018,7 @@ def _speedtree_preserved_cluster_sources(
                 break
             slot_files.append({
                 "map_index": slot_identity[role]["map_index"],
+                "stmat_map_index": slot_identity[role]["map_index"],
                 "map": slot_identity[role]["map"],
                 "capture_role": role,
                 "path": str(Path(path).resolve()),
@@ -1028,13 +1050,29 @@ def _speedtree_preserved_cluster_sources(
                     continue
                 for slot in slot_files:
                     row = expected_by_role.get(slot["capture_role"])
+                    expected_stmat_index = (
+                        row.get("stmat_map_index")
+                        if isinstance(row, dict)
+                        and row.get("stmat_map_index") is not None
+                        else (
+                            row.get("map_index")
+                            if isinstance(row, dict)
+                            else None
+                        )
+                    )
+                    stmat_index_mismatch = False
+                    if enforce_stmat_map_index:
+                        try:
+                            stmat_index_mismatch = (
+                                expected_stmat_index is None
+                                or int(expected_stmat_index)
+                                != slot["stmat_map_index"]
+                            )
+                        except (TypeError, ValueError):
+                            stmat_index_mismatch = True
                     if (
                         row is None
-                        or (
-                            row.get("map_index") is not None
-                            and int(row.get("map_index"))
-                            != slot["map_index"]
-                        )
+                        or stmat_index_mismatch
                         or (
                             str(row.get("map") or "").strip()
                             and str(row.get("map")).strip()
@@ -1085,6 +1123,7 @@ def _speedtree_preserved_cluster_sources(
         "material_id": stmat_material_id,
         "material_name": material.name,
         "stmat_material_name": stmat_material_name,
+        "slot_index_space": STMAT_MAP_INDEX_SPACE,
         "physical_capture_manifest": str(
             proof["manifest_path"].resolve()
         ),

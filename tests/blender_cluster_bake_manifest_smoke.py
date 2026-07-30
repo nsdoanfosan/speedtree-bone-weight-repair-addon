@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import bpy
@@ -164,5 +165,138 @@ with tempfile.TemporaryDirectory(
         assert "sha256_mismatch" in str(exc), exc
     else:
         raise AssertionError("Tampered Cluster bake receipt was accepted")
+
+    capture_hash = hashlib.sha256(
+        b"physical-capture-contract"
+    ).hexdigest()
+    physical_manifest = (
+        cluster_root / "cluster_test_auto_capture_manifest.json"
+    )
+    physical_manifest.write_text(
+        json.dumps({
+            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+            "direct_uv_source":
+                "same_blender_physical_capture_projection",
+            "physical_capture_contract_sha256": capture_hash,
+            "physical_capture_contract": {
+                "contract_sha256": capture_hash,
+            },
+            "material_name": owner.name,
+            "material_id": "7",
+            "maps": capture_maps,
+        }),
+        encoding="utf-8",
+    )
+    stmat = source_fbx.with_suffix(".stmat")
+
+    def write_source_stmat(rows):
+        root = ET.Element("SpeedTreeMaterials")
+        material = ET.SubElement(
+            root,
+            "Material",
+            ID="7",
+            Name=owner.name,
+        )
+        for map_name, source in rows:
+            ET.SubElement(
+                material,
+                "Map",
+                Name=map_name,
+                Source=str(source),
+            )
+        ET.ElementTree(root).write(
+            stmat,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+    ordered_sources = list(source_files.items())
+    write_source_stmat(ordered_sources)
+    legacy_slots = [
+        {
+            # This is deliberately an SPM index, not an STMat index.
+            "map_index": index + 100,
+            "spm_map_index": index + 100,
+            "map": role,
+            "path": path,
+            "sha256": sha256(Path(path)),
+        }
+        for index, (role, path) in enumerate(ordered_sources)
+    ]
+    legacy_receipt = {
+        "kind": core.ATLAS_CLUSTER_RECEIPT_KIND,
+        "version": 1,
+        "source_origin": core.ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
+        "material_id": "7",
+        "material_name": owner.name,
+        "physical_capture_manifest": str(physical_manifest),
+        "physical_capture_contract_sha256": capture_hash,
+        "slot_files": legacy_slots,
+    }
+
+    legacy_proof = core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": legacy_receipt},
+    )
+    assert legacy_proof is not None, legacy_proof
+    assert (
+        legacy_proof["origin_receipt"]["slot_index_space"]
+        == core.STMAT_MAP_INDEX_SPACE
+    ), legacy_proof
+    assert sorted([
+        row["stmat_map_index"]
+        for row in legacy_proof["origin_receipt"]["slot_files"]
+    ]) == list(range(len(ordered_sources))), legacy_proof
+
+    source_spm_receipt = dict(legacy_receipt)
+    source_spm_receipt["slot_index_space"] = (
+        core.SOURCE_SPM_MAP_INDEX_SPACE
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": source_spm_receipt},
+    ) is not None
+
+    wrong_stmat_receipt = dict(legacy_receipt)
+    wrong_stmat_receipt["slot_index_space"] = (
+        core.STMAT_MAP_INDEX_SPACE
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_stmat_receipt},
+    ) is None
+
+    exact_stmat_receipt = json.loads(json.dumps(legacy_receipt))
+    exact_stmat_receipt["slot_index_space"] = (
+        core.STMAT_MAP_INDEX_SPACE
+    )
+    for index, row in enumerate(exact_stmat_receipt["slot_files"]):
+        row["map_index"] = index
+        row["stmat_map_index"] = index
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": exact_stmat_receipt},
+    ) is not None
+
+    wrong_path_receipt = json.loads(json.dumps(legacy_receipt))
+    wrong_path_receipt["slot_files"][0]["path"] = str(
+        cluster_root / "wrong.tga"
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_path_receipt},
+    ) is None
+
+    write_source_stmat(ordered_sources + [ordered_sources[0]])
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": legacy_receipt},
+    ) is None
 
 print("BLENDER_CLUSTER_BAKE_MANIFEST_SMOKE_OK")
