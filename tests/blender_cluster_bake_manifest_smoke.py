@@ -52,7 +52,11 @@ with tempfile.TemporaryDirectory(
         source_files[role] = str(path)
         capture_maps.append(
             {
-                "role": role,
+                "role": (
+                    "SubsurfaceColor"
+                    if role == "translucency"
+                    else role
+                ),
                 "path": str(path),
                 "sha256": sha256(path),
             }
@@ -172,19 +176,20 @@ with tempfile.TemporaryDirectory(
     physical_manifest = (
         cluster_root / "cluster_test_auto_capture_manifest.json"
     )
+    physical_manifest_payload = {
+        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "direct_uv_source":
+            "same_blender_physical_capture_projection",
+        "physical_capture_contract_sha256": capture_hash,
+        "physical_capture_contract": {
+            "contract_sha256": capture_hash,
+        },
+        "material_name": owner.name,
+        "material_id": "7",
+        "maps": capture_maps,
+    }
     physical_manifest.write_text(
-        json.dumps({
-            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
-            "direct_uv_source":
-                "same_blender_physical_capture_projection",
-            "physical_capture_contract_sha256": capture_hash,
-            "physical_capture_contract": {
-                "contract_sha256": capture_hash,
-            },
-            "material_name": owner.name,
-            "material_id": "7",
-            "maps": capture_maps,
-        }),
+        json.dumps(physical_manifest_payload),
         encoding="utf-8",
     )
     stmat = source_fbx.with_suffix(".stmat")
@@ -291,6 +296,301 @@ with tempfile.TemporaryDirectory(
         owner,
         expected_binding={"origin_receipt": wrong_path_receipt},
     ) is None
+
+    fallback_sources = [
+        (
+            role,
+            source_files["translucency"]
+            if role == "subsurface_amount"
+            else path,
+        )
+        for role, path in ordered_sources
+    ]
+    write_source_stmat(fallback_sources)
+    fallback_expected_receipt = json.loads(json.dumps(
+        exact_stmat_receipt
+    ))
+    for row in fallback_expected_receipt["slot_files"]:
+        row["capture_role"] = core._texture_semantic_role(row["map"])
+        if row["capture_role"] == "subsurfaceamount":
+            row["path"] = source_files["translucency"]
+            row["sha256"] = sha256(
+                Path(source_files["translucency"])
+            )
+    fallback_expected_receipt[
+        core.PREVIEW_ROLE_FALLBACKS_FIELD
+    ] = [{
+        "slot_role": "subsurfaceamount",
+        "manifest_role": "subsurfacecolor",
+        "usage": "speedtree_preview_only",
+        "material_id": "7",
+        "material_name": owner.name,
+        "contract_hash": capture_hash,
+        "map_index": 6,
+        "map": "subsurface_amount",
+        "path": str(Path(source_files["translucency"]).resolve()),
+        "sha256": sha256(Path(source_files["translucency"])),
+    }]
+    fallback_expected_receipt = core.finalize_preview_receipt(
+        fallback_expected_receipt
+    )
+    fallback_proof = core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": fallback_expected_receipt
+        },
+    )
+    assert fallback_proof is not None, fallback_proof
+    preview_fallbacks = fallback_proof.get(
+        core.PREVIEW_ROLE_FALLBACKS_FIELD
+    )
+    assert len(preview_fallbacks) == 1, fallback_proof
+    preview_fallback = preview_fallbacks[0]
+    assert preview_fallback == {
+        "slot_role": "subsurfaceamount",
+        "manifest_role": "subsurfacecolor",
+        "usage": "speedtree_preview_only",
+        "material_id": "7",
+        "material_name": owner.name,
+        "contract_hash": capture_hash,
+        "map_index": 6,
+        "map": "subsurface_amount",
+        "path": str(Path(source_files["translucency"]).resolve()),
+        "sha256": sha256(Path(source_files["translucency"])),
+    }, fallback_proof
+    assert (
+        fallback_proof["origin_receipt"][
+            core.PREVIEW_ROLE_FALLBACKS_FIELD
+        ]
+        == preview_fallbacks
+    ), fallback_proof
+    assert fallback_proof["origin_receipt"]["version"] == 2
+    assert fallback_proof["origin_receipt"]["receipt_claim"] == (
+        "speedtree_preview_only"
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": fallback_proof["origin_receipt"]
+        },
+    ) is not None
+    try:
+        core._validate_atlas_canonical_entry(
+            {
+                "material_name": owner.name,
+                "contract": {
+                    "origin_receipt": fallback_proof["origin_receipt"],
+                },
+            },
+            manifest_path,
+            source_fbx_path=source_fbx,
+        )
+    except RuntimeError as exc:
+        assert "rejects preview-only" in str(exc), exc
+    else:
+        raise AssertionError(
+            "Canonical consumer accepted a preview fallback receipt"
+        )
+
+    source_spm_fallback_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    source_spm_fallback_receipt["slot_index_space"] = (
+        core.SOURCE_SPM_MAP_INDEX_SPACE
+    )
+    for row in source_spm_fallback_receipt["slot_files"]:
+        row["spm_map_index"] = row["map_index"] + 100
+        row["map_index"] = row["spm_map_index"]
+    source_spm_fallback = source_spm_fallback_receipt[
+        core.PREVIEW_ROLE_FALLBACKS_FIELD
+    ][0]
+    source_spm_fallback["spm_map_index"] = (
+        source_spm_fallback["map_index"] + 100
+    )
+    source_spm_fallback["map_index"] = source_spm_fallback[
+        "spm_map_index"
+    ]
+    source_spm_fallback.pop("spm_map_index")
+    source_spm_fallback_receipt = core.finalize_preview_receipt(
+        source_spm_fallback_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": source_spm_fallback_receipt
+        },
+    ) is not None
+
+    source_spm_amount_slot = next(
+        row
+        for row in source_spm_fallback_receipt["slot_files"]
+        if row["capture_role"] == "subsurfaceamount"
+    )
+    source_spm_amount_slot["stmat_map_index"] += 1
+    source_spm_fallback_receipt = core.finalize_preview_receipt(
+        source_spm_fallback_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": source_spm_fallback_receipt
+        },
+    ) is None
+
+    wrong_hash_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    wrong_hash_receipt["physical_capture_contract_sha256"] = "0" * 64
+    wrong_hash_receipt = core.finalize_preview_receipt(
+        wrong_hash_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_hash_receipt},
+    ) is None
+
+    wrong_root_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    wrong_root_receipt["physical_capture_manifest"] = str(
+        asset_root / "other" / physical_manifest.name
+    )
+    wrong_root_receipt = core.finalize_preview_receipt(
+        wrong_root_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_root_receipt},
+    ) is None
+
+    wrong_material_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    wrong_material_receipt["material_name"] = "M_other_Mat"
+    wrong_material_receipt["material_id"] = "99"
+    wrong_material_receipt = core.finalize_preview_receipt(
+        wrong_material_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_material_receipt},
+    ) is None
+
+    wrong_index_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    amount_slot = next(
+        row
+        for row in wrong_index_receipt["slot_files"]
+        if row["capture_role"] == "subsurfaceamount"
+    )
+    amount_slot["map_index"] += 1
+    amount_slot["stmat_map_index"] += 1
+    wrong_index_receipt = core.finalize_preview_receipt(
+        wrong_index_receipt
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_index_receipt},
+    ) is None
+
+    wrong_fallback_receipt = json.loads(json.dumps(
+        fallback_proof["origin_receipt"]
+    ))
+    wrong_fallback_receipt[
+        core.PREVIEW_ROLE_FALLBACKS_FIELD
+    ][0]["usage"] = "production"
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={"origin_receipt": wrong_fallback_receipt},
+    ) is None
+
+    invalid_manifest_payload = json.loads(json.dumps(
+        physical_manifest_payload
+    ))
+    next(
+        row
+        for row in invalid_manifest_payload["maps"]
+        if row["role"] == "SubsurfaceColor"
+    )["sha256"] = "0" * 64
+    physical_manifest.write_text(
+        json.dumps(invalid_manifest_payload),
+        encoding="utf-8",
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": fallback_expected_receipt
+        },
+    ) is None
+    physical_manifest.write_text(
+        json.dumps(physical_manifest_payload),
+        encoding="utf-8",
+    )
+
+    unowned = cluster_root / "unowned.tga"
+    unowned.write_bytes(b"unowned")
+    write_source_stmat([
+        (role, str(unowned) if role == "subsurface_amount" else path)
+        for role, path in ordered_sources
+    ])
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": fallback_expected_receipt
+        },
+    ) is None
+
+    alias_manifest_payload = json.loads(json.dumps(
+        physical_manifest_payload
+    ))
+    next(
+        row
+        for row in alias_manifest_payload["maps"]
+        if row["role"] == "SubsurfaceColor"
+    )["role"] = "translucency"
+    physical_manifest.write_text(
+        json.dumps(alias_manifest_payload),
+        encoding="utf-8",
+    )
+    write_source_stmat(fallback_sources)
+    assert core._speedtree_preserved_cluster_sources(
+        source_fbx,
+        owner,
+        expected_binding={
+            "origin_receipt": fallback_expected_receipt
+        },
+    ) is None
+    physical_manifest.write_text(
+        json.dumps(physical_manifest_payload),
+        encoding="utf-8",
+    )
+
+    for swapped_role, swapped_path in (
+        ("albedo", source_files["normal"]),
+        ("normal", source_files["albedo"]),
+        ("alpha", source_files["height"]),
+        ("height", source_files["alpha"]),
+    ):
+        write_source_stmat([
+            (role, swapped_path if role == swapped_role else path)
+            for role, path in ordered_sources
+        ])
+        assert core._speedtree_preserved_cluster_sources(
+            source_fbx,
+            owner,
+        ) is None
 
     write_source_stmat(ordered_sources + [ordered_sources[0]])
     assert core._speedtree_preserved_cluster_sources(
