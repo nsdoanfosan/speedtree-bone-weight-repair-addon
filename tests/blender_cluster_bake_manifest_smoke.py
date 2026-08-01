@@ -189,7 +189,7 @@ with tempfile.TemporaryDirectory(
     )
     stmat = source_fbx.with_suffix(".stmat")
 
-    def write_source_stmat(rows):
+    def write_source_stmat(rows, target=stmat):
         root = ET.Element("SpeedTreeMaterials")
         material = ET.SubElement(
             root,
@@ -205,7 +205,7 @@ with tempfile.TemporaryDirectory(
                 Source=str(source),
             )
         ET.ElementTree(root).write(
-            stmat,
+            target,
             encoding="utf-8",
             xml_declaration=True,
         )
@@ -281,6 +281,24 @@ with tempfile.TemporaryDirectory(
         owner,
         expected_binding={"origin_receipt": exact_stmat_receipt},
     ) is not None
+
+    nested_source_fbx = (
+        cluster_root / "fbx" / "SK_cluster_test_01.fbx"
+    )
+    nested_source_fbx.parent.mkdir()
+    nested_source_fbx.write_bytes(b"nested-cluster-fbx")
+    nested_stmat = nested_source_fbx.with_suffix(".stmat")
+    write_source_stmat(ordered_sources, target=nested_stmat)
+    nested_proof = core._speedtree_preserved_cluster_sources(
+        nested_source_fbx,
+        owner,
+        expected_binding={"origin_receipt": exact_stmat_receipt},
+    )
+    assert nested_proof is not None, nested_proof
+    assert (
+        Path(nested_proof["cluster_root"]).resolve()
+        == cluster_root.resolve()
+    ), nested_proof
 
     wrong_path_receipt = json.loads(json.dumps(legacy_receipt))
     wrong_path_receipt["slot_files"][0]["path"] = str(
