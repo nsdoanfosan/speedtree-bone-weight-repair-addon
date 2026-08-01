@@ -1074,7 +1074,6 @@ def _speedtree_preserved_cluster_sources(
                     slot_role=role,
                     slot_path=path,
                     selected_rows=selected_rows,
-                    declared_rows=declared,
                     material_id=stmat_material_id,
                     # SpeedTree SPM and STMAT names differ by the exported
                     # ``_Mat`` suffix.  The normalized key comparison above

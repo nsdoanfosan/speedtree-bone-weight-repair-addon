@@ -57,7 +57,6 @@ class PreviewTextureContractTests(unittest.TestCase):
             "slot_role": "subsurfaceamount",
             "slot_path": str(self.color),
             "selected_rows": [self.declared["subsurfacecolor"]],
-            "declared_rows": self.declared,
             "material_id": "7",
             "material_name": "M_leaf_test_Mat",
             "contract_hash": "c" * 64,
@@ -134,7 +133,7 @@ class PreviewTextureContractTests(unittest.TestCase):
         )
         self.assertIsNone(self.build(selected_rows=[translucency]))
 
-    def test_rejects_unowned_or_incomplete_manifest_evidence(self):
+    def test_rejects_unowned_or_ambiguous_selected_entry(self):
         self.assertIsNone(
             self.build(
                 slot_path=str(self.unowned),
@@ -143,21 +142,15 @@ class PreviewTextureContractTests(unittest.TestCase):
         )
         self.assertIsNone(
             self.build(
-                declared_rows={
-                    "subsurfacecolor": self.declared["subsurfacecolor"],
-                }
+                selected_rows=[
+                    self.declared["subsurfacecolor"],
+                    dict(self.declared["subsurfacecolor"]),
+                ],
             )
         )
-        same_path = {
-            **self.declared,
-            "subsurfaceamount": {
-                "role": "subsurfaceamount",
-                "raw_role": "subsurfaceamount",
-                "path": str(self.color),
-                "sha256": "b" * 64,
-            },
-        }
-        self.assertIsNone(self.build(declared_rows=same_path))
+
+    def test_does_not_search_an_alternate_amount_candidate(self):
+        self.assertIsNotNone(self.build())
 
     def test_rejects_bad_hash_and_index_receipt_fields(self):
         row = self.build()
