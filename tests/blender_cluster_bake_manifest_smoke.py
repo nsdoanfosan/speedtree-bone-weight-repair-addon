@@ -172,19 +172,20 @@ with tempfile.TemporaryDirectory(
     physical_manifest = (
         cluster_root / "cluster_test_auto_capture_manifest.json"
     )
+    physical_manifest_payload = {
+        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "direct_uv_source":
+            "same_blender_physical_capture_projection",
+        "physical_capture_contract_sha256": capture_hash,
+        "physical_capture_contract": {
+            "contract_sha256": capture_hash,
+        },
+        "material_name": owner.name,
+        "material_id": "7",
+        "maps": capture_maps,
+    }
     physical_manifest.write_text(
-        json.dumps({
-            "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
-            "direct_uv_source":
-                "same_blender_physical_capture_projection",
-            "physical_capture_contract_sha256": capture_hash,
-            "physical_capture_contract": {
-                "contract_sha256": capture_hash,
-            },
-            "material_name": owner.name,
-            "material_id": "7",
-            "maps": capture_maps,
-        }),
+        json.dumps(physical_manifest_payload),
         encoding="utf-8",
     )
     stmat = source_fbx.with_suffix(".stmat")
@@ -240,6 +241,10 @@ with tempfile.TemporaryDirectory(
         expected_binding={"origin_receipt": legacy_receipt},
     )
     assert legacy_proof is not None, legacy_proof
+    assert (
+        Path(legacy_proof["cluster_root"]).resolve()
+        == cluster_root.resolve()
+    ), legacy_proof
     assert (
         legacy_proof["origin_receipt"]["slot_index_space"]
         == core.STMAT_MAP_INDEX_SPACE
@@ -299,6 +304,61 @@ with tempfile.TemporaryDirectory(
         Path(nested_proof["cluster_root"]).resolve()
         == cluster_root.resolve()
     ), nested_proof
+
+    nested_wrong_index = json.loads(json.dumps(exact_stmat_receipt))
+    nested_wrong_index["slot_files"][0]["stmat_map_index"] = 99
+    assert core._speedtree_preserved_cluster_sources(
+        nested_source_fbx,
+        owner,
+        expected_binding={"origin_receipt": nested_wrong_index},
+    ) is None
+
+    nested_wrong_path = json.loads(json.dumps(exact_stmat_receipt))
+    nested_wrong_path["slot_files"][0]["path"] = str(
+        cluster_root / "wrong.tga"
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        nested_source_fbx,
+        owner,
+        expected_binding={"origin_receipt": nested_wrong_path},
+    ) is None
+
+    nested_wrong_hash = json.loads(json.dumps(exact_stmat_receipt))
+    nested_wrong_hash["slot_files"][0]["sha256"] = "0" * 64
+    assert core._speedtree_preserved_cluster_sources(
+        nested_source_fbx,
+        owner,
+        expected_binding={"origin_receipt": nested_wrong_hash},
+    ) is None
+
+    outside_root = asset_root / "outside_capture"
+    outside_root.mkdir()
+    first_role, first_path = ordered_sources[0]
+    outside_path = outside_root / Path(first_path).name
+    outside_path.write_bytes(Path(first_path).read_bytes())
+    outside_sources = list(ordered_sources)
+    outside_sources[0] = (first_role, str(outside_path))
+    write_source_stmat(outside_sources, target=nested_stmat)
+    outside_receipt = json.loads(json.dumps(exact_stmat_receipt))
+    outside_receipt["slot_files"][0]["path"] = str(outside_path)
+    outside_receipt["slot_files"][0]["sha256"] = sha256(outside_path)
+    outside_manifest = json.loads(json.dumps(physical_manifest_payload))
+    outside_manifest["maps"][0]["path"] = str(outside_path)
+    outside_manifest["maps"][0]["sha256"] = sha256(outside_path)
+    physical_manifest.write_text(
+        json.dumps(outside_manifest),
+        encoding="utf-8",
+    )
+    assert core._speedtree_preserved_cluster_sources(
+        nested_source_fbx,
+        owner,
+        expected_binding={"origin_receipt": outside_receipt},
+    ) is None
+    write_source_stmat(ordered_sources, target=nested_stmat)
+    physical_manifest.write_text(
+        json.dumps(physical_manifest_payload),
+        encoding="utf-8",
+    )
 
     wrong_path_receipt = json.loads(json.dumps(legacy_receipt))
     wrong_path_receipt["slot_files"][0]["path"] = str(
