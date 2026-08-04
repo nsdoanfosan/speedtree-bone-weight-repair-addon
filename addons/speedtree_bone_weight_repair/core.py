@@ -85,12 +85,15 @@ def load_speedtree_texture_readiness_contract(
         raise RuntimeError(
             f"SpeedTree texture contract could not be read: {path} ({exc})"
         ) from exc
-    envelope = payload.get(handoff_contract.PIPELINE_ENVELOPE_FIELD)
-    if envelope is not None:
-        if str(payload.get("status") or "") != "ok":
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "SpeedTree texture contract root must be a JSON object"
+        )
+    if handoff_contract.PIPELINE_ENVELOPE_FIELD in payload:
+        envelope = payload.get(handoff_contract.PIPELINE_ENVELOPE_FIELD)
+        if not isinstance(envelope, dict):
             raise RuntimeError(
-                "SpeedTree material preflight report status is not ok: "
-                + str(payload.get("status") or "unknown")
+                "SpeedTree pipeline contract envelope must be a JSON object"
             )
         if not spm_path:
             raise RuntimeError(
@@ -105,11 +108,24 @@ def load_speedtree_texture_readiness_contract(
                 spm_path=spm_path,
                 stmat_paths=stmat_paths,
                 expected_mesh_name=Path(spm_path).stem,
+                texture_contract_mode=(
+                    handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
+                ),
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"SpeedTree preflight contract rejected before Blender mutation: {exc}"
             ) from exc
+
+        report_status = str(payload.get("status") or "")
+        if (
+            report_status != "ok"
+            and not validated.get("texture_only_outcome_override")
+        ):
+            raise RuntimeError(
+                "SpeedTree material preflight report status is not ok: "
+                + str(report_status or "unknown")
+            )
 
         tree_user_data = validated.get("tree_user_data")
         if not isinstance(tree_user_data, dict) or str(
@@ -153,6 +169,18 @@ def load_speedtree_texture_readiness_contract(
             "live_source_identity": live_source,
             "instance_profile": reported_profile,
             "tree_user_data": dict(tree_user_data),
+            handoff_contract.TEXTURE_CONTRACT_MODE_FIELD: (
+                handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
+            ),
+            "texture_outcome": validated.get(
+                "texture_outcome", "complete"
+            ),
+            "texture_diagnostics": list(
+                validated.get("texture_diagnostics") or []
+            ),
+            "texture_warnings": list(
+                validated.get("texture_warnings") or []
+            ),
         }
     else:
         contract = payload.get("texture_readiness_contract", payload)
@@ -163,6 +191,10 @@ def load_speedtree_texture_readiness_contract(
             f"SpeedTree texture contract has no bindings: {path}"
         )
     contract = dict(contract)
+    contract.setdefault(
+        handoff_contract.TEXTURE_CONTRACT_MODE_FIELD,
+        handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE,
+    )
     contract["contract_path"] = str(contract_path.resolve())
     return contract
 
@@ -555,6 +587,164 @@ ATLAS_BLOCKED_TEXTURE_PATH_PARTS = {
     "_pcgtex_generated",
     "_pcgtex_backups",
 }
+
+
+def _runtime_tolerant_texture_contract(texture_contract):
+    return bool(
+        isinstance(texture_contract, dict)
+        and texture_contract.get(
+            handoff_contract.TEXTURE_CONTRACT_MODE_FIELD
+        ) == handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
+    )
+
+
+def _bat_runtime_texture_contract(texture_contract):
+    """Make the operational BAT boundary tolerant without weakening audits."""
+    result = dict(texture_contract or {})
+    source_status = str(result.get("status") or "").strip()
+    if source_status and source_status != "ok":
+        result.setdefault("source_texture_status", source_status)
+    result["status"] = "ok"
+    result.setdefault("bindings", [])
+    result.setdefault(
+        "texture_outcome",
+        "complete" if result["bindings"] else "unassigned",
+    )
+    result[handoff_contract.TEXTURE_CONTRACT_MODE_FIELD] = (
+        handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
+    )
+    return result
+
+
+def load_speedtree_runtime_texture_contract(
+    path, *, spm_path="", source_fbx_path=""
+):
+    """Load operational handoff metadata without admitting texture gates.
+
+    A parsed new pipeline envelope still receives full structural/live source
+    validation. Missing, unreadable, malformed, or incomplete legacy
+    texture-only metadata becomes an empty runtime contract.
+    """
+    if not path:
+        return _bat_runtime_texture_contract(None)
+    contract_path = Path(path)
+    diagnostic = None
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = None
+        diagnostic = _texture_diagnostic(
+            "",
+            "texture_contract_unavailable",
+            f"Texture metadata unavailable; continuing without bindings: {exc}",
+        )
+
+    if (
+        isinstance(payload, dict)
+        and handoff_contract.PIPELINE_ENVELOPE_FIELD in payload
+    ):
+        return _bat_runtime_texture_contract(
+            load_speedtree_texture_readiness_contract(
+                path,
+                spm_path=spm_path,
+                source_fbx_path=source_fbx_path,
+            )
+        )
+
+    if isinstance(payload, dict):
+        legacy = payload.get("texture_readiness_contract", payload)
+        if isinstance(legacy, dict) and isinstance(
+            legacy.get("bindings"), list
+        ):
+            result = _bat_runtime_texture_contract(legacy)
+            result["contract_path"] = str(contract_path.resolve())
+            return result
+        diagnostic = _texture_diagnostic(
+            "",
+            "texture_contract_unassigned",
+            "Legacy texture metadata has no bindings; continuing unassigned",
+        )
+
+    result = _bat_runtime_texture_contract(None)
+    result["contract_path"] = str(contract_path.resolve())
+    result["texture_diagnostics"] = [diagnostic] if diagnostic else []
+    result["texture_warnings"] = []
+    result["texture_outcome"] = "unassigned"
+    return result
+
+
+def _texture_diagnostic(
+    material,
+    code,
+    message,
+    *,
+    severity="info",
+    **details,
+):
+    row = {
+        "code": str(code),
+        "severity": str(severity),
+        "material": str(getattr(material, "name", material) or ""),
+        "message": str(message),
+    }
+    row.update(details)
+    return row
+
+
+def _quarantine_texture_binding(
+    binding,
+    material,
+    code,
+    message,
+    *,
+    severity="info",
+    missing_roles=None,
+    allow_local_search=True,
+):
+    """Return a diagnostic-only binding that cannot publish any path."""
+    result = dict(binding or {})
+    for field in (
+        "origin_receipt",
+        "slot_files",
+        "source_paths",
+        "source_roles",
+        "source_maps",
+        "preserved_files",
+        "declared_source_receipt",
+        "expected_t_paths",
+        "expected_texture_base",
+        "manifest_path",
+        "texture_contract_status",
+        "source_origin",
+        "source_evidence",
+        "origin_state",
+    ):
+        result.pop(field, None)
+    result.update(
+        {
+            "material": getattr(material, "name", str(material or "")),
+            "status": "unassigned",
+            "texture_source_mode": "unresolved",
+            "binding_disposition": "leave_unassigned",
+            "files": {},
+            "available_roles": [],
+            "missing_roles": sorted(
+                set(missing_roles or SPEEDTREE_TEXTURE_ROLES)
+            ),
+            "warning_codes": [str(code)] if severity == "warning" else [],
+            "diagnostic_codes": [str(code)],
+            # Quarantine rejects only the unsafe authority row. It must not
+            # suppress an independent exact STMAT/local lookup in runtime
+            # mode; that lookup can still bind a safe subset.
+            "allow_local_search": bool(allow_local_search),
+        }
+    )
+    return result, _texture_diagnostic(
+        material,
+        code,
+        message,
+        severity=severity,
+    )
 
 
 def _has_authoritative_fallback_evidence(binding):
@@ -2474,7 +2664,15 @@ def _speedtree_manifest_target_name(manifest):
     return common_base
 
 
-def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, manifest_cache=None):
+def _speedtree_manifest_binding(
+    source_fbx_path,
+    material,
+    stmat_data=None,
+    manifest_cache=None,
+    *,
+    validate_texture_compatibility=True,
+    tolerate_unavailable=False,
+):
     """Resolve an intermediate atlas group material to its final atlas material."""
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
     manifest_cache = manifest_cache if manifest_cache is not None else {}
@@ -2496,7 +2694,14 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
     for manifest_path in _speedtree_manifest_paths(source_fbx_path, stmat_material):
         cache_key = os.path.normcase(str(manifest_path))
         if cache_key not in manifest_cache:
-            manifest_cache[cache_key] = _load_speedtree_import_manifest(manifest_path)
+            try:
+                manifest_cache[cache_key] = _load_speedtree_import_manifest(
+                    manifest_path
+                )
+            except RuntimeError:
+                if not tolerate_unavailable:
+                    raise
+                manifest_cache[cache_key] = None
         manifest = manifest_cache[cache_key]
         if not manifest:
             continue
@@ -2511,9 +2716,14 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
             consumer_key = os.path.normcase(str(consumer_path or ""))
             if consumer_path is not None and consumer_path.is_file():
                 if consumer_key not in manifest_cache:
-                    manifest_cache[consumer_key] = (
-                        _load_speedtree_import_manifest(consumer_path)
-                    )
+                    try:
+                        manifest_cache[consumer_key] = (
+                            _load_speedtree_import_manifest(consumer_path)
+                        )
+                    except RuntimeError:
+                        if not tolerate_unavailable:
+                            raise
+                        manifest_cache[consumer_key] = None
                 consumer_manifest = manifest_cache[consumer_key]
                 if (
                     consumer_manifest
@@ -2557,7 +2767,10 @@ def _speedtree_manifest_binding(source_fbx_path, material, stmat_data=None, mani
                 f"consumer_scope=missing, manifest_scope={manifest_scope!r}"
             )
             continue
-        if manifest.get("texture_contract_status"):
+        if (
+            validate_texture_compatibility
+            and manifest.get("texture_contract_status")
+        ):
             entries = _manifest_texture_entries(manifest)
             validated = [
                 _validate_atlas_manifest_entry(
@@ -2658,8 +2871,14 @@ def _speedtree_texture_sets(texture_dir):
     canonical spelling per set.
     """
     texture_dir = Path(texture_dir)
-    indexed = defaultdict(lambda: {"bases": set(), "files": {}})
-    if not texture_dir.is_dir():
+    indexed = defaultdict(
+        lambda: {"bases": set(), "files": {}, "file_candidates": {}}
+    )
+    try:
+        if not texture_dir.is_dir():
+            return indexed
+        entries = list(texture_dir.iterdir())
+    except OSError:
         return indexed
     role_pattern = "|".join(re.escape(role) for role in SPEEDTREE_TEXTURE_ROLES)
     pattern = re.compile(rf"^(T_.+)_({role_pattern})$", re.IGNORECASE)
@@ -2667,8 +2886,15 @@ def _speedtree_texture_sets(texture_dir):
         extension: index for index, extension in enumerate(SPEEDTREE_TEXTURE_EXTENSIONS)
     }
     base_spellings = defaultdict(dict)
-    for path in texture_dir.iterdir():
-        if not path.is_file() or path.suffix.lower() not in extension_rank:
+    for path in entries:
+        try:
+            usable = (
+                path.is_file()
+                and path.suffix.lower() in extension_rank
+            )
+        except OSError:
+            usable = False
+        if not usable:
             continue
         match = pattern.match(path.stem)
         if not match:
@@ -2676,6 +2902,7 @@ def _speedtree_texture_sets(texture_dir):
         texture_base, role = match.group(1), match.group(2).lower()
         key = _speedtree_texture_set_key(texture_base)
         row = indexed[key]
+        row["file_candidates"].setdefault(role, []).append(path)
         spelling_counts = base_spellings[key].setdefault(texture_base.casefold(), {})
         spelling_counts[texture_base] = spelling_counts.get(texture_base, 0) + 1
         current = row["files"].get(role)
@@ -2686,16 +2913,24 @@ def _speedtree_texture_sets(texture_dir):
             _canonical_speedtree_texture_base(spelling_counts)
             for spelling_counts in variants.values()
         }
+        for role, paths in indexed[key]["file_candidates"].items():
+            indexed[key]["file_candidates"][role] = sorted(
+                set(paths),
+                key=lambda candidate: (
+                    extension_rank[candidate.suffix.lower()],
+                    candidate.name.casefold(),
+                ),
+            )
     return indexed
 
 
 def _speedtree_stmat_texture_set(source_fbx_path, material, stmat_data=None):
-    """Return one complete managed T_ set explicitly referenced by STMAT.
+    """Return one unambiguous live managed T_ subset referenced by STMAT.
 
     PCG can intentionally connect differently named SpeedTree materials to one
     shared texture set.  In that case ``M_material -> T_material`` name matching
-    is not the contract: the exported STMAT source paths are.  Only accept an
-    unambiguous six-map T_ set whose files all still exist.
+    is not the contract: the exported STMAT source paths are. Missing roles are
+    ordinary availability and do not invalidate the live roles on that base.
     """
     stmat_data = stmat_data or _speedtree_stmat_materials(source_fbx_path)
     stmat_material = stmat_data.get("materials", {}).get(
@@ -2719,6 +2954,8 @@ def _speedtree_stmat_texture_set(source_fbx_path, material, stmat_data=None):
                 continue
         except OSError:
             continue
+        if _blocked_atlas_texture_path(path):
+            continue
         texture_base, role = match.group(1), match.group(2).lower()
         row = referenced[
             (os.path.normcase(str(path.parent)), _speedtree_texture_set_key(texture_base))
@@ -2728,38 +2965,56 @@ def _speedtree_stmat_texture_set(source_fbx_path, material, stmat_data=None):
         row["bases"].add(texture_base.casefold())
         row["roles"].add(role)
 
-    complete = []
+    candidates = []
     for (texture_dir, texture_key), row in referenced.items():
         if len(row["bases"]) != 1:
-            continue
-        # SpeedTree 10.1 can omit Opacity from an FBX STMAT even when the SPM
-        # slot is connected. Color+Normal on one managed base are the durable
-        # anchors; the directory scan below must still prove all six files.
-        if not {"color", "normal"}.issubset(row["roles"]):
             continue
         match = _speedtree_texture_sets(texture_dir).get(texture_key)
         if not match or len(match["bases"]) != 1:
             continue
-        if not all(role in match["files"] for role in SPEEDTREE_TEXTURE_ROLES):
+        safe_file_candidates = {
+            role: [
+                path
+                for path in match.get("file_candidates", {}).get(role, [])
+                if not _blocked_atlas_texture_path(path)
+            ]
+            for role in SPEEDTREE_TEXTURE_ROLES
+        }
+        safe_file_candidates = {
+            role: paths
+            for role, paths in safe_file_candidates.items()
+            if paths
+        }
+        available = {
+            role: safe_file_candidates[role][0]
+            for role in SPEEDTREE_TEXTURE_ROLES
+            if role in safe_file_candidates
+        }
+        if not available:
             continue
-        complete.append(
+        candidates.append(
             {
                 "texture_dir": str(texture_dir),
                 "texture_base": next(iter(match["bases"])),
-                "files": {
-                    role: match["files"][role]
-                    for role in SPEEDTREE_TEXTURE_ROLES
+                "files": available,
+                "file_candidates": {
+                    role: list(safe_file_candidates[role])
+                    for role in available
                 },
                 "stmat_roles": sorted(row["roles"]),
+                "available_roles": sorted(available),
+                "missing_roles": sorted(
+                    set(SPEEDTREE_TEXTURE_ROLES) - set(available)
+                ),
             }
         )
-    return complete[0] if len(complete) == 1 else None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _complete_speedtree_texture_set(
     material, target_name, stmat_cache=None, texture_index_cache=None
 ):
-    """Find one complete canonical T_ set reachable from a tagged material."""
+    """Find the first unambiguous live canonical T_ subset for a material."""
     if material is None:
         return None
     source_fbx = str(material.get("codex_source_fbx", "")).strip()
@@ -2773,32 +3028,74 @@ def _complete_speedtree_texture_set(
     if source_key not in stmat_cache:
         stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
     texture_key = _speedtree_texture_set_key(target_name)
+    candidates = []
     for texture_dir in _speedtree_material_texture_dirs(
         source_fbx, material, stmat_cache[source_key]
     ):
+        if _blocked_atlas_texture_path(texture_dir):
+            continue
         cache_key = os.path.normcase(str(texture_dir))
         if cache_key not in texture_index_cache:
             texture_index_cache[cache_key] = _speedtree_texture_sets(texture_dir)
         match = texture_index_cache[cache_key].get(texture_key)
         if not match or len(match["bases"]) != 1:
             continue
-        if not all(role in match["files"] for role in SPEEDTREE_TEXTURE_ROLES):
-            continue
-        return {
-            "texture_dir": str(texture_dir),
-            "texture_base": next(iter(match["bases"])),
-            "files": {
-                role: str(match["files"][role]) for role in SPEEDTREE_TEXTURE_ROLES
-            },
+        safe_file_candidates = {
+            role: [
+                str(path)
+                for path in match.get("file_candidates", {}).get(role, [])
+                if not _blocked_atlas_texture_path(path)
+            ]
+            for role in SPEEDTREE_TEXTURE_ROLES
         }
-    return None
+        safe_file_candidates = {
+            role: paths
+            for role, paths in safe_file_candidates.items()
+            if paths
+        }
+        available = {
+            role: paths[0] for role, paths in safe_file_candidates.items()
+        }
+        if not available:
+            continue
+        candidates.append(
+            {
+                "texture_dir": str(texture_dir),
+                "texture_base": next(iter(match["bases"])),
+                "files": available,
+                "file_candidates": {
+                    role: list(safe_file_candidates[role])
+                    for role in available
+                },
+                "available_roles": sorted(available),
+                "missing_roles": sorted(
+                    set(SPEEDTREE_TEXTURE_ROLES) - set(available)
+                ),
+            }
+        )
+    signatures = {
+        _speedtree_texture_file_signature(candidate)
+        for candidate in candidates
+    }
+    signatures.discard(())
+    if len(signatures) != 1:
+        return None
+    signature = next(iter(signatures))
+    return next(
+        candidate
+        for candidate in candidates
+        if _speedtree_texture_file_signature(candidate) == signature
+    )
 
 
 def _speedtree_texture_file_signature(texture_set):
     if not texture_set:
         return ()
     files = texture_set.get("files") or {}
-    if not all(role in files for role in SPEEDTREE_TEXTURE_ROLES):
+    available_roles = [
+        role for role in SPEEDTREE_TEXTURE_ROLES if files.get(role)
+    ]
+    if not available_roles:
         return ()
     return tuple(
         (
@@ -2807,7 +3104,7 @@ def _speedtree_texture_file_signature(texture_set):
                 os.path.normpath(os.path.abspath(os.path.expanduser(str(files[role]))))
             ).casefold(),
         )
-        for role in SPEEDTREE_TEXTURE_ROLES
+        for role in available_roles
     )
 
 
@@ -2823,8 +3120,46 @@ def _remove_speedtree_image_nodes(material):
     return removed_images
 
 
-def _load_speedtree_image(path, role):
+def _clear_speedtree_texture_binding_properties(material):
+    """Remove cached path authority when a material is left unassigned."""
+    if material is None:
+        return False
+    changed = False
+    for key in (
+        "codex_speedtree_texture_base",
+        "codex_speedtree_texture_contract_status",
+        "codex_speedtree_texture_manifest",
+        "codex_speedtree_expected_t_paths",
+    ):
+        if key in material:
+            del material[key]
+            changed = True
+    return changed
+
+
+def _speedtree_material_images_decodable(material):
+    if not material or not material.node_tree:
+        return False
+    image_nodes = [
+        node
+        for node in material.node_tree.nodes
+        if node.type == "TEX_IMAGE" and node.image
+    ]
+    return bool(image_nodes) and all(
+        int(node.image.size[0]) > 0 and int(node.image.size[1]) > 0
+        for node in image_nodes
+    )
+
+
+def _load_speedtree_image(path, role, *, require_decodable=False):
     image = bpy.data.images.load(str(path), check_existing=True)
+    if (
+        require_decodable
+        and (int(image.size[0]) <= 0 or int(image.size[1]) <= 0)
+    ):
+        if image.users == 0:
+            bpy.data.images.remove(image)
+        raise RuntimeError(f"Texture image could not be decoded: {path}")
     image.name = path.stem
     if role not in {"color", "subsurface"}:
         try:
@@ -2834,7 +3169,13 @@ def _load_speedtree_image(path, role):
     return image
 
 
-def _replace_speedtree_material_nodes(material, texture_files):
+def _replace_speedtree_material_nodes(
+    material,
+    texture_files,
+    *,
+    tolerate_load_errors=False,
+    texture_file_candidates=None,
+):
     material.use_nodes = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
@@ -2845,22 +3186,66 @@ def _replace_speedtree_material_nodes(material, texture_files):
 
     bsdf = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
     image_nodes = {}
+    load_errors = {}
+    selected_files = {}
+    texture_file_candidates = texture_file_candidates or {}
     for index, role in enumerate(SPEEDTREE_TEXTURE_ROLES):
-        path = texture_files[role]
+        path = texture_files.get(role)
+        if path is None:
+            continue
+        candidates = list(texture_file_candidates.get(role) or [path])
+        if path not in candidates and str(path) not in {
+            str(candidate) for candidate in candidates
+        }:
+            candidates.insert(0, path)
+        unique_candidates = []
+        seen_candidates = set()
+        for candidate in candidates:
+            candidate_path = Path(candidate)
+            try:
+                candidate_key = _path_identity(candidate_path)
+            except (OSError, ValueError):
+                candidate_key = str(candidate_path).casefold()
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
+            unique_candidates.append(candidate_path)
+        image = None
+        candidate_errors = []
+        for candidate_path in unique_candidates:
+            try:
+                image = _load_speedtree_image(
+                    candidate_path,
+                    role,
+                    require_decodable=tolerate_load_errors,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                if not tolerate_load_errors:
+                    raise
+                candidate_errors.append(
+                    f"{candidate_path}: {exc}"
+                )
+                continue
+            path = candidate_path
+            break
+        if image is None:
+            load_errors[role] = " | ".join(candidate_errors)
+            continue
         node = nodes.new("ShaderNodeTexImage")
         node.name = path.stem
         node.label = path.stem
-        node.image = _load_speedtree_image(path, role)
+        node.image = image
         node.location = (-720, 360 - index * 190)
         image_nodes[role] = node
+        selected_files[role] = path
 
     if bsdf is not None:
         color_socket = bsdf.inputs.get("Base Color")
-        if color_socket is not None:
+        if color_socket is not None and "color" in image_nodes:
             links.new(image_nodes["color"].outputs["Color"], color_socket)
 
         normal_socket = bsdf.inputs.get("Normal")
-        if normal_socket is not None:
+        if normal_socket is not None and "normal" in image_nodes:
             normal_map = nodes.new("ShaderNodeNormalMap")
             normal_map.name = "SpeedTree T_ Normal"
             normal_map.label = "SpeedTree T_ Normal"
@@ -2869,13 +3254,19 @@ def _replace_speedtree_material_nodes(material, texture_files):
             links.new(normal_map.outputs["Normal"], normal_socket)
 
         alpha_socket = bsdf.inputs.get("Alpha")
-        if alpha_socket is not None:
+        if alpha_socket is not None and "opacity" in image_nodes:
             links.new(image_nodes["opacity"].outputs["Color"], alpha_socket)
 
     for image_name in removed_images:
         image = bpy.data.images.get(image_name)
         if image and image.users == 0:
             bpy.data.images.remove(image)
+    return {
+        "loaded_roles": sorted(image_nodes),
+        "failed_roles": sorted(load_errors),
+        "load_errors": load_errors,
+        "selected_files": selected_files,
+    }
 
 
 def _provisional_speedtree_role_files(source_paths):
@@ -2904,7 +3295,12 @@ def _provisional_speedtree_role_files(source_paths):
     return result
 
 
-def _replace_speedtree_provisional_material_nodes(material, texture_files):
+def _replace_speedtree_provisional_material_nodes(
+    material,
+    texture_files,
+    *,
+    tolerate_load_errors=False,
+):
     """Wire only explicitly declared original sources for provisional Atlas."""
     material.use_nodes = True
     nodes = material.node_tree.nodes
@@ -2919,16 +3315,28 @@ def _replace_speedtree_provisional_material_nodes(material, texture_files):
         None,
     )
     image_nodes = {}
+    load_errors = {}
     for index, role in enumerate(SPEEDTREE_TEXTURE_ROLES):
         path = texture_files.get(role)
         if path is None:
+            continue
+        try:
+            image = _load_speedtree_image(
+                path,
+                role,
+                require_decodable=tolerate_load_errors,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if not tolerate_load_errors:
+                raise
+            load_errors[role] = str(exc)
             continue
         node = nodes.new("ShaderNodeTexImage")
         node.name = path.stem
         node.label = (
             path.stem + " [provisional: generate PCG ST9 T_*]"
         )
-        node.image = _load_speedtree_image(path, role)
+        node.image = image
         node.location = (-720, 360 - index * 190)
         image_nodes[role] = node
 
@@ -2960,6 +3368,11 @@ def _replace_speedtree_provisional_material_nodes(material, texture_files):
         image = bpy.data.images.get(image_name)
         if image and image.users == 0:
             bpy.data.images.remove(image)
+    return {
+        "loaded_roles": sorted(image_nodes),
+        "failed_roles": sorted(load_errors),
+        "load_errors": load_errors,
+    }
 
 
 def _validate_atlas_overlay_compatibility(
@@ -3043,6 +3456,9 @@ def preflight_speedtree_material_texture_contracts(
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
     )
+    runtime_tolerant = _runtime_tolerant_texture_contract(
+        texture_contract
+    )
     original_bindings = []
     if isinstance(texture_contract, dict):
         for row in texture_contract.get("bindings") or []:
@@ -3063,24 +3479,49 @@ def preflight_speedtree_material_texture_contracts(
     stmat_cache = {}
     manifest_cache = {}
     reports = []
+    diagnostics = list(
+        (texture_contract or {}).get("texture_diagnostics") or []
+    )
     normalized_by_material = {}
     overlay_statuses = set()
     for material in materials:
+        material_key = _speedtree_material_name_key(material.name)
+        material_diagnostics = []
         source_fbx = str(
             source_fbx_override
             or material.get("codex_source_fbx", "")
         ).strip()
         if not source_fbx:
-            if strict_contract:
+            if strict_contract and not runtime_tolerant:
                 raise RuntimeError(
                     "Strict SpeedTree material has no source FBX identity: "
                     + material.name
+                )
+            if runtime_tolerant:
+                effective, diagnostic = _quarantine_texture_binding(
+                    None,
+                    material,
+                    "missing_source_fbx_identity",
+                    "No source FBX identity is available for local texture lookup",
+                    allow_local_search=False,
+                )
+                normalized_by_material[material_key] = effective
+                diagnostics.append(diagnostic)
+                reports.append(
+                    {
+                        "material": material.name,
+                        "source_fbx": "",
+                        "manifest_path": "",
+                        "texture_contract_status": "",
+                        "status": "unassigned",
+                        "binding_disposition": "leave_unassigned",
+                        "diagnostics": [diagnostic],
+                    }
                 )
             continue
         source_key = normalized_source_fbx_path(source_fbx)
         if source_key not in stmat_cache:
             stmat_cache[source_key] = _speedtree_stmat_materials(source_fbx)
-        material_key = _speedtree_material_name_key(material.name)
         existing = list(
             bindings.get(material_key) or []
         )
@@ -3121,24 +3562,90 @@ def preflight_speedtree_material_texture_contracts(
             }
             if len(signatures) == 1:
                 existing = existing[:1]
-        manifest_binding = _speedtree_manifest_texture_binding(
-            source_fbx,
-            material,
-            stmat_data=stmat_cache[source_key],
-            manifest_cache=manifest_cache,
-        )
-        if strict_contract and manifest_binding is not None:
-            _validate_atlas_overlay_compatibility(
+        manifest_binding_rejected = False
+        try:
+            manifest_binding = _speedtree_manifest_texture_binding(
+                source_fbx,
                 material,
-                manifest_binding,
-                existing,
+                stmat_data=stmat_cache[source_key],
+                manifest_cache=manifest_cache,
             )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if not runtime_tolerant:
+                raise
+            manifest_binding_rejected = True
+            manifest_binding = None
+            atlas_statuses = {
+                ATLAS_CANONICAL_TEXTURE_STATUS,
+                ATLAS_SOURCE_FALLBACK_STATUS,
+                ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
+            }
+            existing = [
+                row
+                for row in existing
+                if not (
+                    str(row.get("manifest_path") or "").strip()
+                    or str(row.get("texture_contract_status") or "")
+                    in atlas_statuses
+                )
+            ]
+            message = str(exc)
+            lowered_message = message.casefold()
+            ordinary_mismatch = (
+                "ambiguous" in lowered_message
+                or "no exact texture mapping" in lowered_message
+            )
+            material_diagnostics.append(
+                _texture_diagnostic(
+                    material,
+                    (
+                        "ambiguous_texture_authority"
+                        if "ambiguous" in lowered_message
+                        else "unmatched_atlas_manifest_texture"
+                        if ordinary_mismatch
+                        else "atlas_manifest_binding_rejected"
+                    ),
+                    message,
+                    severity="info",
+                )
+            )
+        if strict_contract and manifest_binding is not None:
+            try:
+                _validate_atlas_overlay_compatibility(
+                    material,
+                    manifest_binding,
+                    existing,
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                if not runtime_tolerant:
+                    raise
+                material_diagnostics.append(
+                    _texture_diagnostic(
+                        material,
+                        "ambiguous_texture_authority",
+                        str(exc),
+                    )
+                )
+                # Neither conflicting authority may be consumed.
+                existing = []
+                manifest_binding = None
         effective = None
         if manifest_binding is not None:
             effective = dict(existing[0]) if len(existing) == 1 else {}
             effective.update(manifest_binding)
         if effective is None and len(existing) == 1:
             effective = dict(existing[0])
+        if (
+            effective is None
+            and runtime_tolerant
+            and manifest_binding_rejected
+        ):
+            effective, _ignored_diagnostic = _quarantine_texture_binding(
+                None,
+                material,
+                "atlas_manifest_binding_rejected",
+                "Rejected Atlas manifest authority was left unassigned",
+            )
         origin_state = str(
             (effective or {}).get("origin_state") or ""
         ).strip()
@@ -3155,10 +3662,20 @@ def preflight_speedtree_material_texture_contracts(
                 == "managed_texture_set"
             )
         ):
-            raise RuntimeError(
+            message = (
                 "Preview-only texture receipt cannot satisfy a canonical "
                 f"production binding: {material.name}"
             )
+            if not runtime_tolerant:
+                raise RuntimeError(message)
+            effective, diagnostic = _quarantine_texture_binding(
+                effective,
+                material,
+                "preview_receipt_not_production_capable",
+                message,
+            )
+            material_diagnostics.append(diagnostic)
+            origin_state = ""
         if origin_state == "canonical_t":
             effective["texture_contract_status"] = (
                 ATLAS_CANONICAL_TEXTURE_STATUS
@@ -3214,17 +3731,51 @@ def preflight_speedtree_material_texture_contracts(
                 )
         if strict_contract and effective is None:
             reason = "missing" if not existing else "ambiguous"
-            raise RuntimeError(
+            message = (
                 "SpeedTree material-intent texture binding is "
                 f"{reason} before material mutation: {material.name}"
             )
-        cluster_proof = _speedtree_preserved_cluster_sources(
-            source_fbx,
-            material,
-            stmat_cache[source_key],
-            expected_binding=effective,
-        )
-        if effective is None and cluster_proof is not None:
+            if not runtime_tolerant:
+                raise RuntimeError(message)
+            effective, diagnostic = _quarantine_texture_binding(
+                None,
+                material,
+                f"{reason}_material_texture_binding",
+                message,
+            )
+            if reason == "missing" and not material_diagnostics:
+                effective["allow_local_search"] = True
+            material_diagnostics.append(diagnostic)
+        try:
+            cluster_proof = _speedtree_preserved_cluster_sources(
+                source_fbx,
+                material,
+                stmat_cache[source_key],
+                expected_binding=effective,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            if not runtime_tolerant:
+                raise
+            cluster_proof = None
+            material_diagnostics.append(
+                _texture_diagnostic(
+                    material,
+                    "cluster_texture_receipt_rejected",
+                    str(exc),
+                    severity="info",
+                )
+            )
+        if (
+            (
+                effective is None
+                or (
+                    runtime_tolerant
+                    and effective.get("status") == "unassigned"
+                    and effective.get("allow_local_search")
+                )
+            )
+            and cluster_proof is not None
+        ):
             effective = {
                 "material": material.name,
                 "material_key": material_key,
@@ -3243,19 +3794,32 @@ def preflight_speedtree_material_texture_contracts(
             == ATLAS_BLENDER_CLUSTER_BAKE_STATUS
         ):
             if cluster_proof is None:
-                raise RuntimeError(
+                message = (
                     "Blender Cluster bake binding does not match the exact "
                     "STMAT material/map-slot/path/hash receipt before material "
                     "mutation: "
                     + material.name
                 )
-            effective["origin_receipt"] = dict(
-                cluster_proof["origin_receipt"]
-            )
-            effective["source_paths"] = dict(cluster_proof["source_maps"])
-            effective["source_roles"] = sorted(
-                cluster_proof["source_maps"]
-            )
+                if not runtime_tolerant:
+                    raise RuntimeError(message)
+                effective, diagnostic = _quarantine_texture_binding(
+                    effective,
+                    material,
+                    "cluster_texture_receipt_mismatch",
+                    message,
+                    severity="info",
+                )
+                material_diagnostics.append(diagnostic)
+            else:
+                effective["origin_receipt"] = dict(
+                    cluster_proof["origin_receipt"]
+                )
+                effective["source_paths"] = dict(
+                    cluster_proof["source_maps"]
+                )
+                effective["source_roles"] = sorted(
+                    cluster_proof["source_maps"]
+                )
         elif (
             effective is not None
             and effective.get("texture_source_mode")
@@ -3277,12 +3841,22 @@ def preflight_speedtree_material_texture_contracts(
             == ATLAS_SOURCE_FALLBACK_STATUS
             and not _has_authoritative_fallback_evidence(effective)
         ):
-            raise RuntimeError(
+            message = (
                 "Provisional SpeedTree binding lacks authoritative original "
                 "root or structured Atlas manifest evidence before material "
                 "mutation: "
                 + material.name
             )
+            if not runtime_tolerant:
+                raise RuntimeError(message)
+            effective, diagnostic = _quarantine_texture_binding(
+                effective,
+                material,
+                "provisional_texture_evidence_missing",
+                message,
+                severity="info",
+            )
+            material_diagnostics.append(diagnostic)
         if (
             effective is not None
             and effective.get("texture_source_mode")
@@ -3298,23 +3872,31 @@ def preflight_speedtree_material_texture_contracts(
                 stmat_cache[source_key],
             )
             if declared is None:
-                raise RuntimeError(
+                message = (
                     "SpeedTree declared texture sources are stale before "
                     "material mutation: "
                     + material.name
                 )
-            effective["declared_source_receipt"] = declared
+                if not runtime_tolerant:
+                    raise RuntimeError(message)
+                effective, diagnostic = _quarantine_texture_binding(
+                    effective,
+                    material,
+                    "declared_texture_sources_stale",
+                    message,
+                    severity="info",
+                )
+                material_diagnostics.append(diagnostic)
+            else:
+                effective["declared_source_receipt"] = declared
         if (
             effective is not None
             and effective.get("texture_source_mode")
             == "managed_texture_set"
         ):
-            if effective.get("status") != "ok":
-                raise RuntimeError(
-                    "SpeedTree managed texture binding is unresolved before "
-                    "material mutation: "
-                    + material.name
-                )
+            live_files = {}
+            stale_roles = []
+            unsafe_roles = []
             for role in SPEEDTREE_TEXTURE_ROLES:
                 file_path = Path(
                     str((effective.get("files") or {}).get(role) or "")
@@ -3326,12 +3908,68 @@ def preflight_speedtree_material_texture_contracts(
                     )
                 except OSError:
                     ready = False
-                if not ready:
+                blocked_parts = _blocked_atlas_texture_path(file_path)
+                if ready and not blocked_parts:
+                    live_files[role] = str(file_path)
+                else:
+                    stale_roles.append(role)
+                    if blocked_parts:
+                        unsafe_roles.append(role)
+            if (
+                effective.get("status") != "ok"
+                or stale_roles
+            ):
+                message = (
+                    "SpeedTree managed texture binding is incomplete before "
+                    f"material mutation: {material.name}; missing="
+                    + ",".join(stale_roles)
+                )
+                if not runtime_tolerant:
+                    if effective.get("status") != "ok":
+                        raise RuntimeError(
+                            "SpeedTree managed texture binding is unresolved before "
+                            "material mutation: "
+                            + material.name
+                        )
                     raise RuntimeError(
                         "SpeedTree managed texture binding is stale before "
-                        f"material mutation: {material.name} {role}"
+                        f"material mutation: {material.name} {stale_roles[0]}"
                     )
+                effective["files"] = live_files
+                effective["available_roles"] = sorted(live_files)
+                effective["missing_roles"] = sorted(stale_roles)
+                effective["status"] = (
+                    "partial" if live_files else "unassigned"
+                )
+                effective["binding_disposition"] = (
+                    "bind_available"
+                    if live_files
+                    else "leave_unassigned"
+                )
+                effective["allow_local_search"] = not bool(live_files)
+                diagnostic = _texture_diagnostic(
+                    material,
+                    "unsafe_texture_path_quarantined"
+                    if unsafe_roles
+                    else "partial_texture_binding"
+                    if live_files
+                    else "unassigned_texture_binding",
+                    message,
+                    severity="info",
+                    unsafe_roles=unsafe_roles,
+                )
+                material_diagnostics.append(diagnostic)
+            elif runtime_tolerant:
+                effective["files"] = live_files
+                effective["available_roles"] = sorted(live_files)
+                effective["missing_roles"] = []
+                effective["binding_disposition"] = "bind_available"
         if effective is not None:
+            if (
+                runtime_tolerant
+                and effective.get("status") == "unassigned"
+            ):
+                effective.setdefault("allow_local_search", True)
             effective["material"] = material.name
             effective["material_key"] = material_key
             effective["origin_state"] = str(
@@ -3345,6 +3983,7 @@ def preflight_speedtree_material_texture_contracts(
             if status:
                 overlay_statuses.add(status)
             normalized_by_material[material_key] = effective
+        diagnostics.extend(material_diagnostics)
         reports.append({
             "material": material.name,
             "source_fbx": source_fbx,
@@ -3354,6 +3993,11 @@ def preflight_speedtree_material_texture_contracts(
             "texture_contract_status": (
                 (effective or {}).get("texture_contract_status", "")
             ),
+            "status": (effective or {}).get("status", "unassigned"),
+            "binding_disposition": (effective or {}).get(
+                "binding_disposition", "leave_unassigned"
+            ),
+            "diagnostics": material_diagnostics,
         })
     normalized_contract = dict(texture_contract or {})
     normalized_contract["bindings"] = [
@@ -3371,21 +4015,41 @@ def preflight_speedtree_material_texture_contracts(
     normalized_contract[
         "material_texture_preflight"
     ] = reports
+    normalized_contract["texture_diagnostics"] = diagnostics
+    normalized_contract["texture_warnings"] = [
+        row for row in diagnostics if row.get("severity") == "warning"
+    ]
+    report_states = {str(row.get("status") or "") for row in reports}
+    texture_outcome = (
+        "partial"
+        if "partial" in report_states
+        else "unassigned"
+        if report_states & {"unassigned", "missing"}
+        else "complete"
+    )
+    normalized_contract["texture_outcome"] = texture_outcome
+    if runtime_tolerant:
+        normalized_contract["status"] = "ok"
     return {
+        # Texture availability is an output dimension, never an operation
+        # result.  Keeping the operation successful prevents this field from
+        # becoming another downstream admission checkpoint.
         "status": "ok",
+        "texture_outcome": texture_outcome,
         "strict_speedtree_pipeline_contract": strict_contract,
         "materials": reports,
+        "diagnostics": diagnostics,
+        "warnings": [
+            row for row in diagnostics
+            if row.get("severity") == "warning"
+        ],
+        "blocking": [],
         "texture_contract": normalized_contract,
     }
 
 
 def normalize_speedtree_material_textures(objects, texture_contract=None):
-    """Replace SpeedTree FBX dummy images with PCG texture-batch T_ outputs.
-
-    Matching is material-set based (M_x -> T_x) and requires the complete six-map
-    output contract. Missing sets are reported and left without dummy image nodes
-    so a later Unreal push can fail cleanly instead of consuming FBX placeholders.
-    """
+    """Wire only safe available textures and leave unresolved roles unassigned."""
     if not (
         isinstance(texture_contract, dict)
         and texture_contract.get("atlas_manifest_prevalidated")
@@ -3408,6 +4072,9 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
     strict_contract = bool(
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
+    )
+    runtime_tolerant = _runtime_tolerant_texture_contract(
+        texture_contract
     )
     if isinstance(texture_contract, dict):
         contract_status = str(texture_contract.get("status") or "")
@@ -3462,7 +4129,7 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 candidates = candidates[:1]
         return candidates
 
-    if strict_contract:
+    if strict_contract and not runtime_tolerant:
         # Preflight already proved every file/receipt.  Downstream consumes the
         # normalized binding only and never reclassifies provenance.
         for material in materials:
@@ -3517,6 +4184,29 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
     for material in materials:
         source_fbx = str(material.get("codex_source_fbx", "")).strip()
         if not source_fbx:
+            if runtime_tolerant:
+                removed = _remove_speedtree_image_nodes(material)
+                removed_dummy_images.update(removed)
+                metadata_cleared = (
+                    _clear_speedtree_texture_binding_properties(material)
+                )
+                rows.append(
+                    {
+                        "material": material.name,
+                        "texture_dirs": [],
+                        "texture_attempts": [],
+                        "matched_texture_bases": [],
+                        "missing_roles": list(SPEEDTREE_TEXTURE_ROLES),
+                        "match_source": "none",
+                        "status": "unassigned",
+                        "binding_disposition": "leave_unassigned",
+                        "reason": "missing_source_fbx_identity",
+                        "diagnostic_codes": [
+                            "missing_source_fbx_identity"
+                        ],
+                        "changed": bool(removed) or metadata_cleared,
+                    }
+                )
             continue
         source_key = normalized_source_fbx_path(source_fbx)
         if source_key not in stmat_cache:
@@ -3554,12 +4244,15 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
             binding_candidates[0] if len(binding_candidates) == 1 else None
         )
         contract_blocked = len(binding_candidates) > 1 or (
-            strict_contract and not binding_candidates
+            strict_contract
+            and not runtime_tolerant
+            and not binding_candidates
         )
         contract_reason = "ambiguous_material_binding" if contract_blocked else ""
         if strict_contract and not binding_candidates:
             contract_reason = "missing_material_intent_binding"
         stale_roles = []
+        unsafe_roles = []
         referenced_set = None
         source_mode = str(
             (contract_binding or {}).get("texture_source_mode") or ""
@@ -3567,17 +4260,29 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         provisional_manifest_binding = (
             contract_binding
             if (
-                contract_binding or {}
-            ).get("texture_contract_status")
-            == ATLAS_SOURCE_FALLBACK_STATUS
+                (contract_binding or {}).get("texture_contract_status")
+                == ATLAS_SOURCE_FALLBACK_STATUS
+                and (contract_binding or {}).get("status")
+                != "unassigned"
+                and (contract_binding or {}).get(
+                    "binding_disposition"
+                )
+                != "leave_unassigned"
+            )
             else None
         )
         cluster_manifest_binding = (
             contract_binding
             if (
-                contract_binding or {}
-            ).get("texture_contract_status")
-            == ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+                (contract_binding or {}).get("texture_contract_status")
+                == ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+                and (contract_binding or {}).get("status")
+                != "unassigned"
+                and (contract_binding or {}).get(
+                    "binding_disposition"
+                )
+                != "leave_unassigned"
+            )
             else None
         )
         if cluster_manifest_binding is not None:
@@ -3638,11 +4343,29 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 == ATLAS_SOURCE_FALLBACK_STATUS
                 and material_texture_signature(material)
                 == tuple(sorted(target_paths))
-            )
-            if not already_normalized:
-                _replace_speedtree_provisional_material_nodes(
-                    material, texture_files
+                and (
+                    not runtime_tolerant
+                    or _speedtree_material_images_decodable(material)
                 )
+            )
+            load_result = {
+                "loaded_roles": sorted(texture_files),
+                "failed_roles": [],
+                "load_errors": {},
+            }
+            if not already_normalized:
+                load_result = _replace_speedtree_provisional_material_nodes(
+                    material,
+                    texture_files,
+                    tolerate_load_errors=runtime_tolerant,
+                )
+                texture_files = {
+                    role: path
+                    for role, path in texture_files.items()
+                    if role in load_result["loaded_roles"]
+                }
+            metadata_cleared = False
+            if texture_files:
                 material[
                     "codex_speedtree_texture_contract_status"
                 ] = ATLAS_SOURCE_FALLBACK_STATUS
@@ -3659,6 +4382,11 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 ] = provisional_manifest_binding.get(
                     "manifest_path", ""
                 )
+            else:
+                metadata_cleared = (
+                    _clear_speedtree_texture_binding_properties(material)
+                )
+            failed_roles = list(load_result["failed_roles"])
             rows.append(
                 {
                     "material": material.name,
@@ -3694,8 +4422,39 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                         "manifest_path", ""
                     ),
                     "match_source": "atlas_import_manifest",
-                    "status": "needs_pcg_generation",
-                    "changed": not already_normalized,
+                    "status": (
+                        "needs_pcg_generation"
+                        if texture_files
+                        else "unassigned"
+                    ),
+                    "binding_disposition": (
+                        "bind_available"
+                        if texture_files
+                        else "leave_unassigned"
+                    ),
+                    "files": {
+                        role: str(path)
+                        for role, path in texture_files.items()
+                    },
+                    "available_roles": sorted(texture_files),
+                    "missing_roles": sorted(
+                        set(failed_roles)
+                        | (
+                            set(SPEEDTREE_TEXTURE_ROLES)
+                            - set(texture_files)
+                        )
+                    ),
+                    "texture_load_errors": dict(
+                        load_result["load_errors"]
+                    ),
+                    "diagnostic_codes": (
+                        ["texture_image_load_failed"]
+                        if failed_roles
+                        else []
+                    ),
+                    "changed": (
+                        not already_normalized or metadata_cleared
+                    ),
                 }
             )
             continue
@@ -3736,36 +4495,69 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
             contract_blocked = True
             contract_reason = "declared_sources_missing"
             stale_roles = ["declared_source"]
-        elif contract_binding and contract_binding.get("status") == "ok":
-            contract_files = {
-                role: Path(str((contract_binding.get("files") or {}).get(role) or ""))
-                for role in SPEEDTREE_TEXTURE_ROLES
-            }
+        elif contract_binding and contract_binding.get("status") in {
+            "ok",
+            "partial",
+        }:
+            contract_files = {}
             stale_roles = []
-            for role, path in contract_files.items():
+            unsafe_contract_roles = []
+            for role in SPEEDTREE_TEXTURE_ROLES:
+                path = Path(
+                    str(
+                        (contract_binding.get("files") or {}).get(role)
+                        or ""
+                    )
+                )
                 try:
-                    if not path.is_file() or path.stat().st_size <= 0:
-                        stale_roles.append(role)
+                    ready = path.is_file() and path.stat().st_size > 0
                 except OSError:
+                    ready = False
+                blocked_parts = _blocked_atlas_texture_path(path)
+                if ready and not blocked_parts:
+                    contract_files[role] = path
+                else:
                     stale_roles.append(role)
-            if stale_roles:
+                    if blocked_parts:
+                        unsafe_contract_roles.append(role)
+            unsafe_roles = list(unsafe_contract_roles)
+            if stale_roles and not runtime_tolerant:
                 contract_blocked = True
                 contract_reason = "contract_files_missing"
-            else:
+            elif contract_files:
                 referenced_set = {
                     "texture_dir": contract_binding.get("texture_dir", ""),
                     "texture_base": contract_binding.get("texture_base", ""),
                     "files": contract_files,
                     "stmat_roles": contract_binding.get("stmat_roles", []),
+                    "missing_roles": stale_roles,
+                    "unsafe_roles": unsafe_contract_roles,
                 }
+            else:
+                contract_blocked = not bool(
+                    runtime_tolerant
+                    and contract_binding.get("allow_local_search")
+                )
+                contract_reason = (
+                    "unsafe_texture_path_quarantined"
+                    if unsafe_contract_roles
+                    else "contract_files_unassigned"
+                )
         elif contract_binding and contract_binding.get("status") != "not_managed":
-            contract_blocked = True
+            contract_blocked = not bool(
+                runtime_tolerant
+                and contract_binding.get("allow_local_search")
+            )
             contract_reason = str(
                 contract_binding.get("status") or "contract_binding_incomplete"
             )
             stale_roles = list(contract_binding.get("missing_roles") or [])
 
-        if referenced_set is None and not contract_blocked and not strict_contract:
+        if (
+            referenced_set is None
+            and not contract_blocked
+            and (not strict_contract or runtime_tolerant)
+        ):
             referenced_set = _speedtree_stmat_texture_set(
                 source_fbx, material, stmat_data
             )
@@ -3780,6 +4572,7 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         missing_roles = list(SPEEDTREE_TEXTURE_ROLES)
         texture_base = expected_base
         texture_files = {}
+        texture_file_candidates = {}
         ambiguity = []
         texture_dir = texture_dirs[0] if texture_dirs else _speedtree_texture_dir(source_fbx)
         attempts = []
@@ -3805,10 +4598,27 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 }
             )
         elif referenced_set:
-            texture_dir = Path(referenced_set["texture_dir"])
+            texture_dir_value = str(
+                referenced_set.get("texture_dir") or ""
+            )
+            texture_dir = (
+                Path(texture_dir_value)
+                if texture_dir_value
+                else Path(next(iter(referenced_set["files"].values()))).parent
+            )
             texture_base = referenced_set["texture_base"]
             texture_files = dict(referenced_set["files"])
-            missing_roles = []
+            texture_file_candidates = dict(
+                referenced_set.get("file_candidates") or {}
+            )
+            missing_roles = list(
+                referenced_set.get("missing_roles") or [
+                    role
+                    for role in SPEEDTREE_TEXTURE_ROLES
+                    if role not in texture_files
+                ]
+            )
+            unsafe_roles = list(referenced_set.get("unsafe_roles") or [])
             ambiguity = [texture_base]
             match_source = (
                 "atlas_import_manifest"
@@ -3826,51 +4636,169 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 {
                     "texture_dir": str(texture_dir),
                     "matched_texture_bases": [texture_base],
-                    "missing_roles": [],
+                    "missing_roles": missing_roles,
                     "match_source": match_source,
                 }
             )
-        elif not strict_contract:
+        elif not strict_contract or runtime_tolerant:
+            usable_attempts = []
             for candidate_dir in texture_dirs:
+                blocked_parts = _blocked_atlas_texture_path(candidate_dir)
+                if blocked_parts:
+                    attempts.append(
+                        {
+                            "texture_dir": str(candidate_dir),
+                            "matched_texture_bases": [],
+                            "missing_roles": list(SPEEDTREE_TEXTURE_ROLES),
+                            "match_source": match_source,
+                            "reason": "unsafe_texture_root",
+                            "blocked_path_parts": blocked_parts,
+                        }
+                    )
+                    continue
                 cache_key = os.path.normcase(str(candidate_dir))
                 if cache_key not in texture_index_cache:
-                    texture_index_cache[cache_key] = _speedtree_texture_sets(candidate_dir)
+                    texture_index_cache[cache_key] = _speedtree_texture_sets(
+                        candidate_dir
+                    )
                 match = texture_index_cache[cache_key].get(key)
-                candidate_bases = sorted(match["bases"], key=str.casefold) if match else []
-                candidate_files = dict(match["files"]) if match and len(candidate_bases) == 1 else {}
+                candidate_bases = (
+                    sorted(match["bases"], key=str.casefold)
+                    if match
+                    else []
+                )
+                candidate_file_options = (
+                    {
+                        role: [
+                            path
+                            for path in paths
+                            if not _blocked_atlas_texture_path(path)
+                        ]
+                        for role, paths in (
+                            match.get("file_candidates", {})
+                        ).items()
+                    }
+                    if match and len(candidate_bases) == 1
+                    else {}
+                )
+                candidate_file_options = {
+                    role: paths
+                    for role, paths in candidate_file_options.items()
+                    if paths
+                }
+                candidate_files = {
+                    role: paths[0]
+                    for role, paths in candidate_file_options.items()
+                }
                 candidate_missing = [
-                    role for role in SPEEDTREE_TEXTURE_ROLES if role not in candidate_files
+                    role
+                    for role in SPEEDTREE_TEXTURE_ROLES
+                    if role not in candidate_files
                 ]
                 attempt = {
                     "texture_dir": str(candidate_dir),
                     "matched_texture_bases": candidate_bases,
                     "missing_roles": candidate_missing,
+                    "files": {
+                        role: str(path)
+                        for role, path in candidate_files.items()
+                    },
+                    "file_candidates": {
+                        role: [str(path) for path in paths]
+                        for role, paths in candidate_file_options.items()
+                    },
                     "match_source": match_source,
                 }
                 attempts.append(attempt)
-                if best_attempt is None or len(candidate_missing) < len(best_attempt["missing_roles"]):
-                    best_attempt = attempt
-                if len(candidate_bases) == 1 and not candidate_missing:
+                if candidate_files and len(candidate_bases) == 1:
+                    usable_attempts.append(attempt)
+                if (
+                    not runtime_tolerant
+                    and len(candidate_bases) == 1
+                    and not candidate_missing
+                ):
                     texture_dir = candidate_dir
                     texture_base = candidate_bases[0]
                     texture_files = candidate_files
                     missing_roles = []
                     ambiguity = candidate_bases
                     break
-            else:
-                if best_attempt:
+            if runtime_tolerant and usable_attempts:
+                best_missing_count = min(
+                    len(row["missing_roles"])
+                    for row in usable_attempts
+                )
+                best_rows = [
+                    row for row in usable_attempts
+                    if len(row["missing_roles"]) == best_missing_count
+                ]
+                signatures = {
+                    tuple(
+                        sorted(
+                            (role, _path_identity(path))
+                            for role, path in row["files"].items()
+                        )
+                    )
+                    for row in best_rows
+                }
+                if len(signatures) == 1:
+                    best_attempt = best_rows[0]
                     texture_dir = Path(best_attempt["texture_dir"])
-                    ambiguity = best_attempt["matched_texture_bases"]
-                    missing_roles = best_attempt["missing_roles"]
+                    texture_base = best_attempt[
+                        "matched_texture_bases"
+                    ][0]
+                    texture_files = {
+                        role: Path(path)
+                        for role, path in best_attempt["files"].items()
+                    }
+                    texture_file_candidates = dict(
+                        best_attempt.get("file_candidates") or {}
+                    )
+                    ambiguity = [texture_base]
+                    missing_roles = list(best_attempt["missing_roles"])
+                else:
+                    contract_blocked = True
+                    contract_reason = "ambiguous_local_texture_candidates"
+                    ambiguity = sorted(
+                        {
+                            base
+                            for row in best_rows
+                            for base in row["matched_texture_bases"]
+                        },
+                        key=str.casefold,
+                    )
+            elif not texture_files and attempts:
+                best_attempt = min(
+                    attempts,
+                    key=lambda row: len(row.get("missing_roles") or []),
+                )
+                texture_dir = Path(best_attempt["texture_dir"])
+                ambiguity = best_attempt["matched_texture_bases"]
+                missing_roles = best_attempt["missing_roles"]
         else:
             contract_blocked = True
             contract_reason = contract_reason or "material_intent_binding_unresolved"
             missing_roles = stale_roles or ["texture_binding"]
             match_source = "speedtree_material_intent"
 
-        if contract_blocked or missing_roles or len(ambiguity) > 1:
+        unresolved_runtime = runtime_tolerant and (
+            contract_blocked
+            or not texture_files
+            or len(ambiguity) > 1
+        )
+        strict_missing = (
+            not runtime_tolerant
+            and (contract_blocked or missing_roles or len(ambiguity) > 1)
+        )
+        if unresolved_runtime or strict_missing:
             removed = _remove_speedtree_image_nodes(material)
             removed_dummy_images.update(removed)
+            metadata_cleared = False
+            if runtime_tolerant:
+                metadata_cleared = (
+                    _clear_speedtree_texture_binding_properties(material)
+                )
+            row_status = "unassigned" if runtime_tolerant else "missing"
             rows.append(
                 {
                     "material": material.name,
@@ -3881,8 +4809,14 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                     "matched_texture_bases": ambiguity,
                     "missing_roles": missing_roles,
                     "match_source": match_source,
-                    "status": "missing",
-                    "changed": bool(removed),
+                    "status": row_status,
+                    "binding_disposition": "leave_unassigned",
+                    "reason": contract_reason or "no_safe_texture_candidate",
+                    "unsafe_roles": unsafe_roles,
+                    "diagnostic_codes": [
+                        contract_reason or "no_safe_texture_candidate"
+                    ],
+                    "changed": bool(removed) or metadata_cleared,
                 }
             )
             continue
@@ -3891,17 +4825,41 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         # node tree unconditionally; skip materials already wired to exactly
         # this texture set so callers can tell nothing was mutated.
         target_paths = set()
-        for role in SPEEDTREE_TEXTURE_ROLES:
+        for role, texture_path in texture_files.items():
             try:
-                target_paths.add(str(Path(texture_files[role]).resolve()).lower())
+                target_paths.add(str(Path(texture_path).resolve()).lower())
             except (OSError, ValueError):
-                target_paths.add(str(texture_files[role]).lower())
+                target_paths.add(str(texture_path).lower())
         already_normalized = (
             str(material.get("codex_speedtree_texture_base", "")) == texture_base
             and material_texture_signature(material) == tuple(sorted(target_paths))
+            and (
+                not runtime_tolerant
+                or _speedtree_material_images_decodable(material)
+            )
         )
+        load_result = {
+            "loaded_roles": sorted(texture_files),
+            "failed_roles": [],
+            "load_errors": {},
+            "selected_files": dict(texture_files),
+        }
         if not already_normalized:
-            _replace_speedtree_material_nodes(material, texture_files)
+            load_result = _replace_speedtree_material_nodes(
+                material,
+                texture_files,
+                tolerate_load_errors=runtime_tolerant,
+                texture_file_candidates=texture_file_candidates,
+            )
+            texture_files = {
+                role: Path(path)
+                for role, path in load_result["selected_files"].items()
+            }
+            missing_roles = sorted(
+                set(missing_roles) | set(load_result["failed_roles"])
+            )
+        metadata_cleared = False
+        if texture_files:
             material["codex_speedtree_texture_base"] = texture_base
             if (
                 (contract_binding or {}).get(
@@ -3915,17 +4873,48 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 material[
                     "codex_speedtree_texture_manifest"
                 ] = contract_binding.get("manifest_path", "")
+        elif runtime_tolerant:
+            metadata_cleared = (
+                _clear_speedtree_texture_binding_properties(material)
+            )
+        row_status = (
+            "unassigned"
+            if not texture_files
+            else "partial"
+            if missing_roles
+            else "ok"
+        )
         rows.append(
             {
                 "material": material.name,
                 "texture_dir": str(texture_dir),
                 "texture_dirs": [str(path) for path in texture_dirs],
                 "texture_base": texture_base,
-                "files": {role: str(texture_files[role]) for role in SPEEDTREE_TEXTURE_ROLES},
-                "missing_roles": [],
+                "files": {
+                    role: str(path)
+                    for role, path in texture_files.items()
+                },
+                "available_roles": sorted(texture_files),
+                "missing_roles": missing_roles,
+                "unsafe_roles": unsafe_roles,
                 "match_source": match_source,
-                "status": "ok",
-                "changed": not already_normalized,
+                "status": row_status,
+                "binding_disposition": (
+                    "bind_available"
+                    if texture_files
+                    else "leave_unassigned"
+                ),
+                "texture_load_errors": dict(
+                    load_result["load_errors"]
+                ),
+                "diagnostic_codes": (
+                    ["texture_image_load_failed"]
+                    if load_result["failed_roles"]
+                    else []
+                ),
+                "changed": (
+                    not already_normalized or metadata_cleared
+                ),
                 "manifest_path": (
                     (contract_binding or {}).get("manifest_path", "")
                 ),
@@ -3937,14 +4926,23 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         if image and image.users == 0:
             bpy.data.images.remove(image)
 
-    missing = [row for row in rows if row["status"] == "missing"]
+    missing = [
+        row for row in rows
+        if row["status"] in {"missing", "partial", "unassigned"}
+    ]
+    partial = [row for row in rows if row["status"] == "partial"]
+    unassigned = [
+        row for row in rows if row["status"] == "unassigned"
+    ]
     preserved_cluster_count = sum(
         1 for row in rows if row["status"] == "preserved_cluster"
     )
     needs_pcg_generation_count = sum(
         1 for row in rows if row["status"] == "needs_pcg_generation"
     )
-    if missing:
+    if runtime_tolerant:
+        status = "ok"
+    elif missing:
         status = "missing"
     elif needs_pcg_generation_count:
         status = "needs_pcg_generation"
@@ -3973,8 +4971,66 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         aggregate_contract_status = ATLAS_BLENDER_CLUSTER_BAKE_STATUS
     else:
         aggregate_contract_status = contract_status
+    normalization_diagnostics = list(
+        texture_contract.get("texture_diagnostics") or []
+    )
+    diagnostic_rows = list(partial) + list(unassigned)
+    diagnostic_rows.extend(
+        row
+        for row in rows
+        if row.get("texture_load_errors")
+        and row not in diagnostic_rows
+    )
+    for row in diagnostic_rows:
+        unsafe = bool(row.get("unsafe_roles")) or any(
+            attempt.get("reason") == "unsafe_texture_root"
+            for attempt in row.get("texture_attempts") or []
+        )
+        load_failed = bool(row.get("texture_load_errors"))
+        code = (
+            "unsafe_texture_path_quarantined"
+            if unsafe
+            else "texture_image_load_failed"
+            if load_failed
+            else str(
+                (row.get("diagnostic_codes") or [row["status"]])[0]
+            )
+        )
+        normalization_diagnostics.append(
+            _texture_diagnostic(
+                row.get("material", ""),
+                code,
+                row.get("reason")
+                or (
+                    "One or more texture files could not be loaded; their "
+                    "parameters remain unassigned"
+                    if load_failed
+                    else "Texture parameters remain partially or wholly unassigned"
+                ),
+                severity=(
+                    "warning" if load_failed else "info"
+                ),
+            )
+        )
+    normalization_warnings = [
+        row for row in normalization_diagnostics
+        if row.get("severity") == "warning"
+    ]
     return {
         "status": status,
+        "texture_outcome": (
+            "partial"
+            if partial
+            else "unassigned"
+            if unassigned or needs_pcg_generation_count
+            else "complete"
+        ),
+        handoff_contract.TEXTURE_CONTRACT_MODE_FIELD: (
+            texture_contract.get(
+                handoff_contract.TEXTURE_CONTRACT_MODE_FIELD,
+                handoff_contract.STRICT_PUBLICATION_TEXTURE_MODE,
+            )
+        ),
         "strict_speedtree_pipeline_contract": strict_contract,
         "texture_contract_status": aggregate_contract_status,
         "texture_contract_statuses": sorted(overlay_contract_statuses),
@@ -3985,6 +5041,11 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
         "texture_contract_paths": manifest_paths,
         "materials": rows,
         "missing": missing,
+        "partial": partial,
+        "unassigned": unassigned,
+        "diagnostics": normalization_diagnostics,
+        "warnings": normalization_warnings,
+        "blocking": [],
         "material_count": len(rows),
         "preserved_cluster_count": preserved_cluster_count,
         "needs_pcg_generation_count": needs_pcg_generation_count,
@@ -4052,16 +5113,51 @@ def rebind_blocked_speedtree_group_variants(objects):
             continue
         group_base = handoff_contract.production_group_base_name(material.name)
         group_key = _speedtree_material_name_key(group_base)
-        candidates = candidates_by_group.get(group_key, [])
+        raw_candidates = candidates_by_group.get(group_key, [])
+        consensus_candidates = {}
+        for candidate in raw_candidates:
+            source_identity = str(
+                candidate.get("source_identity")
+                or candidate.get("source_fbx")
+                or ""
+            ).strip()
+            try:
+                source_key = normalized_source_fbx_path(source_identity)
+            except (OSError, RuntimeError, ValueError):
+                source_key = source_identity.casefold()
+            signature = _speedtree_texture_file_signature(
+                candidate["texture_set"]
+            )
+            consensus_candidates.setdefault(
+                (source_key, signature), candidate
+            )
+        candidates = list(consensus_candidates.values())
         if len(candidates) != 1:
+            before = material_texture_signature(material)
+            removed = _remove_speedtree_image_nodes(material)
+            metadata_cleared = (
+                _clear_speedtree_texture_binding_properties(material)
+            )
             rows.append(
                 {
                     "material": material.name,
-                    "status": "unresolved",
+                    "status": "unassigned",
+                    "binding_disposition": "leave_unassigned",
                     "production_group_base": group_base,
                     "candidate_count": len(candidates),
+                    "raw_candidate_count": len(raw_candidates),
                     "blocked_source_parts": blocked_source,
                     "blocked_image_parts": blocked_images,
+                    "diagnostic_codes": [
+                        "unsafe_texture_path_quarantined"
+                    ],
+                    "message": (
+                        "Unsafe isolated texture paths were removed; no unique "
+                        "safe replacement was available"
+                    ),
+                    "changed": (
+                        bool(removed) or bool(before) or metadata_cleared
+                    ),
                 }
             )
             continue
@@ -4072,35 +5168,117 @@ def rebind_blocked_speedtree_group_variants(objects):
             for role, path in texture_set["files"].items()
         }
         before = material_texture_signature(material)
-        _replace_speedtree_material_nodes(material, texture_files)
-        material["codex_source_fbx"] = candidate["source_fbx"]
-        if candidate["source_identity"]:
-            material["codex_source_identity"] = candidate[
-                "source_identity"
+        load_result = _replace_speedtree_material_nodes(
+            material,
+            texture_files,
+            tolerate_load_errors=True,
+            texture_file_candidates=(
+                texture_set.get("file_candidates") or {}
+            ),
+        )
+        loaded_roles = list(load_result["loaded_roles"])
+        texture_files = {
+            role: Path(path)
+            for role, path in load_result["selected_files"].items()
+        }
+        failed_roles = list(load_result["failed_roles"])
+        missing_roles = sorted(
+            set(texture_set.get("missing_roles") or [])
+            | set(failed_roles)
+        )
+        metadata_cleared = False
+        if loaded_roles:
+            material["codex_source_fbx"] = candidate["source_fbx"]
+            if candidate["source_identity"]:
+                material["codex_source_identity"] = candidate[
+                    "source_identity"
+                ]
+            material["codex_speedtree_texture_base"] = texture_set[
+                "texture_base"
             ]
-        material["codex_speedtree_texture_base"] = texture_set[
-            "texture_base"
-        ]
+        else:
+            metadata_cleared = (
+                _clear_speedtree_texture_binding_properties(material)
+            )
+        row_status = (
+            "rebound"
+            if not missing_roles
+            else "partial"
+            if loaded_roles
+            else "unassigned"
+        )
         rows.append(
             {
                 "material": material.name,
-                "status": "rebound",
+                "status": row_status,
+                "binding_disposition": (
+                    "bind_available"
+                    if loaded_roles
+                    else "leave_unassigned"
+                ),
                 "production_group_base": group_base,
                 "canonical_material": candidate["material"].name,
                 "texture_base": texture_set["texture_base"],
                 "source_fbx": candidate["source_fbx"],
-                "changed": before != material_texture_signature(material),
+                "available_roles": loaded_roles,
+                "missing_roles": missing_roles,
+                "texture_load_errors": dict(
+                    load_result["load_errors"]
+                ),
+                "diagnostic_codes": (
+                    ["texture_image_load_failed"]
+                    if failed_roles
+                    else ["texture_roles_unassigned"]
+                    if missing_roles
+                    else []
+                ),
+                "warning": (
+                    "One or more safe replacement textures could not be "
+                    "loaded; those parameters remain unassigned"
+                    if failed_roles
+                    else ""
+                ),
+                "changed": (
+                    before != material_texture_signature(material)
+                    or metadata_cleared
+                ),
             }
         )
 
-    unresolved = [row for row in rows if row["status"] == "unresolved"]
+    unresolved = [
+        row
+        for row in rows
+        if row["status"] in {"partial", "unassigned"}
+    ]
     return {
-        "status": "blocked" if unresolved else "ok",
+        "status": "ok",
+        "texture_outcome": (
+            "partial"
+            if any(row["status"] == "partial" for row in unresolved)
+            else "unassigned"
+            if unresolved
+            else "complete"
+        ),
         "materials": rows,
         "rebound_count": sum(
             1 for row in rows if row["status"] == "rebound"
         ),
         "unresolved": unresolved,
+        "blocking": [],
+        "warnings": [
+            {
+                "code": (
+                    "texture_image_load_failed"
+                    if row.get("texture_load_errors")
+                    else "unsafe_texture_path_quarantined"
+                ),
+                "severity": "warning",
+                "material": row["material"],
+                "message": row["warning"],
+            }
+            for row in unresolved
+            if row.get("texture_load_errors")
+        ],
     }
 
 
@@ -4153,11 +5331,12 @@ def remap_mesh_materials(mesh, slot_map, new_materials):
     mesh.update()
 
 
-def _consolidate_speedtree_manifest_materials(mesh_objects):
+def _consolidate_speedtree_manifest_materials(
+    mesh_objects, *, runtime_tolerant=False
+):
     """Collapse Atlas Leaf Mesh Builder groups using its persisted manifest contract."""
     stmat_cache = {}
     manifest_cache = {}
-    target_texture_cache = {}
     bindings = {}
     grouped = defaultdict(list)
 
@@ -4177,39 +5356,12 @@ def _consolidate_speedtree_manifest_materials(mesh_objects):
                 material,
                 stmat_data=stmat_cache[source_key],
                 manifest_cache=manifest_cache,
+                # This pass establishes slot/material identity. Texture
+                # availability is handled later and must not authorize or
+                # veto the structural merge.
+                validate_texture_compatibility=False,
+                tolerate_unavailable=runtime_tolerant,
             )
-            if binding:
-                target_key = _speedtree_texture_set_key(binding["target_name"])
-                texture_cache_key = (source_key, target_key)
-                if texture_cache_key not in target_texture_cache:
-                    target_signatures = set()
-                    for texture_dir in _speedtree_material_texture_dirs(
-                        source_fbx, material, stmat_cache[source_key]
-                    ):
-                        target_match = _speedtree_texture_sets(texture_dir).get(
-                            target_key
-                        )
-                        if not (
-                            target_match
-                            and len(target_match["bases"]) == 1
-                            and all(
-                                role in target_match["files"]
-                                for role in SPEEDTREE_TEXTURE_ROLES
-                            )
-                        ):
-                            continue
-                        target_signatures.add(
-                            _speedtree_texture_file_signature(target_match)
-                        )
-                    target_signatures.discard(())
-                    target_texture_cache[texture_cache_key] = (
-                        len(target_signatures) == 1
-                    )
-                # The manifest describes the intended atlas relationship, but
-                # older assets may still only have group-specific T_ outputs.
-                # Do not create a new missing set by renaming those materials.
-                if not target_texture_cache[texture_cache_key]:
-                    binding = None
             bindings[material] = binding
             if binding:
                 group_key = (
@@ -4285,10 +5437,27 @@ def _consolidate_speedtree_manifest_materials(mesh_objects):
             obj.data = obj.data.copy()
         mesh = obj.data
         old_materials = list(mesh.materials)
+        slot_groups = {}
+        if any(material is None for material in old_materials):
+            # Preserve authored empty slots and their polygon assignments so
+            # the structural validator can report them. Only replace slots
+            # whose manifest identity was proven.
+            for old_index, material in enumerate(old_materials):
+                group_target = material_targets.get(material)
+                if group_target:
+                    mesh.materials[old_index] = group_target[1]
+                    slot_groups[old_index] = group_target[0]
+            for poly in mesh.polygons:
+                group_key = slot_groups.get(poly.material_index)
+                if group_key:
+                    group_stats[group_key]["changed_faces"] += 1
+            for group_key in set(slot_groups.values()):
+                group_stats[group_key]["objects"].add(obj.name)
+            continue
+
         slot_map = {}
         new_materials = []
         new_indices = {}
-        slot_groups = {}
         for old_index, material in enumerate(old_materials):
             group_target = material_targets.get(material)
             replacement = group_target[1] if group_target else material
@@ -4333,46 +5502,73 @@ def _consolidate_speedtree_manifest_materials(mesh_objects):
     }
 
 
-def _strict_consolidation_binding_signature(material, texture_contract):
+def _strict_consolidation_intent_signature(material, texture_contract):
+    """Return exact structural proof for one production-group material.
+
+    Texture availability is intentionally absent.  A strict envelope may
+    authorize consolidation only when this exact Blender material has one
+    unambiguous intent and its production-group identity and Unreal semantics
+    agree.
+    """
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        return ()
+    api = handoff_contract.central_contract_api()
+    material_key = api.normalize_material_key(material.name)
     candidates = [
-        binding
-        for binding in (texture_contract.get("bindings") or [])
-        if isinstance(binding, dict)
-        and _speedtree_material_name_key(binding.get("material"))
-        == _speedtree_material_name_key(material.name)
+        row
+        for row in (envelope.get("material_intents") or [])
+        if isinstance(row, dict)
+        and api.normalize_material_key(row.get("material_key")) == material_key
     ]
-    signatures = set()
-    for binding in candidates:
-        if (
-            str(binding.get("texture_source_mode") or "")
-            != "managed_texture_set"
-            or str(binding.get("status") or "") != "ok"
-        ):
-            continue
-        files = binding.get("files") or {}
-        file_signature = _speedtree_texture_file_signature({"files": files})
-        if not file_signature:
-            continue
-        ready = True
-        for role in SPEEDTREE_TEXTURE_ROLES:
-            try:
-                path = Path(str(files.get(role) or ""))
-                if not path.is_file() or path.stat().st_size <= 0:
-                    ready = False
-                    break
-            except OSError:
-                ready = False
-                break
-        if not ready:
-            continue
-        signatures.add(
-            (
-                str(binding.get("set_key") or "").casefold(),
-                str(binding.get("texture_base") or "").casefold(),
-                file_signature,
-            )
-        )
-    return next(iter(signatures)) if len(signatures) == 1 else ()
+    if len(candidates) != 1:
+        return ()
+    intent = candidates[0]
+    computed_base = api.production_group_base_name(material.name)
+    group_tokens = api.production_group_tokens(material.name)
+    recorded_base = str(intent.get("production_group_base") or "").strip()
+    if (
+        not computed_base
+        or not group_tokens
+        or api.normalize_material_key(recorded_base)
+        != api.normalize_material_key(computed_base)
+    ):
+        return ()
+    return (
+        api.normalize_material_key(computed_base),
+        str(intent.get("tree_part") or ""),
+        str(intent.get("tree_shading") or ""),
+        str(intent.get("instance_profile") or ""),
+    )
+
+
+def _strict_numeric_material_intent_signature(material, texture_contract):
+    """Return exact semantic proof for a Blender ``.001`` collision.
+
+    Numeric suffixes are not production-group tokens, so they need a smaller
+    exact-intent proof than production-group consolidation. Texture fields are
+    deliberately excluded.
+    """
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        return ()
+    api = handoff_contract.central_contract_api()
+    material_key = api.normalize_material_key(material.name)
+    candidates = [
+        row
+        for row in (envelope.get("material_intents") or [])
+        if isinstance(row, dict)
+        and api.normalize_material_key(row.get("material_key")) == material_key
+    ]
+    if len(candidates) != 1:
+        return ()
+    intent = candidates[0]
+    return (
+        material_key,
+        str(intent.get("tree_part") or ""),
+        str(intent.get("tree_shading") or ""),
+        str(intent.get("instance_profile") or ""),
+    )
 
 
 def _blender_numeric_material_base(value):
@@ -4396,21 +5592,27 @@ def _numeric_material_equivalence(left, right, texture_contract):
     right_source = normalized_source_fbx_path(
         right.get("codex_source_fbx", "")
     )
-    if left_source and left_source == right_source:
-        return "source_fbx"
+    if (left_source or right_source) and left_source != right_source:
+        # A same-named datablock left behind by another imported tree is never
+        # a canonical target for this source, even when its semantic intent
+        # happens to match.
+        return ""
 
     if (
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
     ):
-        left_binding = _strict_consolidation_binding_signature(
+        left_binding = _strict_numeric_material_intent_signature(
             left, texture_contract
         )
-        right_binding = _strict_consolidation_binding_signature(
+        right_binding = _strict_numeric_material_intent_signature(
             right, texture_contract
         )
         if left_binding and left_binding == right_binding:
             return "strict_texture_contract"
+
+    if left_source and left_source == right_source:
+        return "source_fbx"
 
     left_textures = material_texture_signature(left)
     right_textures = material_texture_signature(right)
@@ -4661,10 +5863,13 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
     manifest_result = (
         {"groups": [], "changed_object_count": 0, "changed_face_count": 0}
         if strict_contract
-        else _consolidate_speedtree_manifest_materials(mesh_objects)
+        else _consolidate_speedtree_manifest_materials(
+            mesh_objects,
+            runtime_tolerant=_runtime_tolerant_texture_contract(
+                texture_contract
+            ),
+        )
     )
-    stmat_cache = {}
-    texture_index_cache = {}
     skipped_groups = list(numeric_result["skipped_groups"])
 
     grouped = defaultdict(list)
@@ -4678,13 +5883,21 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                 material.get("codex_source_fbx", "") if material else ""
             )
             texture_signature = material_texture_signature(material)
-            if source_key:
-                provenance = ("source_fbx", source_key)
-            elif texture_signature:
-                provenance = ("texture_signature", texture_signature)
+            if strict_contract:
+                intent_signature = _strict_consolidation_intent_signature(
+                    material, texture_contract
+                )
+                if not intent_signature:
+                    continue
+                provenance = (
+                    "material_intent",
+                    (source_key, intent_signature),
+                )
             else:
-                # A parsed suffix is metadata only; without provenance it does
-                # not authorize merging materials by name.
+                # Legacy/name-only metadata cannot prove that two variant
+                # slots share one structural material identity.  A validated
+                # import manifest was handled above; otherwise leave the
+                # variants intact and let the pipeline continue.
                 continue
             grouped[(provenance, base_name)].append(
                 (obj, slot_index, material, group_token)
@@ -4708,72 +5921,51 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
         target_name = unified_material_name(base_name, source_materials)
         if strict_contract:
-            binding_signatures = [
-                _strict_consolidation_binding_signature(
-                    material, texture_contract
-                )
-                for material in source_materials
-            ]
-            binding_ready = bool(
-                all(binding_signatures)
-                and len(set(binding_signatures)) == 1
+            target_intent = handoff_contract.resolve_material_intent(
+                target_name,
+                texture_contract["speedtree_pipeline_contract"],
             )
-            readiness_mode = "strict_texture_contract"
+            expected_semantics = tuple(provenance_value[1][1:])
+            target_semantics = (
+                str((target_intent or {}).get("tree_part") or ""),
+                str((target_intent or {}).get("tree_shading") or ""),
+                str((target_intent or {}).get("instance_profile") or ""),
+            )
+            if target_intent is None or target_semantics != expected_semantics:
+                raise RuntimeError(
+                    "SpeedTree production-group target intent conflicts with "
+                    f"its source variants: {target_name}"
+                )
+        readiness_mode = provenance_type
+        if provenance_type == "material_intent":
+            target_material = next(
+                (
+                    candidate
+                    for candidate in source_materials
+                    if _speedtree_material_name_key(candidate.name)
+                    == _speedtree_material_name_key(target_name)
+                ),
+                None,
+            )
         else:
-            canonical_sets = [
-                _complete_speedtree_texture_set(
-                    material,
-                    target_name,
-                    stmat_cache=stmat_cache,
-                    texture_index_cache=texture_index_cache,
-                )
-                for material in source_materials
-            ]
-            canonical_signatures = [
-                _speedtree_texture_file_signature(texture_set)
-                for texture_set in canonical_sets
-            ]
-            binding_ready = bool(
-                all(canonical_signatures)
-                and len(set(canonical_signatures)) == 1
-            )
-            readiness_mode = "canonical_texture_set"
-        if not binding_ready:
-            skipped_groups.append(
-                {
-                    "mode": "production_group_suffix",
-                    "target_material": target_name,
-                    "source_materials": [
-                        material.name for material in source_materials
-                    ],
-                    "group_tokens": group_tokens,
-                    "provenance_type": provenance_type,
-                    "reason": (
-                        "strict bindings do not prove one shared managed six-map set"
-                        if strict_contract
-                        else "canonical target T_ six-map set is not complete or differs by source"
-                    ),
-                }
-            )
-            continue
-        target_material = next(
-            (
-                candidate
-                for candidate in bpy.data.materials
-                if _speedtree_material_name_key(candidate.name)
-                == _speedtree_material_name_key(target_name)
-                and (
-                    normalized_source_fbx_path(
-                        candidate.get("codex_source_fbx", "")
+            target_material = next(
+                (
+                    candidate
+                    for candidate in bpy.data.materials
+                    if _speedtree_material_name_key(candidate.name)
+                    == _speedtree_material_name_key(target_name)
+                    and (
+                        normalized_source_fbx_path(
+                            candidate.get("codex_source_fbx", "")
+                        )
+                        == provenance_value
+                        if provenance_type == "source_fbx"
+                        else material_texture_signature(candidate)
+                        == provenance_value
                     )
-                    == provenance_value
-                    if provenance_type == "source_fbx"
-                    else material_texture_signature(candidate)
-                    == provenance_value
-                )
-            ),
-            None,
-        )
+                ),
+                None,
+            )
         if target_material is None:
             target_material = source_materials[0].copy()
             target_material.name = target_name
@@ -4790,24 +5982,28 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                 obj.data = obj.data.copy()
             mesh = obj.data
             candidate_slots = set(candidate_slots)
-            slot_map = {}
-            new_materials = [target_material]
-            non_candidate_indices = {}
-            for old_index, material in enumerate(mesh.materials):
-                if old_index in candidate_slots:
-                    slot_map[old_index] = 0
-                    continue
-                if material is None:
-                    slot_map[old_index] = 0
-                    continue
-                if material.name not in non_candidate_indices:
-                    non_candidate_indices[material.name] = len(new_materials)
-                    new_materials.append(material)
-                slot_map[old_index] = non_candidate_indices[material.name]
             for poly in mesh.polygons:
                 if poly.material_index in candidate_slots:
                     changed_faces += 1
-            remap_mesh_materials(mesh, slot_map, new_materials)
+            if any(material is None for material in mesh.materials):
+                # Preserve every empty slot and its face assignments for the
+                # later structural validator. Only replace proven group slots
+                # in place; never turn an authored None into the target.
+                for slot_index in candidate_slots:
+                    mesh.materials[slot_index] = target_material
+            else:
+                slot_map = {}
+                new_materials = [target_material]
+                non_candidate_indices = {}
+                for old_index, material in enumerate(mesh.materials):
+                    if old_index in candidate_slots:
+                        slot_map[old_index] = 0
+                        continue
+                    if material.name not in non_candidate_indices:
+                        non_candidate_indices[material.name] = len(new_materials)
+                        new_materials.append(material)
+                    slot_map[old_index] = non_candidate_indices[material.name]
+                remap_mesh_materials(mesh, slot_map, new_materials)
             obj["codex_speedtree_unified_material"] = target_material.name
             changed_objects.append(obj.name)
 
@@ -4818,10 +6014,8 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                 "source_materials": [material.name for material in source_materials],
                 "group_tokens": group_tokens,
                 "provenance_type": provenance_type,
-                "source_fbx": (
-                    str(source_materials[0].get("codex_source_fbx", ""))
-                    if provenance_type == "source_fbx"
-                    else ""
+                "source_fbx": str(
+                    source_materials[0].get("codex_source_fbx", "")
                 ),
                 "readiness_mode": readiness_mode,
                 "texture_signatures": [list(signature) for signature in texture_signatures],
@@ -4875,9 +6069,12 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
     rows = []
     changed = []
     unmatched = []
+    diagnostics = []
     resolved_materials = []
     for material in collect_object_materials(objects):
-        intent = handoff_contract.resolve_material_intent(material.name, envelope)
+        intent = handoff_contract.resolve_material_intent(
+            material.name, envelope
+        )
         if intent is None:
             unmatched.append(material.name)
             continue
@@ -4915,6 +6112,10 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
         "status": "applied" if rows else "not_applicable",
         "materials": rows,
         "changed_materials": changed,
+        "unmatched_materials": sorted(unmatched, key=str.casefold),
+        "diagnostics": diagnostics,
+        "warnings": [],
+        "blocking": [],
     }
 
 
@@ -5455,6 +6656,8 @@ def run_import_source_fbx(
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
         raise RuntimeError(f"Source FBX does not exist: {source_fbx_path}")
+    if texture_contract is None:
+        texture_contract = _bat_runtime_texture_contract(None)
 
     before = {obj.name for obj in bpy.data.objects}
     bpy.ops.import_scene.fbx(filepath=str(path))
@@ -8345,6 +9548,13 @@ def _is_ready_managed_bark_intent(intent):
     return True
 
 
+def _is_semantic_bark_intent(intent):
+    return bool(
+        isinstance(intent, dict)
+        and str(intent.get("tree_part") or "") == "bark"
+    )
+
+
 def normalize_merged_speedtree_placeholder_material(
     merged_obj, texture_contract=None
 ):
@@ -8374,6 +9584,9 @@ def normalize_merged_speedtree_placeholder_material(
         )
 
     api = handoff_contract.central_contract_api()
+    runtime_tolerant = _runtime_tolerant_texture_contract(
+        texture_contract
+    )
     intents = list(envelope.get("material_intents") or [])
     default_intents = [
         row for row in intents if _is_unmanaged_empty_default_intent(row)
@@ -8414,21 +9627,23 @@ def normalize_merged_speedtree_placeholder_material(
         ):
             placeholder_slots.append(slot_index)
         else:
-            raise RuntimeError(
+            message = (
                 "SpeedTree merged Default material is not uniquely proven by "
                 "the strict STMAT Default intent; slot: "
                 + str(slot_index)
             )
+            raise RuntimeError(message)
     if not placeholder_slots:
         return {
             "status": "not_applicable",
             "reason": "no_default_or_none_placeholder_slots",
         }
     if len(all_default_intents) != 1 or len(default_intents) != 1:
-        raise RuntimeError(
+        message = (
             "SpeedTree merged Default placeholder requires exactly one "
             "unmanaged, source-empty STMAT Default intent"
         )
+        raise RuntimeError(message)
 
     candidate_materials = []
     seen_candidates = set()
@@ -8438,16 +9653,21 @@ def normalize_merged_speedtree_placeholder_material(
         if str(material.get(UNREAL_TREE_PART_PROPERTY) or "") != "bark":
             continue
         matching = _strict_material_intents_for_name(material.name, envelope)
-        if len(matching) != 1 or not _is_ready_managed_bark_intent(matching[0]):
+        if len(matching) != 1 or not (
+            _is_semantic_bark_intent(matching[0])
+            if runtime_tolerant
+            else _is_ready_managed_bark_intent(matching[0])
+        ):
             continue
         seen_candidates.add(material.as_pointer())
         candidate_materials.append(material)
     if len(candidate_materials) != 1:
-        raise RuntimeError(
+        message = (
             "SpeedTree merged Default placeholder requires exactly one actual "
-            "managed bark material slot with a ready binding; found "
+            "bark material slot; found "
             + str(len(candidate_materials))
         )
+        raise RuntimeError(message)
     target_material = candidate_materials[0]
 
     if merged_obj.data.users > 1:
@@ -8479,12 +9699,60 @@ def normalize_merged_speedtree_placeholder_material(
     remap_mesh_materials(mesh, slot_map, new_materials)
     return {
         "status": "applied",
-        "proof": "strict_stmat_default_to_unique_managed_bark",
+        "proof": (
+            "runtime_stmat_default_to_unique_semantic_bark"
+            if runtime_tolerant
+            else "strict_stmat_default_to_unique_managed_bark"
+        ),
         "placeholder_slots": placeholder_slots,
         "target_material": target_material.name,
         "changed_face_count": changed_faces,
         "material_count_before": len(old_materials),
         "material_count_after": len(mesh.materials),
+    }
+
+
+def validate_face_assigned_material_slots(mesh_obj):
+    """Reject structural material omissions at the final export boundary.
+
+    An unused empty Blender slot is harmless metadata and may survive a join.
+    A polygon assigned to an empty or out-of-range slot, however, would publish
+    a mesh section with no material identity. That is structural corruption,
+    not texture availability, and remains a hard failure.
+    """
+    if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
+        raise RuntimeError(
+            "Material-slot validation requires a final merged mesh"
+        )
+    materials = list(mesh_obj.data.materials)
+    invalid_faces = []
+    invalid_slots = set()
+    for polygon in mesh_obj.data.polygons:
+        slot_index = int(polygon.material_index)
+        if (
+            slot_index < 0
+            or slot_index >= len(materials)
+            or materials[slot_index] is None
+        ):
+            invalid_faces.append(int(polygon.index))
+            invalid_slots.add(slot_index)
+    if invalid_faces:
+        raise RuntimeError(
+            "Final merged mesh has polygon-assigned empty material slots: "
+            f"object={mesh_obj.name}, slots={sorted(invalid_slots)}, "
+            f"faces={invalid_faces[:40]}"
+        )
+    return {
+        "status": "ok",
+        "material_count": len(materials),
+        "assigned_slot_indices": sorted(
+            {int(polygon.material_index) for polygon in mesh_obj.data.polygons}
+        ),
+        "unused_empty_slot_indices": [
+            index
+            for index, material in enumerate(materials)
+            if material is None
+        ],
     }
 
 
@@ -8780,6 +10048,9 @@ def run_merge_export(
             merged_obj, texture_contract=texture_contract
         )
     )
+    material_slot_validation = validate_face_assigned_material_slots(
+        merged_obj
+    )
     source_fbx_candidates = {
         str(obj.get("codex_source_fbx", "") or "").strip()
         for obj in source_objects
@@ -8847,6 +10118,7 @@ def run_merge_export(
         "placeholder_material_normalization": (
             placeholder_material_normalization
         ),
+        "material_slot_validation": material_slot_validation,
         "uv_layers": uv_names,
         "color_attributes": [attr.name for attr in merged_obj.data.color_attributes],
         "merge_method": "join",
@@ -9011,8 +10283,9 @@ def run_full_pipeline(settings):
     save_stage_blends = settings.get("save_intermediate_blends", False)
 
     # New-schema provenance/profile validation must finish before any Blender
-    # object, material, or node mutation. Legacy reports keep the old fallback.
-    texture_contract = load_speedtree_texture_readiness_contract(
+    # mutation.  The operational BAT boundary still treats texture assignment
+    # as runtime-tolerant; strict publication remains available to audit calls.
+    texture_contract = load_speedtree_runtime_texture_contract(
         settings.get("texture_contract_path", ""),
         spm_path=settings.get("spm_path", ""),
         source_fbx_path=settings.get("source_fbx_path", ""),
@@ -9114,22 +10387,13 @@ def run_full_pipeline(settings):
     reports["steps"].append(
         {
             "name": "rebind_blocked_speedtree_group_variants",
-            "status": group_variant_rebinding.get("status", "blocked"),
+            "status": group_variant_rebinding.get("status", "ok"),
             "rebound_count": group_variant_rebinding.get(
                 "rebound_count", 0
             ),
             "unresolved": group_variant_rebinding.get("unresolved", []),
         }
     )
-    if group_variant_rebinding.get("status") == "blocked":
-        raise RuntimeError(
-            "SpeedTree production-group material variants still reference "
-            "blocked isolated texture paths: "
-            + ", ".join(
-                row.get("material", "<unnamed>")
-                for row in group_variant_rebinding.get("unresolved", [])
-            )
-        )
 
     removed_phantoms = remove_phantom_image_nodes(bpy.context.scene.objects)
     if removed_phantoms:
@@ -9414,7 +10678,7 @@ def run_import_and_repair(settings):
     # full repair pipeline. Pressing the button again is a clean update.
     if not settings.get("source_fbx_path"):
         raise RuntimeError("Source FBX path is required (run the SpeedTree export first).")
-    texture_contract = load_speedtree_texture_readiness_contract(
+    texture_contract = load_speedtree_runtime_texture_contract(
         settings.get("texture_contract_path", ""),
         spm_path=settings.get("spm_path", ""),
         source_fbx_path=settings.get("source_fbx_path", ""),
