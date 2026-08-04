@@ -464,7 +464,7 @@ class STBWR_OT_ImportSourceFBX(STBWR_OT_Base):
             return self.fail("Source FBX path is required.")
         try:
             core = get_core()
-            texture_contract = core.load_speedtree_texture_readiness_contract(
+            texture_contract = core.load_speedtree_runtime_texture_contract(
                 settings.get("texture_contract_path", ""),
                 spm_path=settings.get("spm_path", ""),
                 source_fbx_path=settings.get("source_fbx_path", ""),

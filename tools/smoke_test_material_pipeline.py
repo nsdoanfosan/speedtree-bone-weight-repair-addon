@@ -14,6 +14,12 @@ import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+# Always exercise the checked-out add-on, even when a different build is
+# installed in Blender's user add-ons directory.
+REPO_DIR = Path(__file__).resolve().parents[1]
+REPO_ADDONS_DIR = REPO_DIR / "addons"
+sys.path.insert(0, str(REPO_ADDONS_DIR))
+
 import addon_utils
 import bpy
 
@@ -403,14 +409,39 @@ def run_contract_smoke(
             "M_Bark_numeric_collision_01"
         )
         collision_material["codex_source_fbx"] = str(source_fbx)
-        collision_duplicate["codex_source_fbx"] = str(collision_source)
+        collision_duplicate["codex_source_fbx"] = str(source_fbx)
         collision_object = make_mesh_object(
             "NumericCollisionObject",
             [collision_material, collision_duplicate],
         )
+        collision_intent = (
+            handoff_contract.central_contract_api().build_material_intent(
+                collision_material.name,
+                explicit_tree_part="bark",
+                explicit_tree_shading="wood",
+            )
+        )
+        collision_intent.update(
+            {
+                "stmat_material_index": 0,
+                "stmat_material_id": "numeric-collision",
+                "material_name": collision_material.name,
+                "texture_source_mode": "managed_texture_set",
+                "texture_binding": {
+                    "status": "ok",
+                    "set_key": "barknumericcollision01",
+                    "texture_base": "T_Bark_numeric_collision_01",
+                    "files": shared_files,
+                    "missing_roles": [],
+                },
+            }
+        )
         collision_contract = {
             "status": "ok",
             "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": {
+                "material_intents": [collision_intent]
+            },
             "bindings": [
                 {
                     "material": collision_material.name,
@@ -459,9 +490,33 @@ def run_contract_smoke(
                 distinct_collision_duplicate,
             ],
         )
+        distinct_collision_intent = (
+            handoff_contract.central_contract_api().build_material_intent(
+                distinct_collision_material.name,
+                explicit_tree_part="bark",
+                explicit_tree_shading="wood",
+            )
+        )
+        distinct_collision_intent.update(
+            {
+                "stmat_material_index": 1,
+                "stmat_material_id": "cross-source-numeric-collision",
+                "material_name": distinct_collision_material.name,
+                "texture_source_mode": "unresolved",
+                "texture_binding": {
+                    "status": "unassigned",
+                    "binding_disposition": "leave_unassigned",
+                    "files": {},
+                    "missing_roles": list(TEXTURE_ROLES),
+                },
+            }
+        )
         distinct_collision_contract = {
             "status": "ok",
             "strict_speedtree_pipeline_contract": True,
+            "speedtree_pipeline_contract": {
+                "material_intents": [distinct_collision_intent]
+            },
             "bindings": [
                 {
                     "material": distinct_collision_material.name,
@@ -536,8 +591,15 @@ def run_contract_smoke(
         canonical_names = [
             material.name for material in canonical_object.data.materials if material
         ]
-        if canonical_names != ["M_Leaf_common_grass_01"]:
-            raise AssertionError(canonical_names)
+        if (
+            canonical_names
+            != [
+                "M_Leaf_common_grass_01_green",
+                "M_Leaf_common_grass_01_dead",
+            ]
+            or canonical_result.get("status") != "skipped"
+        ):
+            raise AssertionError((canonical_names, canonical_result))
 
         arbitrary_materials = [
             bpy.data.materials.new("M_Leaf_arbitrary_grass_01_fresh_custom"),
@@ -600,7 +662,15 @@ def run_contract_smoke(
         for material in distinct_materials:
             material["codex_source_fbx"] = str(source_fbx)
         distinct_bindings = []
-        for material, files in zip(distinct_materials, (shared_files, green)):
+        distinct_intents = []
+        for index, (material, files, tree_part, tree_shading) in enumerate(
+            zip(
+                distinct_materials,
+                (shared_files, green),
+                ("leaf", "bark"),
+                ("foliage", "wood"),
+            )
+        ):
             distinct_bindings.append(
                 {
                     "material": material.name,
@@ -613,11 +683,32 @@ def run_contract_smoke(
                     "missing_roles": [],
                 }
             )
+            intent = (
+                handoff_contract.central_contract_api().build_material_intent(
+                    material.name,
+                    explicit_tree_part=tree_part,
+                    explicit_tree_shading=tree_shading,
+                )
+            )
+            intent.update(
+                {
+                    "stmat_material_index": index,
+                    "stmat_material_id": f"distinct-semantics-{index}",
+                    "material_name": material.name,
+                    "texture_source_mode": "managed_texture_set",
+                    "texture_binding": dict(distinct_bindings[-1]),
+                }
+            )
+            distinct_intents.append(intent)
         distinct_contract = {
             "status": "ok",
             "strict_speedtree_pipeline_contract": True,
-            "speedtree_pipeline_contract": {"material_intents": []},
-            "bindings": distinct_bindings,
+            "speedtree_pipeline_contract": {
+                "material_intents": distinct_intents
+            },
+            "bindings": handoff_contract.texture_bindings_from_envelope(
+                {"material_intents": distinct_intents}
+            ),
         }
         distinct_object = make_mesh_object(
             "DistinctSourceSignatureObject", distinct_materials
@@ -625,8 +716,9 @@ def run_contract_smoke(
         distinct_result = consolidate_speedtree_group_materials(
             [distinct_object], texture_contract=distinct_contract
         )
-        if len(distinct_object.data.materials) != 2 or not (
-            distinct_result.get("skipped_groups")
+        if (
+            len(distinct_object.data.materials) != 2
+            or distinct_result.get("status") != "skipped"
         ):
             raise AssertionError(distinct_result)
 
@@ -654,18 +746,18 @@ def run_contract_smoke(
             )
             isolated_sources.append(str(isolated_fbx.resolve()).casefold())
         isolated_result = consolidate_speedtree_group_materials(isolated_objects)
-        isolated_targets = [
-            obj.data.materials[0] for obj in isolated_objects
-        ]
-        if any(len(obj.data.materials) != 1 for obj in isolated_objects):
+        if any(len(obj.data.materials) != 2 for obj in isolated_objects):
             raise AssertionError(isolated_result)
-        if isolated_targets[0] == isolated_targets[1]:
-            raise AssertionError("different source FBXs shared one consolidated material")
-        if {
+        if isolated_result.get("status") != "skipped":
+            raise AssertionError(isolated_result)
+        live_sources = {
             str(material.get("codex_source_fbx", "")).casefold()
-            for material in isolated_targets
-        } != set(isolated_sources):
-            raise AssertionError(isolated_result)
+            for obj in isolated_objects
+            for material in obj.data.materials
+            if material
+        }
+        if live_sources != set(isolated_sources):
+            raise AssertionError((live_sources, isolated_result))
 
         manifest_material = bpy.data.materials.new(
             "M_Leaf_manifest_grass_01_winter_dry"
@@ -1501,6 +1593,17 @@ def main():
     }
     try:
         addon_utils.enable("speedtree_bone_weight_repair", default_set=False)
+        import speedtree_bone_weight_repair as loaded_addon
+
+        loaded_package_dir = Path(loaded_addon.__file__).resolve().parent
+        expected_package_dir = (
+            REPO_ADDONS_DIR / "speedtree_bone_weight_repair"
+        ).resolve()
+        if loaded_package_dir != expected_package_dir:
+            raise RuntimeError(
+                "material smoke loaded the wrong add-on: "
+                f"{loaded_package_dir} != {expected_package_dir}"
+            )
         from speedtree_bone_weight_repair.core import (
             _speedtree_manifest_binding,
             _speedtree_manifest_texture_binding,
@@ -1558,8 +1661,13 @@ def main():
             or {}
         )
         missing = normalization_result.get("missing") or []
-        if missing:
-            raise RuntimeError(f"texture normalization still has missing rows: {missing}")
+        report["texture_diagnostics"] = {
+            "missing": missing,
+            "partial": normalization_result.get("partial") or [],
+            "unassigned": normalization_result.get("unassigned") or [],
+            "warnings": normalization_result.get("warnings") or [],
+            "blocking": normalization_result.get("blocking") or [],
+        }
         report["status"] = "ok"
     except Exception as exc:
         report["error"] = str(exc)

@@ -216,6 +216,191 @@ class BwrHandoffContractTests(unittest.TestCase):
                     stmat_paths=[stmat],
                 )
 
+    def test_runtime_tolerant_partial_binding_keeps_only_available_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            intent = envelope["material_intents"][0]
+            envelope["material_intents"] = [intent]
+            binding = intent["texture_binding"]
+            missing_path = Path(binding["files"].pop("height"))
+            missing_path.unlink()
+            binding["status"] = "partial"
+            binding["missing_roles"] = ["height"]
+
+            validated, _live = adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+                texture_contract_mode=(
+                    adapter.RUNTIME_TOLERANT_TEXTURE_MODE
+                ),
+            )
+            runtime_binding = validated["material_intents"][0][
+                "texture_binding"
+            ]
+            self.assertEqual(runtime_binding["status"], "partial")
+            self.assertEqual(
+                runtime_binding["binding_disposition"], "bind_available"
+            )
+            self.assertNotIn("height", runtime_binding["files"])
+            self.assertIn("height", runtime_binding["missing_roles"])
+            self.assertEqual(validated["texture_outcome"], "partial")
+            self.assertEqual(validated["texture_warnings"], [])
+            self.assertEqual(
+                validated["texture_diagnostics"][0]["severity"], "info"
+            )
+
+    def test_runtime_partial_production_receipt_keeps_live_roles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            intent = envelope["material_intents"][0]
+            envelope["material_intents"] = [intent]
+            binding = intent["texture_binding"]
+            binding["origin_receipt"] = {
+                "kind": "blender_cluster_bake_texture_origin_receipt",
+                "version": 1,
+            }
+            missing_path = Path(binding["files"]["height"])
+            missing_path.unlink()
+            binding["status"] = "partial"
+            binding["missing_roles"] = ["height"]
+
+            validated, _live = adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+                texture_contract_mode=adapter.RUNTIME_TOLERANT_TEXTURE_MODE,
+            )
+
+            runtime_binding = validated["material_intents"][0][
+                "texture_binding"
+            ]
+            self.assertEqual(runtime_binding["status"], "partial")
+            self.assertEqual(
+                runtime_binding["binding_disposition"], "bind_available"
+            )
+            self.assertNotIn("height", runtime_binding["files"])
+            self.assertTrue(runtime_binding["files"])
+
+    def test_runtime_tolerant_unresolved_intent_becomes_unassigned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            intent = envelope["material_intents"][0]
+            envelope["material_intents"] = [intent]
+            intent["texture_source_mode"] = "unresolved"
+            intent.pop("texture_binding")
+
+            validated, _live = adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+                texture_contract_mode=(
+                    adapter.RUNTIME_TOLERANT_TEXTURE_MODE
+                ),
+            )
+            runtime_intent = validated["material_intents"][0]
+            runtime_binding = runtime_intent["texture_binding"]
+            self.assertEqual(
+                runtime_intent["texture_source_mode"], "unresolved"
+            )
+            self.assertEqual(runtime_binding["status"], "unassigned")
+            self.assertEqual(runtime_binding["files"], {})
+            self.assertEqual(validated["texture_warnings"], [])
+            self.assertEqual(
+                validated["texture_diagnostics"][0]["code"],
+                "unresolved_texture_binding",
+            )
+
+    def test_runtime_tolerant_preview_receipt_is_quarantined_not_terminal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            receipt = json.loads(
+                PREVIEW_FIXTURE_PATH.read_text(encoding="utf-8")
+            )
+            envelope["material_intents"][0]["texture_binding"][
+                "origin_receipt"
+            ] = receipt
+            envelope["material_intents"][0]["texture_binding"].update(
+                {
+                    "texture_contract_status": "fixture_authority",
+                    "source_paths": {"color": "unsafe-source-path"},
+                    "manifest_path": "unsafe-manifest-path",
+                    "expected_t_paths": {"color": "unsafe-target-path"},
+                }
+            )
+
+            validated, _live = adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+                texture_contract_mode=(
+                    adapter.RUNTIME_TOLERANT_TEXTURE_MODE
+                ),
+            )
+            runtime_binding = validated["material_intents"][0][
+                "texture_binding"
+            ]
+            self.assertEqual(runtime_binding["status"], "unassigned")
+            self.assertEqual(runtime_binding["files"], {})
+            self.assertEqual(
+                runtime_binding["binding_disposition"], "leave_unassigned"
+            )
+            self.assertNotIn("texture_contract_status", runtime_binding)
+            self.assertNotIn("source_paths", runtime_binding)
+            self.assertNotIn("manifest_path", runtime_binding)
+            self.assertNotIn("expected_t_paths", runtime_binding)
+            self.assertEqual(validated["texture_warnings"], [])
+            self.assertEqual(
+                validated["texture_diagnostics"][0]["code"],
+                "preview_receipt_not_production_capable",
+            )
+
+    def test_runtime_tolerant_texture_only_blocked_outcome_continues(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            envelope["outcome"] = "blocked"
+            envelope["issues"] = [
+                {
+                    "code": "TEXTURE_SET_INCOMPLETE",
+                    "severity": "error",
+                    "scope": "material",
+                    "entity": "M_Leaf_common_grass_01_green",
+                    "message": "fixture partial texture set",
+                }
+            ]
+            validated, _live = adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+                texture_contract_mode=(
+                    adapter.RUNTIME_TOLERANT_TEXTURE_MODE
+                ),
+            )
+            self.assertEqual(validated["texture_outcome"], "partial")
+
+    def test_runtime_tolerant_non_texture_block_still_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            envelope["outcome"] = "blocked"
+            envelope["issues"] = [
+                {
+                    "code": "MATERIAL_INTENT_PARSE_ERROR",
+                    "severity": "error",
+                    "scope": "stmat",
+                    "entity": stmat.name,
+                    "message": "fixture structural failure",
+                }
+            ]
+            with self.assertRaisesRegex(RuntimeError, "not ready"):
+                adapter.validate_live_preflight_envelope(
+                    envelope,
+                    spm_path=spm,
+                    stmat_paths=[stmat],
+                    texture_contract_mode=(
+                        adapter.RUNTIME_TOLERANT_TEXTURE_MODE
+                    ),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

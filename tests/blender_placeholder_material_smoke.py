@@ -36,6 +36,14 @@ def mesh_object(name, materials):
     return obj
 
 
+def write_png(path):
+    image = bpy.data.images.new(path.stem + "_source", width=1, height=1)
+    image.filepath_raw = str(path)
+    image.file_format = "PNG"
+    image.save()
+    bpy.data.images.remove(image)
+
+
 def intent(api, index, name, *, tree_part="", mode="", binding=None):
     return {
         "stmat_material_index": index,
@@ -50,12 +58,17 @@ def intent(api, index, name, *, tree_part="", mode="", binding=None):
     }
 
 
-def contract(intents):
-    return {
+def contract(intents, *, runtime_tolerant=False):
+    result = {
         "status": "ok",
         "strict_speedtree_pipeline_contract": True,
         "speedtree_pipeline_contract": {"material_intents": intents},
     }
+    if runtime_tolerant:
+        result[core.handoff_contract.TEXTURE_CONTRACT_MODE_FIELD] = (
+            core.handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
+        )
+    return result
 
 
 def ready_binding(texture_dir, base):
@@ -163,6 +176,65 @@ with tempfile.TemporaryDirectory(
         raise AssertionError("ambiguous managed bark candidates were accepted")
     assert list(ambiguous.data.materials) == ambiguous_before
 
+    runtime_missing = mesh_object("RuntimeMissingCandidate", [default_material])
+    runtime_missing_before = list(runtime_missing.data.materials)
+    try:
+        core.normalize_merged_speedtree_placeholder_material(
+            runtime_missing,
+            contract([default_intent], runtime_tolerant=True),
+        )
+    except RuntimeError as exc:
+        assert "found 0" in str(exc), exc
+    else:
+        raise AssertionError("runtime mode accepted missing structural bark identity")
+    assert list(runtime_missing.data.materials) == runtime_missing_before
+
+    runtime_ambiguous = mesh_object(
+        "RuntimeAmbiguousCandidate",
+        [default_material, bark_material, second_material],
+    )
+    runtime_ambiguous_before = list(runtime_ambiguous.data.materials)
+    try:
+        core.normalize_merged_speedtree_placeholder_material(
+            runtime_ambiguous,
+            contract(
+                [default_intent, bark_intent, second_intent],
+                runtime_tolerant=True,
+            ),
+        )
+    except RuntimeError as exc:
+        assert "found 2" in str(exc), exc
+    else:
+        raise AssertionError("runtime mode accepted ambiguous structural bark identity")
+    assert list(runtime_ambiguous.data.materials) == runtime_ambiguous_before
+
+    unassigned_bark_intent = intent(
+        api,
+        1,
+        "M_bark_safe_Mat",
+        tree_part="bark",
+        mode="unresolved",
+        binding={"status": "unassigned", "files": {}},
+    )
+    runtime_unique = mesh_object(
+        "RuntimeUniqueSemanticBark",
+        [default_material, bark_material],
+    )
+    runtime_unique_result = (
+        core.normalize_merged_speedtree_placeholder_material(
+            runtime_unique,
+            contract(
+                [default_intent, unassigned_bark_intent],
+                runtime_tolerant=True,
+            ),
+        )
+    )
+    assert runtime_unique_result["status"] == "applied", runtime_unique_result
+    assert list(runtime_unique.data.materials) == [bark_material]
+    assert runtime_unique_result["proof"] == (
+        "runtime_stmat_default_to_unique_semantic_bark"
+    )
+
     unknown_none = mesh_object("UnknownNone", [bark_material, None])
     unknown_before = list(unknown_none.data.materials)
     unknown_result = core.normalize_merged_speedtree_placeholder_material(
@@ -170,6 +242,21 @@ with tempfile.TemporaryDirectory(
     )
     assert unknown_result["status"] == "not_applicable", unknown_result
     assert list(unknown_none.data.materials) == unknown_before
+    try:
+        core.validate_face_assigned_material_slots(unknown_none)
+    except RuntimeError as exc:
+        assert "polygon-assigned empty material slots" in str(exc), exc
+    else:
+        raise AssertionError("face-assigned empty material slot was accepted")
+
+    unused_none = mesh_object("UnusedNone", [bark_material, None])
+    for polygon in unused_none.data.polygons:
+        polygon.material_index = 0
+    unused_none_validation = core.validate_face_assigned_material_slots(
+        unused_none
+    )
+    assert unused_none_validation["status"] == "ok", unused_none_validation
+    assert unused_none_validation["unused_empty_slot_indices"] == [1]
 
     tree_root = texture_dir / "tree"
     cluster_fbx = tree_root / "cluster" / "fbx" / "SK_leaf_test.fbx"
@@ -189,8 +276,8 @@ with tempfile.TemporaryDirectory(
     canonical_texture_dir = tree_root / "texture"
     canonical_texture_dir.mkdir(parents=True, exist_ok=True)
     for role in core.SPEEDTREE_TEXTURE_ROLES:
-        path = canonical_texture_dir / f"{canonical_base}_{role}.tga"
-        path.write_bytes(role.encode("ascii"))
+        path = canonical_texture_dir / f"{canonical_base}_{role}.png"
+        write_png(path)
         canonical_files[role] = path
 
     canonical_material = bpy.data.materials.new("M_leaf_test_atlas_01")
@@ -250,7 +337,7 @@ with tempfile.TemporaryDirectory(
         Path(path).name.casefold()
         for path in core.material_texture_signature(isolated_material)
     } == {
-        f"{canonical_base}_{role}.tga".casefold()
+        f"{canonical_base}_{role}.png".casefold()
         for role in core.SPEEDTREE_TEXTURE_ROLES
     }, rebound
 

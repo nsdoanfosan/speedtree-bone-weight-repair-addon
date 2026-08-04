@@ -25,6 +25,13 @@ SOURCE_MODES = {
     "preserve_declared_sources",
     "unresolved",
 }
+TEXTURE_CONTRACT_MODE_FIELD = "texture_contract_mode"
+RUNTIME_TOLERANT_TEXTURE_MODE = "runtime_tolerant"
+STRICT_PUBLICATION_TEXTURE_MODE = "strict_publication"
+TEXTURE_CONTRACT_MODES = {
+    RUNTIME_TOLERANT_TEXTURE_MODE,
+    STRICT_PUBLICATION_TEXTURE_MODE,
+}
 
 
 @lru_cache(maxsize=1)
@@ -267,12 +274,165 @@ def _validate_managed_binding(intent, required_roles):
             )
 
 
+def _texture_issue_code(exc):
+    message = str(exc).casefold()
+    if "preview" in message:
+        return "preview_receipt_not_production_capable"
+    if "capability" in message:
+        return "unsupported_texture_receipt_capability"
+    if "stale" in message:
+        return "stale_texture_binding"
+    if "unresolved" in message:
+        return "unresolved_texture_binding"
+    if "no texture_binding" in message:
+        return "missing_texture_binding"
+    if "not ready" in message:
+        return "incomplete_texture_binding"
+    return "texture_binding_rejected"
+
+
+def _texture_issue_severity(code):
+    # Runtime texture authority and availability are telemetry, not admission
+    # or operator-action events. Actual image decode/I/O warnings are emitted
+    # later by Blender when a chosen file cannot be consumed.
+    del code
+    return "info"
+
+
+def _live_runtime_files(binding, required_roles):
+    """Return only currently readable files from an otherwise untrusted row."""
+    files = binding.get("files") if isinstance(binding, dict) else None
+    if not isinstance(files, dict):
+        return {}, list(required_roles)
+    available = {}
+    missing = []
+    for role in required_roles:
+        value = str(files.get(role) or "").strip()
+        path = Path(value)
+        try:
+            ready = path.is_file() and path.stat().st_size > 0
+        except OSError:
+            ready = False
+        if ready:
+            available[role] = str(path)
+        else:
+            missing.append(role)
+    return available, missing
+
+
+def _runtime_tolerant_binding(intent, required_roles):
+    """Quarantine one invalid texture binding without rejecting the handoff.
+
+    This is deliberately downstream of the strict validator.  Receipt and
+    publication audits remain fail-closed; the BAT runtime converts their
+    rejection into an empty parameter assignment plus a structured diagnostic.
+    """
+    normalized = copy.deepcopy(intent)
+    binding = normalized.get("texture_binding")
+    binding = copy.deepcopy(binding) if isinstance(binding, dict) else {}
+    mode = str(normalized.get("texture_source_mode") or "").strip()
+    diagnostic = None
+    try:
+        _validate_managed_binding(normalized, required_roles)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        code = _texture_issue_code(exc)
+        diagnostic = {
+            "code": code,
+            "severity": _texture_issue_severity(code),
+            "material": str(normalized.get("material_name") or ""),
+            "message": str(exc),
+        }
+
+    if diagnostic is None:
+        if mode == "preserve_declared_sources":
+            binding["binding_disposition"] = "preserve_declared_sources"
+            binding["available_roles"] = sorted(
+                str(role) for role in (binding.get("source_roles") or [])
+            )
+        else:
+            binding["binding_disposition"] = "bind_available"
+            binding["available_roles"] = sorted(
+                str(role) for role in (binding.get("files") or {})
+            )
+            binding["missing_roles"] = []
+        normalized["texture_binding"] = binding
+        return normalized, None
+
+    # Only a receipt/capability/usage rejection invalidates the whole row.
+    # Ordinary incomplete or stale availability keeps the currently live roles
+    # even when the otherwise valid production row carries a receipt.
+    receipt_rejected = diagnostic["code"] in {
+        "preview_receipt_not_production_capable",
+        "unsupported_texture_receipt_capability",
+        "texture_binding_rejected",
+    }
+    if receipt_rejected:
+        available, missing = {}, list(required_roles)
+    elif mode == "managed_texture_set":
+        available, missing = _live_runtime_files(binding, required_roles)
+    else:
+        available, missing = {}, list(required_roles)
+
+    # Strip every field that could make a downstream consumer treat this row
+    # as an authoritative manifest/receipt binding.  The rejected provenance
+    # remains represented only by the diagnostic code below.
+    for field in (
+        "origin_receipt",
+        "slot_files",
+        "source_paths",
+        "source_roles",
+        "source_maps",
+        "preserved_files",
+        "declared_source_receipt",
+        "expected_t_paths",
+        "expected_texture_base",
+        "manifest_path",
+        "texture_contract_status",
+        "source_origin",
+        "source_evidence",
+        "origin_state",
+    ):
+        binding.pop(field, None)
+    binding["files"] = available
+    binding["available_roles"] = sorted(available)
+    binding["missing_roles"] = sorted(set(missing))
+    binding["binding_disposition"] = (
+        "bind_available" if available else "leave_unassigned"
+    )
+    binding["status"] = "partial" if available else "unassigned"
+    binding["warning_codes"] = (
+        [diagnostic["code"]]
+        if diagnostic.get("severity") == "warning"
+        else []
+    )
+    binding["diagnostic_codes"] = [diagnostic["code"]]
+    normalized["texture_binding"] = binding
+    normalized["texture_source_mode"] = (
+        "managed_texture_set" if available else "unresolved"
+    )
+    return normalized, diagnostic
+
+
+def _is_texture_only_issue(issue):
+    if not isinstance(issue, dict):
+        return False
+    code = str(issue.get("code") or "").strip().upper()
+    scope = str(issue.get("scope") or "").strip().casefold()
+    return (
+        code.startswith("TEXTURE_")
+        or code.startswith("CANONICAL_TEXTURE_")
+        or code.startswith("ATLAS_TEXTURE_")
+        or scope in {"texture", "texture_binding", "texture_set"}
+    )
+
+
 def validate_live_preflight_envelope(
     envelope,
     *,
     spm_path,
     stmat_paths=(),
     expected_mesh_name="",
+    texture_contract_mode=STRICT_PUBLICATION_TEXTURE_MODE,
 ):
     """Validate schema plus live SPM/STMAT identity before Blender mutation."""
     api = central_contract_api()
@@ -280,10 +440,23 @@ def validate_live_preflight_envelope(
     validated = api.validate_preflight_envelope(
         envelope, expected_mesh_name=expected_mesh_name
     )
-    if str(validated.get("outcome") or "") != "ok":
+    if texture_contract_mode not in TEXTURE_CONTRACT_MODES:
+        raise ValueError(
+            "unsupported SpeedTree texture contract mode: "
+            + str(texture_contract_mode)
+        )
+    outcome = str(validated.get("outcome") or "")
+    issues = list(validated.get("issues") or [])
+    texture_only_block = bool(
+        texture_contract_mode == RUNTIME_TOLERANT_TEXTURE_MODE
+        and outcome != "ok"
+        and issues
+        and all(_is_texture_only_issue(issue) for issue in issues)
+    )
+    if outcome != "ok" and not texture_only_block:
         raise RuntimeError(
             "SpeedTree material preflight is not ready: "
-            + str(validated.get("outcome") or "unknown")
+            + str(outcome or "unknown")
         )
 
     source = validated["source"]
@@ -321,8 +494,41 @@ def validate_live_preflight_envelope(
             )
 
     required_roles = tuple(api.required_texture_roles())
+    texture_diagnostics = []
+    runtime_intents = []
     for intent in validated.get("material_intents") or []:
-        _validate_managed_binding(intent, required_roles)
+        if texture_contract_mode == RUNTIME_TOLERANT_TEXTURE_MODE:
+            runtime_intent, diagnostic = _runtime_tolerant_binding(
+                intent, required_roles
+            )
+            runtime_intents.append(runtime_intent)
+            if diagnostic is not None:
+                texture_diagnostics.append(diagnostic)
+        else:
+            _validate_managed_binding(intent, required_roles)
+            runtime_intents.append(copy.deepcopy(intent))
+    validated["material_intents"] = runtime_intents
+    validated[TEXTURE_CONTRACT_MODE_FIELD] = texture_contract_mode
+    validated["texture_only_outcome_override"] = texture_only_block
+    validated["texture_diagnostics"] = texture_diagnostics
+    validated["texture_warnings"] = [
+        row for row in texture_diagnostics
+        if row.get("severity") == "warning"
+    ]
+    available_counts = [
+        len((intent.get("texture_binding") or {}).get("files") or {})
+        for intent in runtime_intents
+    ]
+    if texture_only_block:
+        validated["texture_outcome"] = (
+            "partial" if any(available_counts) else "unassigned"
+        )
+    elif texture_diagnostics:
+        validated["texture_outcome"] = (
+            "partial" if any(available_counts) else "unassigned"
+        )
+    else:
+        validated["texture_outcome"] = "complete"
     return copy.deepcopy(validated), live
 
 
@@ -416,6 +622,9 @@ def production_group_base_name(value):
 
 __all__ = [
     "PIPELINE_ENVELOPE_FIELD",
+    "RUNTIME_TOLERANT_TEXTURE_MODE",
+    "STRICT_PUBLICATION_TEXTURE_MODE",
+    "TEXTURE_CONTRACT_MODE_FIELD",
     "central_contract_api",
     "envelope_field",
     "normalize_instance_profile",
