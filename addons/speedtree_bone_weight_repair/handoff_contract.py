@@ -27,6 +27,30 @@ SOURCE_MODES = {
 }
 
 
+@lru_cache(maxsize=1)
+def _preview_contract_api():
+    """Load the sibling pure module with or without package context."""
+    try:
+        from . import preview_texture_contract
+
+        return preview_texture_contract
+    except ImportError:
+        candidate = Path(__file__).with_name(
+            "preview_texture_contract.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "speedtree_bwr_preview_texture_contract",
+            candidate,
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(
+                "SpeedTree preview texture contract is unavailable"
+            )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 def _central_candidates():
     explicit = str(os.environ.get(CENTRAL_MODULE_ENV) or "").strip()
     if explicit:
@@ -194,6 +218,28 @@ def _validate_managed_binding(intent, required_roles):
     if not isinstance(binding, dict):
         raise ValueError(
             f"Material intent has no texture_binding: {intent.get('material_name')!r}"
+        )
+    origin_receipt = binding.get("origin_receipt")
+    preview_api = _preview_contract_api()
+    declares_preview = preview_api.receipt_declares_preview_fallback(
+        origin_receipt
+    )
+    if (
+        isinstance(origin_receipt, dict)
+        and origin_receipt.get(
+            preview_api.RECEIPT_CAPABILITIES_FIELD
+        )
+        and not declares_preview
+    ):
+        raise ValueError("unsupported texture receipt capability")
+    if declares_preview:
+        preview_api.validate_preview_receipt(
+            origin_receipt,
+            requested_usage=(
+                preview_api.PREVIEW_ONLY_USAGE
+                if mode == "preserve_declared_sources"
+                else "production_canonical"
+            ),
         )
     if mode == "preserve_declared_sources":
         return

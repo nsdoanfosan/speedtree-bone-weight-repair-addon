@@ -15,6 +15,17 @@ import numpy as np
 from mathutils import Vector, kdtree
 
 from . import handoff_contract, speedtree_cli
+from .preview_texture_contract import (
+    PREVIEW_ONLY_USAGE,
+    PREVIEW_RECEIPT_VERSION,
+    PREVIEW_ROLE_FALLBACKS_FIELD,
+    RECEIPT_CAPABILITIES_FIELD,
+    build_preview_role_fallback,
+    finalize_preview_receipt,
+    preview_role_fallbacks_signature,
+    receipt_declares_preview_fallback,
+    validate_preview_receipt,
+)
 
 # Parked 3D Branch Cluster prototype.
 # The active add-on no longer imports/registers this path. Keep the separate
@@ -839,14 +850,27 @@ def _speedtree_preserved_cluster_sources(
         if isinstance(expected_binding, dict)
         else None
     )
-    if expected_receipt is not None and (
-        not isinstance(expected_receipt, dict)
-        or expected_receipt.get("kind") != ATLAS_CLUSTER_RECEIPT_KIND
-        or expected_receipt.get("source_origin")
-        != ATLAS_BLENDER_CLUSTER_BAKE_STATUS
-        or str(expected_receipt.get("version") or "") != "1"
-    ):
-        return None
+    if expected_receipt is not None:
+        if (
+            not isinstance(expected_receipt, dict)
+            or expected_receipt.get("kind")
+            != ATLAS_CLUSTER_RECEIPT_KIND
+            or expected_receipt.get("source_origin")
+            != ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+        ):
+            return None
+        if receipt_declares_preview_fallback(expected_receipt):
+            try:
+                validate_preview_receipt(
+                    expected_receipt,
+                    requested_usage=PREVIEW_ONLY_USAGE,
+                )
+            except (TypeError, ValueError):
+                return None
+        elif expected_receipt.get(RECEIPT_CAPABILITIES_FIELD):
+            return None
+        elif str(expected_receipt.get("version") or "") != "1":
+            return None
     expected_index_space = str(
         (expected_receipt or {}).get("slot_index_space")
         or (expected_receipt or {}).get("map_index_space")
@@ -872,16 +896,22 @@ def _speedtree_preserved_cluster_sources(
         or ""
     ).strip()
     if expected_manifest:
-        candidate_paths.add(Path(expected_manifest).expanduser().resolve())
-    try:
-        candidate_paths.update(
-            path.resolve()
-            for path in cluster_root.glob(
-                "*_auto_capture_manifest.json"
+        expected_manifest_path = Path(
+            expected_manifest
+        ).expanduser().resolve()
+        if not _path_is_under(expected_manifest_path, cluster_root):
+            return None
+        candidate_paths.add(expected_manifest_path)
+    else:
+        try:
+            candidate_paths.update(
+                path.resolve()
+                for path in cluster_root.glob(
+                    "*_auto_capture_manifest.json"
+                )
             )
-        )
-    except OSError:
-        return None
+        except OSError:
+            return None
 
     stmat_material_name = str(
         stmat_material.get("name") or material.name
@@ -968,6 +998,7 @@ def _speedtree_preserved_cluster_sources(
             continue
 
         declared = {}
+        declared_rows = []
         valid_rows = True
         for row in payload.get("maps") or []:
             if (
@@ -976,6 +1007,11 @@ def _speedtree_preserved_cluster_sources(
                 or not row.get("role")
             ):
                 continue
+            raw_role = re.sub(
+                r"[^a-z0-9]+",
+                "",
+                str(row.get("role") or "").casefold(),
+            )
             role = _texture_semantic_role(row.get("role"))
             path = Path(str(row.get("path"))).expanduser()
             if not path.is_absolute():
@@ -999,15 +1035,19 @@ def _speedtree_preserved_cluster_sources(
             ):
                 valid_rows = False
                 break
-            declared[role] = {
+            declared_row = {
                 "role": role,
+                "raw_role": raw_role,
                 "path": str(path),
                 "sha256": sha256,
             }
+            declared[role] = declared_row
+            declared_rows.append(declared_row)
         if not valid_rows:
             continue
 
         slot_files = []
+        preview_role_fallbacks = []
         for role, path in sorted(resolved.items()):
             declared_row = declared.get(role)
             if (
@@ -1015,7 +1055,41 @@ def _speedtree_preserved_cluster_sources(
                 or _path_identity(declared_row["path"])
                 != _path_identity(path)
             ):
-                break
+                # Exact semantic-role equality remains the default.  This
+                # helper recognizes only the receipt-recorded preview case.
+                if (
+                    expected_receipt is None
+                    or not receipt_declares_preview_fallback(
+                        expected_receipt
+                    )
+                ):
+                    break
+                selected_rows = [
+                    row
+                    for row in declared_rows
+                    if _path_identity(row["path"])
+                    == _path_identity(path)
+                ]
+                fallback = build_preview_role_fallback(
+                    slot_role=role,
+                    slot_path=path,
+                    selected_rows=selected_rows,
+                    material_id=stmat_material_id,
+                    # SpeedTree SPM and STMAT names differ by the exported
+                    # ``_Mat`` suffix.  The normalized key comparison above
+                    # proves they are the same material; keep the producer's
+                    # exact parent-receipt spelling for cross-reader identity.
+                    material_name=declared_material,
+                    contract_hash=capture_hash,
+                    map_index=slot_identity[role]["map_index"],
+                    map_name=slot_identity[role]["map"],
+                    workflow_mode=payload.get("workflow_mode"),
+                    direct_uv_source=payload.get("direct_uv_source"),
+                )
+                if fallback is None:
+                    break
+                declared_row = declared[fallback["manifest_role"]]
+                preview_role_fallbacks.append(fallback)
             slot_files.append({
                 "map_index": slot_identity[role]["map_index"],
                 "stmat_map_index": slot_identity[role]["map_index"],
@@ -1090,10 +1164,137 @@ def _speedtree_preserved_cluster_sources(
                         break
                 if not valid_rows:
                     continue
+            if (
+                expected_receipt is not None
+                and PREVIEW_ROLE_FALLBACKS_FIELD in expected_receipt
+            ):
+                expected_fallbacks = expected_receipt.get(
+                    PREVIEW_ROLE_FALLBACKS_FIELD
+                )
+                if expected_index_space in {
+                    SOURCE_SPM_MAP_INDEX_SPACE,
+                    _LEGACY_SOURCE_SPM_MAP_INDEX_SPACE,
+                }:
+                    if not isinstance(expected_fallbacks, list):
+                        continue
+                    expected_fallbacks = [
+                        dict(row)
+                        for row in expected_fallbacks
+                        if isinstance(row, dict)
+                    ]
+                    if len(expected_fallbacks) != len(
+                        expected_receipt.get(
+                            PREVIEW_ROLE_FALLBACKS_FIELD
+                        )
+                    ):
+                        continue
+                    valid_fallback_indexes = True
+                    for row in expected_fallbacks:
+                        matching_slots = []
+                        for slot in expected_slots:
+                            if not isinstance(slot, dict):
+                                continue
+                            slot_role = _texture_semantic_role(
+                                slot.get("capture_role")
+                                or slot.get("map")
+                                or slot.get("role")
+                            )
+                            try:
+                                source_index_match = int(
+                                    slot.get("map_index")
+                                ) == int(row.get("map_index"))
+                            except (TypeError, ValueError):
+                                source_index_match = False
+                            if (
+                                slot_role == row.get("slot_role")
+                                and source_index_match
+                                and str(slot.get("map") or "").strip()
+                                == str(row.get("map") or "").strip()
+                                and _path_identity(slot.get("path"))
+                                == _path_identity(row.get("path"))
+                                and str(
+                                    slot.get("sha256") or ""
+                                ).strip().casefold()
+                                == str(
+                                    row.get("sha256") or ""
+                                ).strip().casefold()
+                            ):
+                                matching_slots.append(slot)
+                        if len(matching_slots) != 1:
+                            valid_fallback_indexes = False
+                            break
+                        live_stmat_slot = slot_identity.get(
+                            row.get("slot_role")
+                        )
+                        if live_stmat_slot is None:
+                            valid_fallback_indexes = False
+                            break
+                        try:
+                            live_stmat_index = int(
+                                live_stmat_slot["map_index"]
+                            )
+                            declared_stmat_index = matching_slots[0].get(
+                                "stmat_map_index"
+                            )
+                            if (
+                                declared_stmat_index is not None
+                                and int(declared_stmat_index)
+                                != live_stmat_index
+                            ):
+                                raise ValueError(
+                                    "stmat_map_index mismatch"
+                                )
+                            row["map_index"] = live_stmat_index
+                        except (KeyError, TypeError, ValueError):
+                            valid_fallback_indexes = False
+                            break
+                    if not valid_fallback_indexes:
+                        continue
+                expected_fallback_signature = (
+                    preview_role_fallbacks_signature(
+                        expected_fallbacks
+                    )
+                )
+                current_fallback_signature = (
+                    preview_role_fallbacks_signature(
+                        preview_role_fallbacks
+                    )
+                )
+                if (
+                    expected_fallback_signature is None
+                    or expected_fallback_signature
+                    != current_fallback_signature
+                ):
+                    continue
+            if expected_slots:
+                for slot in slot_files:
+                    expected_slot = expected_by_role.get(
+                        slot["capture_role"]
+                    )
+                    declared_spm_index = (
+                        expected_slot.get("spm_map_index")
+                        if isinstance(expected_slot, dict)
+                        else None
+                    )
+                    if declared_spm_index is None:
+                        continue
+                    try:
+                        declared_spm_index = int(declared_spm_index)
+                    except (TypeError, ValueError):
+                        valid_rows = False
+                        break
+                    if declared_spm_index < 0:
+                        valid_rows = False
+                        break
+                    slot["spm_map_index"] = declared_spm_index
+                if not valid_rows:
+                    continue
             proofs.append({
                 "manifest_path": manifest_path,
                 "capture_hash": capture_hash,
+                "receipt_material_name": declared_material,
                 "slot_files": slot_files,
+                PREVIEW_ROLE_FALLBACKS_FIELD: preview_role_fallbacks,
             })
 
     signatures = {
@@ -1109,6 +1310,9 @@ def _speedtree_preserved_cluster_sources(
                 )
                 for row in proof["slot_files"]
             ),
+            preview_role_fallbacks_signature(
+                proof[PREVIEW_ROLE_FALLBACKS_FIELD]
+            ),
         )
         for proof in proofs
     }
@@ -1121,7 +1325,11 @@ def _speedtree_preserved_cluster_sources(
         "source_origin": ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
         "source_spm": str(_source_fbx_expected_spm(source_fbx_path)),
         "material_id": stmat_material_id,
-        "material_name": material.name,
+        "material_name": (
+            proof["receipt_material_name"]
+            if proof[PREVIEW_ROLE_FALLBACKS_FIELD]
+            else material.name
+        ),
         "stmat_material_name": stmat_material_name,
         "slot_index_space": STMAT_MAP_INDEX_SPACE,
         "physical_capture_manifest": str(
@@ -1133,12 +1341,68 @@ def _speedtree_preserved_cluster_sources(
         ],
         "slot_files": proof["slot_files"],
     }
+    if proof[PREVIEW_ROLE_FALLBACKS_FIELD]:
+        origin_receipt[PREVIEW_ROLE_FALLBACKS_FIELD] = list(
+            proof[PREVIEW_ROLE_FALLBACKS_FIELD]
+        )
+        try:
+            origin_receipt = finalize_preview_receipt(origin_receipt)
+            validate_preview_receipt(
+                origin_receipt,
+                requested_usage=PREVIEW_ONLY_USAGE,
+            )
+        except (TypeError, ValueError):
+            return None
+        if int(origin_receipt.get("version") or 0) != (
+            PREVIEW_RECEIPT_VERSION
+        ):
+            return None
+        manifest_path = Path(
+            origin_receipt["physical_capture_manifest"]
+        )
+        if (
+            not manifest_path.is_file()
+            or not _path_is_under(manifest_path, cluster_root)
+        ):
+            return None
+        slots_by_role = {
+            row["capture_role"]: row
+            for row in origin_receipt["slot_files"]
+        }
+        for row in origin_receipt[PREVIEW_ROLE_FALLBACKS_FIELD]:
+            selected_path = Path(row["path"]).expanduser().resolve()
+            selected_slot = slots_by_role.get(row["slot_role"])
+            try:
+                live_match = (
+                    _path_is_under(selected_path, cluster_root)
+                    and selected_path.is_file()
+                    and selected_path.stat().st_size > 0
+                    and _file_sha256(selected_path).casefold()
+                    == row["sha256"]
+                )
+            except OSError:
+                live_match = False
+            if (
+                not live_match
+                or selected_slot is None
+                or _path_identity(selected_slot["path"])
+                != _path_identity(selected_path)
+                or selected_slot["sha256"] != row["sha256"]
+                or row["material_id"] != stmat_material_id
+                or row["material_name"]
+                != origin_receipt["material_name"]
+                or row["contract_hash"] != proof["capture_hash"]
+            ):
+                return None
     return {
         "cluster_root": str(cluster_root.resolve()),
         "source_maps": resolved,
         "preserved_files": resolved,
         "origin_kind": ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
         "origin_receipt": origin_receipt,
+        PREVIEW_ROLE_FALLBACKS_FIELD: list(
+            proof[PREVIEW_ROLE_FALLBACKS_FIELD]
+        ),
     }
 
 
@@ -1376,6 +1640,17 @@ def _validate_atlas_canonical_entry(
     source_fbx_path=None,
 ):
     contract = entry["contract"]
+    if any(
+        receipt_declares_preview_fallback(candidate)
+        for candidate in (
+            contract,
+            contract.get("origin_receipt"),
+        )
+    ):
+        raise RuntimeError(
+            "Atlas canonical texture mapping rejects preview-only receipt "
+            "capabilities"
+        )
     texture_base = str(contract.get("texture_base") or "").strip()
     if not texture_base.casefold().startswith("t_"):
         raise RuntimeError(
@@ -2833,6 +3108,9 @@ def preflight_speedtree_material_texture_contracts(
                         "texture_base": row.get("texture_base"),
                         "files": row.get("files") or {},
                         "slot_files": row.get("slot_files") or [],
+                        "origin_receipt": row.get(
+                            "origin_receipt"
+                        ) or {},
                         "missing_roles": row.get("missing_roles") or [],
                     },
                     sort_keys=True,
@@ -2864,6 +3142,23 @@ def preflight_speedtree_material_texture_contracts(
         origin_state = str(
             (effective or {}).get("origin_state") or ""
         ).strip()
+        effective_origin_receipt = (
+            (effective or {}).get("origin_receipt")
+        )
+        if (
+            receipt_declares_preview_fallback(
+                effective_origin_receipt
+            )
+            and (
+                origin_state == "canonical_t"
+                or (effective or {}).get("texture_source_mode")
+                == "managed_texture_set"
+            )
+        ):
+            raise RuntimeError(
+                "Preview-only texture receipt cannot satisfy a canonical "
+                f"production binding: {material.name}"
+            )
         if origin_state == "canonical_t":
             effective["texture_contract_status"] = (
                 ATLAS_CANONICAL_TEXTURE_STATUS
@@ -3147,13 +3442,19 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                     {
                         "status": row.get("status"),
                         "texture_source_mode": row.get("texture_source_mode"),
+                        "origin_state": row.get("origin_state"),
                         "set_key": row.get("set_key"),
                         "texture_base": row.get("texture_base"),
                         "files": row.get("files") or {},
+                        "slot_files": row.get("slot_files") or [],
+                        "origin_receipt": row.get(
+                            "origin_receipt"
+                        ) or {},
                         "missing_roles": row.get("missing_roles") or [],
                     },
                     sort_keys=True,
                     separators=(",", ":"),
+                    default=str,
                 )
                 for row in candidates
             }
@@ -3231,13 +3532,19 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                     {
                         "status": row.get("status"),
                         "texture_source_mode": row.get("texture_source_mode"),
+                        "origin_state": row.get("origin_state"),
                         "set_key": row.get("set_key"),
                         "texture_base": row.get("texture_base"),
                         "files": row.get("files") or {},
+                        "slot_files": row.get("slot_files") or [],
+                        "origin_receipt": row.get(
+                            "origin_receipt"
+                        ) or {},
                         "missing_roles": row.get("missing_roles") or [],
                     },
                     sort_keys=True,
                     separators=(",", ":"),
+                    default=str,
                 )
                 for row in binding_candidates
             }

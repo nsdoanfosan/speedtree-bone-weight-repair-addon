@@ -4,6 +4,7 @@ __pycache__/
 *.blend1
 *.fbx
 *.json
+!tests/fixtures/preview_role_fallback_v1.json
 *.log
 .venv/
 .idea/

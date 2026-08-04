@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -13,6 +14,9 @@ ADAPTER_PATH = (
     / "addons"
     / "speedtree_bone_weight_repair"
     / "handoff_contract.py"
+)
+PREVIEW_FIXTURE_PATH = (
+    REPO_ROOT / "tests" / "fixtures" / "preview_role_fallback_v1.json"
 )
 SPEC = importlib.util.spec_from_file_location("bwr_handoff_contract_test", ADAPTER_PATH)
 adapter = importlib.util.module_from_spec(SPEC)
@@ -164,6 +168,53 @@ class BwrHandoffContractTests(unittest.TestCase):
         self.assertEqual(
             adapter.production_group_tokens("M_stem_common_01"), []
         )
+
+    def test_managed_production_binding_rejects_preview_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            receipt = json.loads(
+                PREVIEW_FIXTURE_PATH.read_text(encoding="utf-8")
+            )
+            envelope["material_intents"][0]["texture_binding"][
+                "origin_receipt"
+            ] = receipt
+
+            with self.assertRaisesRegex(ValueError, "forbidden"):
+                adapter.validate_live_preflight_envelope(
+                    envelope,
+                    spm_path=spm,
+                    stmat_paths=[stmat],
+                )
+
+            envelope["material_intents"][0][
+                "texture_source_mode"
+            ] = "preserve_declared_sources"
+            adapter.validate_live_preflight_envelope(
+                envelope,
+                spm_path=spm,
+                stmat_paths=[stmat],
+            )
+
+    def test_unknown_origin_receipt_capability_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            spm, stmat, envelope = self.make_envelope(Path(temporary))
+            envelope["material_intents"][0]["texture_binding"][
+                "origin_receipt"
+            ] = {
+                "kind": "blender_cluster_bake_texture_origin_receipt",
+                "version": 1,
+                "receipt_capabilities": ["unknown_capability_v1"],
+            }
+            envelope["material_intents"][0][
+                "texture_source_mode"
+            ] = "preserve_declared_sources"
+
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                adapter.validate_live_preflight_envelope(
+                    envelope,
+                    spm_path=spm,
+                    stmat_paths=[stmat],
+                )
 
 
 if __name__ == "__main__":
