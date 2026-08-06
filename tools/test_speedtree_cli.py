@@ -191,6 +191,75 @@ class SpeedTreeCliTests(unittest.TestCase):
             self.assertTrue(target.with_suffix(".stmat").is_file())
             self.assertTrue(Path(second["cache_path"]).is_file())
 
+    def test_identical_option_bytes_in_another_checkout_reuse_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, first_options = make_inputs(root)
+            second_options = root / "another-checkout" / "Options.ini"
+            second_options.parent.mkdir()
+            second_options.write_bytes(first_options.read_bytes())
+            stat = second_options.stat()
+            os.utime(
+                second_options,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000),
+            )
+            target = root / "out" / "SK_test.fbx"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                write_staged_fbx(command)
+                return FakeProcess(command, kwargs["stdout"], kwargs["stderr"])
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ):
+                first = speedtree_cli.export_target(
+                    exe, spm, first_options, "fbx", target
+                )
+                second = speedtree_cli.export_target(
+                    exe, spm, second_options, "fbx", target
+                )
+
+            self.assertFalse(first["cache_hit"])
+            self.assertTrue(second["cache_hit"])
+            self.assertEqual(len(calls), 1)
+
+    def test_different_option_content_still_invalidates_export_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, first_options = make_inputs(root)
+            second_options = root / "another-checkout" / "Options.ini"
+            second_options.parent.mkdir()
+            second_options.write_text(
+                "[Options]\nTextureSkipWriting=true\nGeometry=changed\n",
+                encoding="utf-8",
+            )
+            target = root / "out" / "SK_test.fbx"
+            call_count = 0
+
+            def popen(command, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                write_staged_fbx(
+                    command, f"fbx-v{call_count}".encode("ascii")
+                )
+                return FakeProcess(command, kwargs["stdout"], kwargs["stderr"])
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ):
+                speedtree_cli.export_target(
+                    exe, spm, first_options, "fbx", target
+                )
+                second = speedtree_cli.export_target(
+                    exe, spm, second_options, "fbx", target
+                )
+
+            self.assertFalse(second["cache_hit"])
+            self.assertEqual(call_count, 2)
+            self.assertEqual(target.read_bytes(), b"fbx-v2")
+
     def test_changed_spm_invalidates_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
