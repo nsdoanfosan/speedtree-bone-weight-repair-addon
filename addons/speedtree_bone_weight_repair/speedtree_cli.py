@@ -261,10 +261,81 @@ def _artifact_matches(record, root):
         return False
 
 
-def _cache_hit(cache, fingerprint, kind, target):
+def _normalized_path(value):
+    try:
+        return os.path.normcase(str(Path(value).resolve())).casefold()
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def _same_content_identity(recorded, current, *, require_path):
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    if require_path and _normalized_path(recorded.get("path")) != _normalized_path(
+        current.get("path")
+    ):
+        return False
+    try:
+        return bool(
+            int(recorded.get("size")) == int(current.get("size"))
+            and str(recorded.get("sha256") or "").casefold()
+            == str(current.get("sha256") or "").casefold()
+            and current.get("sha256")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _same_executable_identity(recorded, current):
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    try:
+        return bool(
+            _normalized_path(recorded.get("path"))
+            == _normalized_path(current.get("path"))
+            and int(recorded.get("size")) == int(current.get("size"))
+            and int(recorded.get("mtime_ns")) == int(current.get("mtime_ns"))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _semantically_equivalent_inputs(cache, inputs, kind, target):
+    """Accept identical presets copied into another checkout.
+
+    The output target and authored SPM remain path-bound.  An FBX/XML option
+    preset is behaviorally identified by its bytes, so checkout path and mtime
+    differences must not make two tools repeatedly overwrite the same export
+    cache.  This fallback also upgrades existing version-1 receipts without a
+    fleet-wide cache purge.
+    """
+    recorded = cache.get("inputs") if isinstance(cache, dict) else None
+    if not isinstance(recorded, dict) or not isinstance(inputs, dict):
+        return False
+    if str(cache.get("kind") or "").casefold() != str(kind).casefold():
+        return False
+    if _normalized_path(cache.get("target")) != _normalized_path(target):
+        return False
+    return bool(
+        _same_content_identity(
+            recorded.get("spm"), inputs.get("spm"), require_path=True
+        )
+        and _same_content_identity(
+            recorded.get("options"), inputs.get("options"), require_path=False
+        )
+        and _same_executable_identity(
+            recorded.get("speedtree_exe"), inputs.get("speedtree_exe")
+        )
+    )
+
+
+def _cache_hit(cache, fingerprint, kind, target, inputs=None):
     if not cache or cache.get("version") != EXPORT_CACHE_VERSION:
         return False
-    if cache.get("input_fingerprint") != fingerprint:
+    if (
+        cache.get("input_fingerprint") != fingerprint
+        and not _semantically_equivalent_inputs(cache, inputs, kind, target)
+    ):
         return False
     artifacts = cache.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
@@ -512,7 +583,7 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
     cache_path = _cache_path(target)
     started = _utc_timestamp()
     cache = _load_cache(cache_path)
-    if _cache_hit(cache, fingerprint, kind, target):
+    if _cache_hit(cache, fingerprint, kind, target, inputs):
         finished = _utc_timestamp()
         return {
             "path": str(target),
