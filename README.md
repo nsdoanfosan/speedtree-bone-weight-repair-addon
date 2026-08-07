@@ -40,6 +40,14 @@ The Unreal project owns runtime behavior:
 
 Do not use the conversion JSON as a scratchpad for live Unreal wind tuning. Runtime fixes in Unreal should not require regenerating the FBX or rewriting source conversion JSON unless the geometry grouping or binding contract changes.
 
+The add-on assigns one immutable response category (`TREE`, `BUSH`, `WEED`, or
+`NONE`) and exports the per-group basis Unreal needs. Unreal exposes one shared
+numeric response profile per category; changing `TREE` affects every imported
+mesh assigned to `TREE`, never one Skeletal Mesh override. `NONE` follows the
+same contract and merely starts with zero-valued defaults. These asset-response
+profiles are separate from level/weather wind speed, amplitude, direction, and
+gust controls.
+
 ### SpeedTree Export Input Recommendation
 
 For MegaPlant JSON grouping, prefer a SpeedTree FBX export that preserves useful mesh/object hierarchy. The final Blender output can still become one merged skeletal mesh, but the JSON should be captured from the repaired source objects before that merge happens.
