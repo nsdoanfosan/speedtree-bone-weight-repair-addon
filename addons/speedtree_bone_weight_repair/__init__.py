@@ -70,34 +70,34 @@ BUNDLED_FBX_EXPORT_OPTIONS = str(BUNDLED_PRESET_DIR / "Options_MA_Fbx.ini")
 BUNDLED_XML_EXPORT_OPTIONS = str(BUNDLED_PRESET_DIR / "Options_HI_Xml.ini")
 
 
-# Wind slot presets: pick the plant type, get proven starting values; Custom
-# exposes the raw sliders. Tree matches the verified SK_Tree_elm_01 reference
-# import; Bush/Grass are starting points (final feel is tuned on the Unreal
-# CodexDynamicWindSourceController anyway).
+# Immutable wind response categories. These values are only default snapshots
+# for backward compatibility; Unreal owns one shared editable profile per ID.
+# The level/weather DynamicWind source controller is a separate system.
 WIND_PRESETS = {
     "TREE": {"flexibility": 1.0, "gust_attenuation": 0.25, "ground_cover": False},
     "BUSH": {"flexibility": 1.4, "gust_attenuation": 0.40, "ground_cover": False},
-    "GRASS": {"flexibility": 1.8, "gust_attenuation": 0.60, "ground_cover": True},
+    "WEED": {"flexibility": 1.8, "gust_attenuation": 0.60, "ground_cover": True},
+    "NONE": {"flexibility": 0.0, "gust_attenuation": 0.0, "ground_cover": False},
 }
 
+WIND_PRESET_ALIASES = {"GRASS": "WEED"}
+
 WIND_PRESET_ITEMS = (
-    ("TREE", "Tree", "Large tree: stiff trunk, canopy sways (flex 1.0, gust 0.25) — matches the verified elm reference"),
-    ("BUSH", "Bush", "Shrub: no rigid trunk, whole plant sways (flex 1.4, gust 0.40)"),
-    ("GRASS", "Grass", "Ground cover: everything sways, ground-cover flag on (flex 1.8, gust 0.60)"),
-    ("CUSTOM", "Custom", "Enter Wind Flexibility / Gust Attenuation / Ground Cover manually"),
+    ("TREE", "Tree", "Immutable TREE response category; shared values are edited in Unreal"),
+    ("BUSH", "Bush", "Immutable BUSH response category; shared values are edited in Unreal"),
+    ("WEED", "Weed", "Immutable WEED response category; shared values are edited in Unreal"),
+    ("NONE", "None", "Immutable NONE response category; shared Unreal defaults are zero"),
 )
 
 
+def canonical_wind_preset_id(value):
+    preset_id = str(value or "TREE").strip().upper()
+    preset_id = WIND_PRESET_ALIASES.get(preset_id, preset_id)
+    return preset_id if preset_id in WIND_PRESETS else "TREE"
+
+
 def resolve_wind_values(settings):
-    # Effective wind numbers for the JSON: preset table unless Custom.
-    preset = WIND_PRESETS.get(settings.wind_preset)
-    if preset is None:
-        return {
-            "flexibility": settings.dynamic_wind_flexibility,
-            "gust_attenuation": settings.dynamic_wind_gust_attenuation,
-            "ground_cover": settings.dynamic_wind_ground_cover,
-        }
-    return dict(preset)
+    return dict(WIND_PRESETS[canonical_wind_preset_id(settings.wind_preset)])
 
 
 def get_core():
@@ -293,7 +293,7 @@ class STBWR_Settings(PropertyGroup):
     )
     wind_preset: EnumProperty(
         name="Wind Preset",
-        description="Plant-type slot preset for the dynamic wind values; Custom exposes the raw sliders",
+        description="Immutable response category assigned upstream; edit its shared numeric profile in Unreal",
         items=WIND_PRESET_ITEMS,
         default="TREE",
     )
@@ -406,7 +406,7 @@ class STBWR_Settings(PropertyGroup):
             "source_collection_name": self.source_collection_name,
             "write_unreal_json": self.write_unreal_json,
             "write_dynamic_wind_json": self.write_dynamic_wind_json,
-            "wind_preset": self.wind_preset,
+            "wind_preset": canonical_wind_preset_id(self.wind_preset),
             "dynamic_wind_flexibility": wind["flexibility"],
             "dynamic_wind_gust_attenuation": wind["gust_attenuation"],
             "dynamic_wind_ground_cover": wind["ground_cover"],
@@ -814,20 +814,15 @@ class STBWR_PT_Main(Panel):
         box.prop(settings, "write_dynamic_wind_json")
         if settings.write_dynamic_wind_json:
             box.prop(settings, "wind_preset")
-            if settings.wind_preset == "CUSTOM":
-                box.prop(settings, "dynamic_wind_flexibility", slider=True)
-                row = box.row(align=True)
-                row.prop(settings, "dynamic_wind_gust_attenuation")
-                row.prop(settings, "dynamic_wind_ground_cover")
-            else:
-                wind = resolve_wind_values(settings)
-                box.label(
-                    text=(
-                        f"Flexibility {wind['flexibility']:.1f} · Gust {wind['gust_attenuation']:.2f}"
-                        + (" · Ground Cover" if wind["ground_cover"] else "")
-                    ),
-                    icon="INFO",
-                )
+            wind = resolve_wind_values(settings)
+            box.label(
+                text=(
+                    f"Default: Flexibility {wind['flexibility']:.1f} · Gust {wind['gust_attenuation']:.2f}"
+                    + (" · Ground Cover" if wind["ground_cover"] else "")
+                ),
+                icon="INFO",
+            )
+            box.label(text="Shared response values are edited and applied in Unreal.")
         # The JSON's real payload is per-bone simulation groups, which come from
         # the XML. No XML -> nothing for Unreal's wind import to consume.
         if not settings.xml_path:

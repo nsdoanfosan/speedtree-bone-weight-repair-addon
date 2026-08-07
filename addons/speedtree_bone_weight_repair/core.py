@@ -7198,9 +7198,9 @@ def run_preview_json_groups(settings):
 # bIsGroundCover, GustAttenuation}. This is the same conversion the old manual
 # work-script did in the editor; it belongs here next to the bone/group data the
 # add-on already computes, so the add-on emits the import-ready JSON directly and
-# Unreal only has to call the (stable C++) import function — no conversion code
-# stranded editor-side. Per-group influence values are sensible defaults an
-# artist can override in Unreal afterwards.
+# Unreal only has to call the stable C++ import function. Final values remain
+# for legacy importers; the versioned response contract lets Unreal rebuild
+# them from one shared profile per immutable preset ID.
 
 
 def derive_group_flex(simulation_groups, flexibility=1.0):
@@ -7310,6 +7310,29 @@ def build_dynamic_wind_groups(simulation_groups, flexibility=1.0, ground_cover=F
             }
         )
     return groups
+
+
+def build_dynamic_wind_group_bases(simulation_groups):
+    """Build the asset-specific basis used by shared Unreal response profiles."""
+    normalized_flex = derive_group_flex(simulation_groups, 1.0)
+    max_index = max((group["index"] for group in simulation_groups), default=0)
+    by_index = {group["index"]: group for group in simulation_groups}
+    bases = []
+    for group_index in range(max_index + 1):
+        source = by_index.get(group_index, {})
+        bases.append(
+            {
+                "SimulationGroupIndex": group_index,
+                "BaseFlexibility": round(
+                    min(1.0, max(0.0, normalized_flex.get(group_index, 0.0))),
+                    6,
+                ),
+                "bSourceTrunkGroup": bool(
+                    source.get("is_trunk_group", group_index == 0)
+                ),
+            }
+        )
+    return bases
 
 
 def build_final_skeleton_wind_contract(bone_records, import_root_name):
@@ -7428,7 +7451,15 @@ def build_final_skeleton_wind_contract(bone_records, import_root_name):
     }
 
 
-def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.25, ground_cover=False, flexibility=1.0, import_root_name=None):
+def build_dynamic_wind_data(
+    bone_records,
+    simulation_groups,
+    gust_attenuation=0.25,
+    ground_cover=False,
+    flexibility=1.0,
+    import_root_name=None,
+    wind_preset="TREE",
+):
     indexed, skeleton_contract = build_final_skeleton_wind_contract(
         bone_records, import_root_name
     )
@@ -7455,10 +7486,30 @@ def build_dynamic_wind_data(bone_records, simulation_groups, gust_attenuation=0.
         )
     if not joints:
         raise RuntimeError("Cannot build dynamic wind JSON: no joint→group entries (needs the SpeedTree XML).")
+    canonical_preset = str(wind_preset or "TREE").strip().upper()
+    if canonical_preset == "GRASS":
+        canonical_preset = "WEED"
+    if canonical_preset not in {"TREE", "BUSH", "WEED", "NONE"}:
+        raise RuntimeError(
+            "Cannot build dynamic wind JSON: unsupported response preset "
+            f"{canonical_preset!r}."
+        )
     return {
         "SkeletonContract": skeleton_contract,
         "Joints": joints,
         "SimulationGroups": build_dynamic_wind_groups(simulation_groups or [], flexibility, ground_cover),
+        "WindResponsePresetContract": {
+            "SchemaVersion": 1,
+            "Preset": canonical_preset,
+            "DefaultProfile": {
+                "Flexibility": float(flexibility),
+                "GustAttenuation": float(gust_attenuation),
+                "bIsGroundCover": bool(ground_cover),
+            },
+            "SimulationGroupBases": build_dynamic_wind_group_bases(
+                simulation_groups or []
+            ),
+        },
         "bIsGroundCover": bool(ground_cover),
         "GustAttenuation": float(gust_attenuation),
         # flexibility<=0 (wind NONE) marks the mesh disabled so the runtime can
@@ -7577,7 +7628,7 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             "bones": xml_bones,
         },
         "runtime_boundary": {
-            "note": "This JSON is the rich record. The Unreal-ready import file is the sibling *_dynamic_wind_import_from_megaplant_groups.json. Per-group influence defaults may be overridden in Unreal.",
+            "note": "This JSON is the rich record. The Unreal-ready sibling carries an immutable response preset ID and group basis; shared preset values are edited in Unreal, not per mesh.",
         },
         "export_report": export_report or {},
     }
@@ -7596,6 +7647,7 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             ground_cover=settings.get("dynamic_wind_ground_cover", False),
             flexibility=settings.get("dynamic_wind_flexibility", 1.0),
             import_root_name=armature.name,
+            wind_preset=settings.get("wind_preset", "TREE"),
         )
         write_report(dynamic_wind_path, dynamic_wind)
         result["dynamic_wind_path"] = dynamic_wind_path
