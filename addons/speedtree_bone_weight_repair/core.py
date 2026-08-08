@@ -8812,6 +8812,21 @@ def assign_mesh_components_from_skinned_surface(obj, duplicate, surface_targets)
 XML_ATTR_RE = re.compile(r'([A-Za-z][A-Za-z0-9]*)="([^"]*)"')
 
 
+def _speedtree_xml_number(value):
+    """Parse the invariant or locale-comma decimal emitted by SpeedTree Raw XML."""
+    text = str("" if value is None else value).strip()
+    if not text:
+        return 0.0
+    if "," in text:
+        if "." in text or text.count(",") != 1:
+            raise ValueError(f"ambiguous SpeedTree XML decimal: {text!r}")
+        text = text.replace(",", ".")
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite SpeedTree XML decimal: {text!r}")
+    return number
+
+
 def parse_speedtree_xml_bones(xml_path):
     path = Path(xml_path)
     if not xml_path or not path.exists():
@@ -8831,10 +8846,18 @@ def parse_speedtree_xml_bones(xml_path):
                         {
                             "id": int(attrs["ID"]),
                             "parent_id": int(attrs.get("ParentID", "-1")),
-                            "radius": float(attrs.get("Radius", "0") or 0.0),
-                            "start": (float(attrs["StartX"]), float(attrs["StartY"]), float(attrs["StartZ"])),
-                            "end": (float(attrs["EndX"]), float(attrs["EndY"]), float(attrs["EndZ"])),
-                            "mass": float(attrs.get("Mass", "0") or 0.0),
+                            "radius": _speedtree_xml_number(attrs.get("Radius", "0")),
+                            "start": (
+                                _speedtree_xml_number(attrs["StartX"]),
+                                _speedtree_xml_number(attrs["StartY"]),
+                                _speedtree_xml_number(attrs["StartZ"]),
+                            ),
+                            "end": (
+                                _speedtree_xml_number(attrs["EndX"]),
+                                _speedtree_xml_number(attrs["EndY"]),
+                                _speedtree_xml_number(attrs["EndZ"]),
+                            ),
+                            "mass": _speedtree_xml_number(attrs.get("Mass", "0")),
                             "generator": attrs.get("Generator", ""),
                         }
                     )
