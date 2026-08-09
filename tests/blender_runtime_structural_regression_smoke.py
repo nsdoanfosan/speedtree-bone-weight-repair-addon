@@ -749,4 +749,50 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         for path in core.material_texture_signature(decode_material)
     } == {valid_color.resolve(), valid_normal.resolve()}
 
+    # A scan-authored trunk can use M_tree_*/M_bark_* names rather than the
+    # branch/leaf conventions. The residual pass is source-scoped, excludes
+    # meshes already represented by semantic passes, and the independent
+    # geometry gate catches any authored face that is still missing.
+    bpy.ops.object.armature_add(enter_editmode=False)
+    hybrid_armature = bpy.context.active_object
+    hybrid_armature.name = "HybridScanRoot"
+    hybrid_armature.data.name = "HybridScanRootArmature"
+    trunk_material = bpy.data.materials.new("M_tree_hybrid_scan_01")
+    stitch_material = bpy.data.materials.new("M_tree_hybrid_scan_stitch_01")
+    foreign_material = bpy.data.materials.new("M_unrelated_scene_mesh")
+    hybrid_trunk = make_mesh_object("M_tree_hybrid_scan_01", [trunk_material])
+    hybrid_stitch = make_mesh_object(
+        "M_tree_hybrid_scan_stitch_01", [stitch_material]
+    )
+    unrelated = make_mesh_object("UnrelatedSceneMesh", [foreign_material])
+    for obj in (hybrid_trunk, hybrid_stitch, unrelated):
+        obj.data.uv_layers.new(name="uv0")
+        obj.data.uv_layers.new(name="blend_ao")
+
+    residual = core.run_skin_loose_instances(
+        hybrid_armature.name,
+        "",
+        "HybridResidualGeometry",
+        source_object_names=[hybrid_trunk.name, hybrid_stitch.name],
+        exclude_object_names=[hybrid_stitch.name],
+    )
+    assert residual["status"] == "applied", residual
+    assert residual["source_scope_restricted"], residual
+    assert residual["source_objects"] == [hybrid_trunk.name], residual
+    hybrid_output = bpy.data.objects[residual["created_object"]]
+    coverage = core.validate_source_geometry_coverage(
+        [hybrid_trunk], hybrid_output
+    )
+    assert coverage["status"] == "ok", coverage
+    assert coverage["expected_faces"] == len(hybrid_trunk.data.polygons)
+    try:
+        core.validate_source_geometry_coverage(
+            [hybrid_trunk, hybrid_stitch], hybrid_output
+        )
+    except RuntimeError as exc:
+        assert "M_tree_hybrid_scan_stitch_01" in str(exc), exc
+    else:
+        raise AssertionError("Missing hybrid stitch geometry was not blocked")
+    assert unrelated.hide_render is False
+
 print("RUNTIME_STRUCTURAL_REGRESSION_SMOKE_OK")
