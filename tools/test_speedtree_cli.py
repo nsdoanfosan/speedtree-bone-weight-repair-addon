@@ -282,6 +282,67 @@ class SpeedTreeCliTests(unittest.TestCase):
             self.assertFalse(result["cache_hit"])
             self.assertEqual(target.read_bytes(), b"fbx-v2")
 
+    def test_mtime_only_spm_change_revalidates_entire_cached_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.fbx"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                write_staged_fbx(command)
+                return FakeProcess(command, kwargs["stdout"], kwargs["stderr"])
+
+            with mock.patch.object(speedtree_cli.subprocess, "Popen", side_effect=popen):
+                first = speedtree_cli.export_target(
+                    exe, spm, options, "fbx", target, timeout_seconds=10
+                )
+                fbx_bytes = target.read_bytes()
+                stmat_path = target.with_suffix(".stmat")
+                stmat_bytes = stmat_path.read_bytes()
+                previous_fingerprint = first["input_fingerprint"]
+                current_spm_stat = spm.stat()
+                advanced_spm_mtime = current_spm_stat.st_mtime_ns + 5_000_000_000
+                os.utime(
+                    spm,
+                    ns=(current_spm_stat.st_atime_ns, advanced_spm_mtime),
+                )
+
+                second = speedtree_cli.export_target(
+                    exe, spm, options, "fbx", target, timeout_seconds=10
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(second["cache_hit"])
+            self.assertTrue(second["semantic_cache_revalidated"])
+            self.assertNotEqual(second["input_fingerprint"], previous_fingerprint)
+            self.assertEqual(target.read_bytes(), fbx_bytes)
+            self.assertEqual(stmat_path.read_bytes(), stmat_bytes)
+            self.assertGreaterEqual(target.stat().st_mtime_ns, advanced_spm_mtime)
+            self.assertGreaterEqual(stmat_path.stat().st_mtime_ns, advanced_spm_mtime)
+
+            receipt = speedtree_cli._load_cache(Path(second["cache_path"]))
+            self.assertEqual(
+                receipt["input_fingerprint"], second["input_fingerprint"]
+            )
+            self.assertEqual(
+                receipt["inputs"]["spm"]["mtime_ns"], advanced_spm_mtime
+            )
+            self.assertEqual(
+                receipt["semantic_revalidation"]["artifact_count"], 3
+            )
+            artifact_mtimes = {
+                row["relative_path"]: row["mtime_ns"]
+                for row in receipt["artifacts"]
+            }
+            self.assertEqual(
+                artifact_mtimes[target.name], target.stat().st_mtime_ns
+            )
+            self.assertEqual(
+                artifact_mtimes[stmat_path.name], stmat_path.stat().st_mtime_ns
+            )
+
     def test_first_run_seeds_fresh_valid_existing_export(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

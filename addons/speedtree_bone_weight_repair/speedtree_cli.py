@@ -346,6 +346,75 @@ def _cache_hit(cache, fingerprint, kind, target, inputs=None):
     return _basic_output_is_valid(kind, target, parse_xml=False)
 
 
+def _rebind_semantic_cache_hit(cache_path, cache, fingerprint, inputs, target):
+    """Bind a verified content-equivalent bundle to the current input receipt.
+
+    A semantic cache hit deliberately ignores mtime-only drift on an authored
+    SPM (and path/mtime drift on a byte-identical export preset).  Downstream
+    SpeedTree handoff contracts still require every produced sidecar to be at
+    least as fresh as the current SPM.  Revalidate every artifact first via
+    ``_cache_hit``, then advance the whole immutable bundle and its receipt as
+    one operation.  Bytes and hashes never change here.
+    """
+    previous_fingerprint = str(cache.get("input_fingerprint") or "")
+    if previous_fingerprint == fingerprint:
+        return {
+            "changed": False,
+            "semantic_cache_revalidated": False,
+            "artifacts": list(cache.get("artifacts") or []),
+        }
+
+    minimum_mtime_ns = int((inputs.get("spm") or {}).get("mtime_ns") or 0)
+    if minimum_mtime_ns <= 0:
+        raise RuntimeError(
+            "Semantic SpeedTree cache revalidation has no current SPM mtime"
+        )
+    root = Path(target).parent.resolve()
+    artifacts = []
+    for source_record in cache.get("artifacts") or []:
+        record = dict(source_record)
+        relative_path = str(record.get("relative_path") or "")
+        artifact = (root / relative_path).resolve()
+        try:
+            artifact.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Semantic SpeedTree cache artifact escapes its export root: "
+                + relative_path
+            ) from exc
+        stat = artifact.stat()
+        synchronized_mtime_ns = max(int(stat.st_mtime_ns), minimum_mtime_ns)
+        if synchronized_mtime_ns != int(stat.st_mtime_ns):
+            os.utime(
+                artifact,
+                ns=(int(stat.st_atime_ns), synchronized_mtime_ns),
+            )
+        record["mtime_ns"] = synchronized_mtime_ns
+        artifacts.append(record)
+
+    revalidated_at = _utc_timestamp()
+    rebound = dict(cache)
+    rebound["input_fingerprint"] = fingerprint
+    rebound["inputs"] = inputs
+    rebound["artifacts"] = artifacts
+    rebound["completed_at"] = revalidated_at
+    rebound["semantic_revalidation"] = {
+        "status": "rebound",
+        "previous_input_fingerprint": previous_fingerprint,
+        "current_input_fingerprint": fingerprint,
+        "minimum_artifact_mtime_ns": minimum_mtime_ns,
+        "artifact_count": len(artifacts),
+        "revalidated_at": revalidated_at,
+    }
+    _write_cache(cache_path, rebound)
+    return {
+        "changed": True,
+        "semantic_cache_revalidated": True,
+        "artifacts": artifacts,
+        "evidence": rebound["semantic_revalidation"],
+    }
+
+
 def synchronize_result_mtime(result, minimum_mtime_ns):
     """Advance a verified cached output and its receipt as one export bundle.
 
@@ -584,8 +653,15 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
     started = _utc_timestamp()
     cache = _load_cache(cache_path)
     if _cache_hit(cache, fingerprint, kind, target, inputs):
+        semantic_revalidation = _rebind_semantic_cache_hit(
+            cache_path,
+            cache,
+            fingerprint,
+            inputs,
+            target,
+        )
         finished = _utc_timestamp()
-        return {
+        result = {
             "path": str(target),
             "export_options": str(options),
             "exists": True,
@@ -599,8 +675,14 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
             "cache_seeded": False,
             "cache_path": str(cache_path),
             "input_fingerprint": fingerprint,
-            "artifacts": cache.get("artifacts", []),
+            "artifacts": semantic_revalidation["artifacts"],
+            "semantic_cache_revalidated": semantic_revalidation[
+                "semantic_cache_revalidated"
+            ],
         }
+        if semantic_revalidation.get("evidence"):
+            result["semantic_revalidation"] = semantic_revalidation["evidence"]
+        return result
 
     # Migration for valid outputs written by the former no-cache exporter.
     # Do not use it for a corrupt/stale/mismatched existing receipt: those
