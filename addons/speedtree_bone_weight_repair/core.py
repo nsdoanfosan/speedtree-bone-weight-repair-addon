@@ -9057,11 +9057,26 @@ def choose_bone_for_instance(obj, skinned_parent, armature, segments, candidate_
     return nearest_segment(center, names, heads, tails)
 
 
-def collect_loose_instances(armature, name_contains):
+def collect_loose_instances(
+    armature,
+    name_contains,
+    source_object_names=None,
+    exclude_object_names=None,
+):
     instances = []
     needle = name_contains.lower()
+    source_names = (
+        {str(name) for name in source_object_names}
+        if source_object_names is not None
+        else None
+    )
+    excluded_names = {str(name) for name in (exclude_object_names or [])}
     for obj in bpy.context.scene.objects:
         if obj.type != "MESH":
+            continue
+        if source_names is not None and obj.name not in source_names:
+            continue
+        if obj.name in excluded_names:
             continue
         if is_cluster_normalizer_generated(obj):
             continue
@@ -9244,9 +9259,16 @@ def run_skin_loose_instances(
     spm_path="",
     true_root="Bone_1_Start",
     scale_value="auto",
+    source_object_names=None,
+    exclude_object_names=None,
 ):
     armature = get_armature(armature_name)
-    instances = collect_loose_instances(armature, name_contains)
+    instances = collect_loose_instances(
+        armature,
+        name_contains,
+        source_object_names=source_object_names,
+        exclude_object_names=exclude_object_names,
+    )
     leaf_target_info = {"status": "not-requested", "targets": []}
     if spm_path:
         leaf_mesh_obj = next((obj for obj, parent in instances if parent is None), None)
@@ -9262,6 +9284,11 @@ def run_skin_loose_instances(
         "armature": armature.name,
         "name_contains": name_contains,
         "candidate_instances": len(instances),
+        "source_objects": [obj.name for obj, _parent in instances],
+        "source_scope_restricted": source_object_names is not None,
+        "excluded_source_objects": sorted(
+            {str(name) for name in (exclude_object_names or [])}
+        ),
         "spm_leaf_targets": {
             key: value
             for key, value in leaf_target_info.items()
@@ -10079,6 +10106,88 @@ def park_cluster_source_full_reference(
     }
 
 
+def _mesh_face_material_counts(obj):
+    materials = list(obj.data.materials)
+    counts = Counter()
+    for polygon in obj.data.polygons:
+        slot = int(polygon.material_index)
+        material = materials[slot] if 0 <= slot < len(materials) else None
+        key = material.name if material is not None else f"<unassigned:{slot}>"
+        counts[key] += 1
+    return counts
+
+
+def validate_source_geometry_coverage(source_objects, merged_obj):
+    """Prove that every cleaned source face survives the final SK merge.
+
+    SpeedTree material-grouped FBX files may contain authored scan trunks,
+    stitches, caps, or bark surfaces whose names do not contain ``branch`` or
+    ``leaf``.  Texture-contract validation cannot detect their omission when a
+    material is absent from that contract, so geometry coverage is checked
+    independently against the cleaned imported source objects.
+    """
+    expected_objects = []
+    seen = set()
+    expected_materials = Counter()
+    for obj in source_objects or []:
+        if (
+            obj is None
+            or obj.name in seen
+            or obj.type != "MESH"
+            or obj.data is None
+            or len(obj.data.polygons) == 0
+        ):
+            continue
+        seen.add(obj.name)
+        counts = _mesh_face_material_counts(obj)
+        expected_materials.update(counts)
+        expected_objects.append(
+            {
+                "object": obj.name,
+                "faces": len(obj.data.polygons),
+                "materials": dict(sorted(counts.items())),
+            }
+        )
+
+    actual_materials = _mesh_face_material_counts(merged_obj)
+    expected_faces = sum(row["faces"] for row in expected_objects)
+    actual_faces = len(merged_obj.data.polygons)
+    missing_material_faces = {
+        name: count - actual_materials.get(name, 0)
+        for name, count in expected_materials.items()
+        if count > actual_materials.get(name, 0)
+    }
+    unexpected_material_faces = {
+        name: count - expected_materials.get(name, 0)
+        for name, count in actual_materials.items()
+        if count > expected_materials.get(name, 0)
+    }
+    report = {
+        "status": "ok",
+        "expected_source_mesh_count": len(expected_objects),
+        "expected_faces": expected_faces,
+        "merged_faces": actual_faces,
+        "face_delta": actual_faces - expected_faces,
+        "expected_material_faces": dict(sorted(expected_materials.items())),
+        "merged_material_faces": dict(sorted(actual_materials.items())),
+        "missing_material_faces": dict(sorted(missing_material_faces.items())),
+        "unexpected_material_faces": dict(
+            sorted(unexpected_material_faces.items())
+        ),
+        "source_objects": expected_objects,
+    }
+    if (
+        actual_faces != expected_faces
+        or expected_materials != actual_materials
+    ):
+        report["status"] = "blocked"
+        raise RuntimeError(
+            "Final SpeedTree merge omitted or duplicated cleaned source geometry: "
+            + json.dumps(report, sort_keys=True)
+        )
+    return report
+
+
 def run_merge_export(
     armature_name,
     merged_name,
@@ -10088,6 +10197,7 @@ def run_merge_export(
     report_path="",
     settings=None,
     texture_contract=None,
+    expected_source_objects=None,
 ):
     armature = get_armature(armature_name)
     name_filter = compile_optional_regex(mesh_regex)
@@ -10125,6 +10235,11 @@ def run_merge_export(
     )
     material_slot_validation = validate_face_assigned_material_slots(
         merged_obj
+    )
+    source_geometry_coverage = (
+        validate_source_geometry_coverage(expected_source_objects, merged_obj)
+        if expected_source_objects is not None
+        else {"status": "not_requested"}
     )
     source_fbx_candidates = {
         str(obj.get("codex_source_fbx", "") or "").strip()
@@ -10194,6 +10309,7 @@ def run_merge_export(
             placeholder_material_normalization
         ),
         "material_slot_validation": material_slot_validation,
+        "source_geometry_coverage": source_geometry_coverage,
         "uv_layers": uv_names,
         "color_attributes": [attr.name for attr in merged_obj.data.color_attributes],
         "merge_method": "join",
@@ -10339,6 +10455,10 @@ def default_paths(settings):
             f"{name_stem}_branch_plane_skin_report_codex.json",
         ),
         "leaf_report": os.path.join(reports_dir, f"{name_stem}_leaf_skin_report_codex.json"),
+        "residual_geometry_report": os.path.join(
+            reports_dir,
+            f"{name_stem}_residual_geometry_skin_report_codex.json",
+        ),
         "weight_report": os.path.join(reports_dir, f"{name_stem}_weight_repair_report_codex.json"),
         "export_report": os.path.join(reports_dir, f"{name_stem}_codex_merged_skinned_weights_fixed_export_report.json"),
         "unreal_json": os.path.join(json_dir, f"{name_stem}_megaplant_tree_groups.json"),
@@ -10548,6 +10668,7 @@ def run_full_pipeline(settings):
         spm_path="",
         true_root=settings.get("true_root", "Bone_1_Start"),
         scale_value=settings.get("scale_value", "auto"),
+        source_object_names=[obj.name for obj in source_import_meshes],
     )
     reports["steps"].append(
         {
@@ -10558,6 +10679,7 @@ def run_full_pipeline(settings):
             "created_faces": branch_planes.get("created_faces", 0),
         }
     )
+    represented_source_objects = set(branch_planes.get("source_objects", []))
 
     if settings.get("skip_leaf_skin", False):
         reports["steps"].append({"name": "skin_loose_instances", "status": "skipped"})
@@ -10573,9 +10695,41 @@ def run_full_pipeline(settings):
             spm_path=settings.get("spm_path", ""),
             true_root=settings.get("true_root", "Bone_1_Start"),
             scale_value=settings.get("scale_value", "auto"),
+            source_object_names=[obj.name for obj in source_import_meshes],
         )
+        represented_source_objects.update(leaf.get("source_objects", []))
         reports["steps"].append({"name": "skin_loose_instances", "status": leaf.get("status"), "report": paths["leaf_report"]})
         stage_save(paths["leaf_blend"])
+
+    # Preserve every remaining authored render mesh, regardless of naming.
+    # Scan-derived trunks and their stitch surfaces commonly use M_tree_* or
+    # M_bark_* names and therefore bypass the historical branch/leaf passes.
+    # Restrict the catch-all to this exact FBX import and exclude source meshes
+    # already represented by the semantic passes so each face is copied once.
+    residual_geometry = run_skin_loose_instances(
+        settings.get("armature_name", "Root"),
+        "",
+        "Residual_Geometry_Skinned_Codex",
+        hide_originals=settings.get("hide_originals", True),
+        fallback_all_bones=settings.get("fallback_all_bones", False),
+        apply=True,
+        report_path=paths["residual_geometry_report"],
+        spm_path="",
+        true_root=settings.get("true_root", "Bone_1_Start"),
+        scale_value=settings.get("scale_value", "auto"),
+        source_object_names=[obj.name for obj in source_import_meshes],
+        exclude_object_names=represented_source_objects,
+    )
+    reports["steps"].append(
+        {
+            "name": "skin_residual_render_geometry",
+            "status": residual_geometry.get("status"),
+            "report": paths["residual_geometry_report"],
+            "source_objects": residual_geometry.get("source_objects", []),
+            "created_object": residual_geometry.get("created_object", ""),
+            "created_faces": residual_geometry.get("created_faces", 0),
+        }
+    )
 
     weights = run_repair_invalid_weights(
         settings.get("armature_name", "Root"),
@@ -10604,6 +10758,7 @@ def run_full_pipeline(settings):
         report_path=paths["export_report"],
         settings=settings,
         texture_contract=texture_contract,
+        expected_source_objects=source_import_meshes,
     )
     reports["steps"].append(
         {
@@ -10614,6 +10769,9 @@ def run_full_pipeline(settings):
             "removed_invalid_groups": export.get("removed_invalid_groups"),
             "placeholder_material_normalization": export.get(
                 "placeholder_material_normalization", {}
+            ),
+            "source_geometry_coverage": export.get(
+                "source_geometry_coverage", {}
             ),
             "export_structure": export.get("export_structure", {}),
         }
