@@ -573,6 +573,46 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     unsafe_fbx.write_bytes(b"isolated")
     unsafe_image_path = unsafe_fbx.parent / "isolated_color.png"
     write_image(unsafe_image_path)
+
+    # The operational batch intentionally imports its FBX from the isolated
+    # bark workspace after preflight has rebound the material to production
+    # T_* images.  Source provenance alone must not make those safe images
+    # unassigned (the Weeping Willow regression).
+    safe_isolated_source = bpy.data.materials.new(
+        "M_Bark_safe_isolated_source_13"
+    )
+    safe_isolated_source.use_nodes = True
+    safe_isolated_source["codex_source_fbx"] = str(unsafe_fbx)
+    safe_isolated_source["codex_source_identity"] = str(
+        consensus_root / "SK_SafeIsolatedSource.spm"
+    )
+    safe_isolated_source["codex_speedtree_texture_base"] = consensus_base
+    safe_source_node = safe_isolated_source.node_tree.nodes.new(
+        "ShaderNodeTexImage"
+    )
+    safe_source_node.image = bpy.data.images.load(
+        str(consensus_files["color"])
+    )
+    safe_source_object = make_mesh_object(
+        "SafeIsolatedSourceObject", [safe_isolated_source]
+    )
+    safe_source_signature = core.material_texture_signature(
+        safe_isolated_source
+    )
+    safe_source_result = core.rebind_blocked_speedtree_group_variants(
+        [safe_source_object]
+    )
+    assert safe_source_result["status"] == "ok", safe_source_result
+    assert safe_source_result["texture_outcome"] == "complete", (
+        safe_source_result
+    )
+    assert safe_source_result["materials"] == [], safe_source_result
+    assert (
+        core.material_texture_signature(safe_isolated_source)
+        == safe_source_signature
+    )
+    assert safe_isolated_source["codex_source_fbx"] == str(unsafe_fbx)
+
     unsafe_variant = bpy.data.materials.new(
         "M_Leaf_rebind_consensus_08_green"
     )
