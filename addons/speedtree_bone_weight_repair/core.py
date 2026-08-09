@@ -10092,7 +10092,83 @@ def _mesh_face_material_counts(obj):
     return counts
 
 
-def validate_source_geometry_coverage(source_objects, merged_obj):
+def _project_placeholder_material_reassignment(
+    expected_materials, placeholder_material_normalization
+):
+    """Project only the exact placeholder remap proven at the merge boundary."""
+    expected_materials = Counter(expected_materials)
+    normalization = placeholder_material_normalization
+    if (
+        not isinstance(normalization, dict)
+        or normalization.get("status") != "applied"
+    ):
+        return expected_materials, {"status": "not_applied"}
+
+    proof = str(normalization.get("proof") or "")
+    if proof not in {
+        "runtime_stmat_default_to_unique_semantic_bark",
+        "strict_stmat_default_to_unique_managed_bark",
+    }:
+        raise RuntimeError(
+            "Source geometry coverage received an unsupported placeholder "
+            f"normalization proof: {proof!r}"
+        )
+    changed_face_count = normalization.get("changed_face_count")
+    if isinstance(changed_face_count, bool) or not isinstance(
+        changed_face_count, int
+    ) or changed_face_count < 0:
+        raise RuntimeError(
+            "Source geometry coverage requires a non-negative integer "
+            "placeholder changed_face_count"
+        )
+    target_material = str(normalization.get("target_material") or "").strip()
+    api = handoff_contract.central_contract_api()
+    if (
+        not target_material
+        or target_material.startswith("<unassigned:")
+        or api.normalize_material_key(target_material) == "default"
+    ):
+        raise RuntimeError(
+            "Source geometry coverage requires a non-placeholder target material"
+        )
+
+    placeholder_keys = sorted(
+        key
+        for key in expected_materials
+        if (
+            (key.startswith("<unassigned:") and key.endswith(">"))
+            or api.normalize_material_key(key) == "default"
+        )
+    )
+    source_placeholder_faces = sum(
+        expected_materials[key] for key in placeholder_keys
+    )
+    if source_placeholder_faces != changed_face_count:
+        raise RuntimeError(
+            "Source geometry coverage placeholder normalization evidence "
+            "does not match the cleaned source faces: "
+            f"source={source_placeholder_faces}, changed={changed_face_count}"
+        )
+
+    projected = Counter(expected_materials)
+    for key in placeholder_keys:
+        del projected[key]
+    projected[target_material] += changed_face_count
+    return projected, {
+        "status": "applied",
+        "proof": proof,
+        "source_placeholder_material_keys": placeholder_keys,
+        "changed_face_count": changed_face_count,
+        "target_material": target_material,
+    }
+
+
+def validate_source_geometry_coverage(
+    source_objects,
+    merged_obj,
+    *,
+    placeholder_material_normalization=None,
+):
     """Prove that every cleaned source face survives the final SK merge.
 
     SpeedTree material-grouped FBX files may contain authored scan trunks,
@@ -10124,6 +10200,13 @@ def validate_source_geometry_coverage(source_objects, merged_obj):
             }
         )
 
+    source_expected_materials = Counter(expected_materials)
+    expected_materials, material_reassignment = (
+        _project_placeholder_material_reassignment(
+            source_expected_materials,
+            placeholder_material_normalization,
+        )
+    )
     actual_materials = _mesh_face_material_counts(merged_obj)
     expected_faces = sum(row["faces"] for row in expected_objects)
     actual_faces = len(merged_obj.data.polygons)
@@ -10143,8 +10226,12 @@ def validate_source_geometry_coverage(source_objects, merged_obj):
         "expected_faces": expected_faces,
         "merged_faces": actual_faces,
         "face_delta": actual_faces - expected_faces,
+        "source_expected_material_faces": dict(
+            sorted(source_expected_materials.items())
+        ),
         "expected_material_faces": dict(sorted(expected_materials.items())),
         "merged_material_faces": dict(sorted(actual_materials.items())),
+        "placeholder_material_reassignment": material_reassignment,
         "missing_material_faces": dict(sorted(missing_material_faces.items())),
         "unexpected_material_faces": dict(
             sorted(unexpected_material_faces.items())
@@ -10212,7 +10299,13 @@ def run_merge_export(
         merged_obj
     )
     source_geometry_coverage = (
-        validate_source_geometry_coverage(expected_source_objects, merged_obj)
+        validate_source_geometry_coverage(
+            expected_source_objects,
+            merged_obj,
+            placeholder_material_normalization=(
+                placeholder_material_normalization
+            ),
+        )
         if expected_source_objects is not None
         else {"status": "not_requested"}
     )

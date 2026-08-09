@@ -835,4 +835,59 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         raise AssertionError("Missing hybrid stitch geometry was not blocked")
     assert unrelated.hide_render is False
 
+    # Placeholder normalization is an intentional, strictly proven material
+    # identity change. Geometry coverage must project that one remap while
+    # continuing to reject the same histogram drift without exact evidence.
+    coverage_bark = bpy.data.materials.new("M_bark_coverage_projection_01")
+    coverage_placeholder = make_mesh_object("CoverageDefaultSource", [])
+    coverage_bark_source = make_mesh_object(
+        "CoverageBarkSource", [coverage_bark]
+    )
+    coverage_merged = make_mesh_object(
+        "CoverageMerged", [coverage_bark, coverage_bark]
+    )
+    placeholder_normalization = {
+        "status": "applied",
+        "proof": "runtime_stmat_default_to_unique_semantic_bark",
+        "changed_face_count": 1,
+        "target_material": coverage_bark.name,
+    }
+    projected_coverage = core.validate_source_geometry_coverage(
+        [coverage_placeholder, coverage_bark_source],
+        coverage_merged,
+        placeholder_material_normalization=placeholder_normalization,
+    )
+    assert projected_coverage["status"] == "ok", projected_coverage
+    assert projected_coverage["source_expected_material_faces"] == {
+        "<unassigned:0>": 1,
+        coverage_bark.name: 1,
+    }, projected_coverage
+    assert projected_coverage["expected_material_faces"] == {
+        coverage_bark.name: 2,
+    }, projected_coverage
+    try:
+        core.validate_source_geometry_coverage(
+            [coverage_placeholder, coverage_bark_source], coverage_merged
+        )
+    except RuntimeError as exc:
+        assert "<unassigned:0>" in str(exc), exc
+    else:
+        raise AssertionError(
+            "Placeholder material drift passed without normalization evidence"
+        )
+    bad_normalization = dict(placeholder_normalization)
+    bad_normalization["changed_face_count"] = 2
+    try:
+        core.validate_source_geometry_coverage(
+            [coverage_placeholder, coverage_bark_source],
+            coverage_merged,
+            placeholder_material_normalization=bad_normalization,
+        )
+    except RuntimeError as exc:
+        assert "does not match the cleaned source faces" in str(exc), exc
+    else:
+        raise AssertionError(
+            "Mismatched placeholder normalization evidence was not blocked"
+        )
+
 print("RUNTIME_STRUCTURAL_REGRESSION_SMOKE_OK")
