@@ -139,14 +139,14 @@ with tempfile.TemporaryDirectory(
 
     missing_candidate = mesh_object("MissingCandidate", [default_material])
     missing_before = list(missing_candidate.data.materials)
-    try:
-        core.normalize_merged_speedtree_placeholder_material(
-            missing_candidate, contract([default_intent])
-        )
-    except RuntimeError as exc:
-        assert "found 0" in str(exc), exc
-    else:
-        raise AssertionError("missing managed bark candidate was accepted")
+    missing_result = core.normalize_merged_speedtree_placeholder_material(
+        missing_candidate, contract([default_intent])
+    )
+    assert missing_result["status"] == "not_applicable", missing_result
+    assert missing_result["candidate_count"] == 0, missing_result
+    assert missing_result["reason"] == (
+        "no_semantic_bark_candidate_preserved_default"
+    ), missing_result
     assert list(missing_candidate.data.materials) == missing_before
 
     second_binding = ready_binding(texture_dir, "T_bark_other")
@@ -164,37 +164,37 @@ with tempfile.TemporaryDirectory(
         "AmbiguousCandidate",
         [default_material, bark_material, second_material],
     )
-    ambiguous_before = list(ambiguous.data.materials)
-    try:
-        core.normalize_merged_speedtree_placeholder_material(
-            ambiguous,
-            contract([default_intent, bark_intent, second_intent]),
-        )
-    except RuntimeError as exc:
-        assert "found 2" in str(exc), exc
-    else:
-        raise AssertionError("ambiguous managed bark candidates were accepted")
-    assert list(ambiguous.data.materials) == ambiguous_before
+    ambiguous_result = core.normalize_merged_speedtree_placeholder_material(
+        ambiguous,
+        contract([default_intent, bark_intent, second_intent]),
+    )
+    assert ambiguous_result["status"] == "applied", ambiguous_result
+    assert ambiguous_result["candidate_count"] == 2, ambiguous_result
+    assert ambiguous_result["target_material"] == bark_material.name
+    assert ambiguous_result["candidate_material_slots"] == [1, 2]
+    assert ambiguous_result["selection_policy"] == (
+        "first_semantic_bark_in_material_slot_order"
+    )
+    assert list(ambiguous.data.materials) == [bark_material, second_material]
+    assert [poly.material_index for poly in ambiguous.data.polygons] == [0, 0]
 
     runtime_missing = mesh_object("RuntimeMissingCandidate", [default_material])
     runtime_missing_before = list(runtime_missing.data.materials)
-    try:
+    runtime_missing_result = (
         core.normalize_merged_speedtree_placeholder_material(
             runtime_missing,
             contract([default_intent], runtime_tolerant=True),
         )
-    except RuntimeError as exc:
-        assert "found 0" in str(exc), exc
-    else:
-        raise AssertionError("runtime mode accepted missing structural bark identity")
+    )
+    assert runtime_missing_result["status"] == "not_applicable"
+    assert runtime_missing_result["candidate_count"] == 0
     assert list(runtime_missing.data.materials) == runtime_missing_before
 
     runtime_ambiguous = mesh_object(
         "RuntimeAmbiguousCandidate",
         [default_material, bark_material, second_material],
     )
-    runtime_ambiguous_before = list(runtime_ambiguous.data.materials)
-    try:
+    runtime_ambiguous_result = (
         core.normalize_merged_speedtree_placeholder_material(
             runtime_ambiguous,
             contract(
@@ -202,11 +202,17 @@ with tempfile.TemporaryDirectory(
                 runtime_tolerant=True,
             ),
         )
-    except RuntimeError as exc:
-        assert "found 2" in str(exc), exc
-    else:
-        raise AssertionError("runtime mode accepted ambiguous structural bark identity")
-    assert list(runtime_ambiguous.data.materials) == runtime_ambiguous_before
+    )
+    assert runtime_ambiguous_result["status"] == "applied"
+    assert runtime_ambiguous_result["candidate_count"] == 2
+    assert runtime_ambiguous_result["target_material"] == bark_material.name
+    assert runtime_ambiguous_result["proof"] == (
+        "runtime_stmat_default_to_first_semantic_bark"
+    )
+    assert list(runtime_ambiguous.data.materials) == [
+        bark_material,
+        second_material,
+    ]
 
     unassigned_bark_intent = intent(
         api,
