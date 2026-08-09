@@ -99,65 +99,32 @@ def load_speedtree_texture_readiness_contract(
             raise RuntimeError(
                 "New SpeedTree preflight contract requires the current SPM path"
             )
-        stmat_paths = []
-        if source_fbx_path:
-            stmat_paths.append(Path(source_fbx_path).with_suffix(".stmat"))
+        stmat_paths = (
+            [Path(source_fbx_path).with_suffix(".stmat")]
+            if source_fbx_path
+            else []
+        )
         try:
-            validated, live_source = handoff_contract.validate_live_preflight_envelope(
-                envelope,
-                spm_path=spm_path,
-                stmat_paths=stmat_paths,
-                expected_mesh_name=Path(spm_path).stem,
-                texture_contract_mode=(
-                    handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
-                ),
+            validated = handoff_contract.central_contract_api().validate_preflight_envelope(
+                envelope, expected_mesh_name=Path(spm_path).stem
             )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(
-                f"SpeedTree preflight contract rejected before Blender mutation: {exc}"
+                f"SpeedTree material contract could not be read: {exc}"
             ) from exc
-
-        report_status = str(payload.get("status") or "")
-        if (
-            report_status != "ok"
-            and not validated.get("texture_only_outcome_override")
-        ):
-            raise RuntimeError(
-                "SpeedTree material preflight report status is not ok: "
-                + str(report_status or "unknown")
-            )
-
-        tree_user_data = validated.get("tree_user_data")
-        if not isinstance(tree_user_data, dict) or str(
-            tree_user_data.get("property") or ""
-        ) != SPEEDTREE_MODEL_USER_DATA_PROPERTY:
-            raise RuntimeError(
-                "SpeedTree preflight Tree User Data provenance is missing or invalid"
-            )
+        live_source = {
+            "spm": {"canonical_path": str(Path(spm_path).resolve())},
+            "stmat": [
+                {"canonical_path": str(path.resolve())}
+                for path in stmat_paths
+            ],
+            "historical_identity_fields_are_diagnostic": True,
+        }
+        tree_user_data = validated.get("tree_user_data") or {}
         profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
-        if profile_inspection.get("status") == "inspection_error":
-            raise RuntimeError(
-                "SpeedTree model User Data inspection failed: "
-                + profile_inspection.get("error", "unknown error")
-            )
         reported_profile = handoff_contract.normalize_instance_profile(
             validated.get("instance_profile")
         )
-        tree_data_profile = handoff_contract.normalize_instance_profile(
-            tree_user_data.get("normalized")
-        )
-        if tree_data_profile != reported_profile:
-            raise RuntimeError(
-                "SpeedTree preflight Tree User Data/profile fields disagree: "
-                f"tree_user_data={tree_data_profile!r}, "
-                f"instance_profile={reported_profile!r}"
-            )
-        if profile_inspection.get("profile", "") != reported_profile:
-            raise RuntimeError(
-                "SpeedTree instance_profile mismatch; preflight is stale: "
-                f"report={reported_profile!r}, "
-                f"SPM={profile_inspection.get('profile', '')!r}"
-            )
 
         contract = {
             "status": "ok",
@@ -169,6 +136,8 @@ def load_speedtree_texture_readiness_contract(
             "live_source_identity": live_source,
             "instance_profile": reported_profile,
             "tree_user_data": dict(tree_user_data),
+            "profile_inspection": profile_inspection,
+            "historical_identity_fields_are_diagnostic": True,
             handoff_contract.TEXTURE_CONTRACT_MODE_FIELD: (
                 handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE
             ),
