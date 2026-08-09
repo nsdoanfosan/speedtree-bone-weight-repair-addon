@@ -5060,7 +5060,9 @@ def rebind_blocked_speedtree_group_variants(objects):
     ``M_leaf_x_atlas_01_green`` while a later canonical source repair creates
     the authoritative base material ``M_leaf_x_atlas_01``.  A saved prototype
     must not keep image paths inside ``.sk_batch_isolated_bark`` merely because
-    its material name includes that production-group suffix.
+    its material name includes that production-group suffix.  The imported FBX
+    itself may intentionally live in that isolated workspace; its provenance
+    alone is not evidence that already-normalized production images are unsafe.
     """
     targets = collect_object_materials(objects)
     stmat_cache = {}
@@ -5075,7 +5077,6 @@ def rebind_blocked_speedtree_group_variants(objects):
         if (
             not texture_base.casefold().startswith("t_")
             or not source_fbx
-            or _blocked_atlas_texture_path(source_fbx)
         ):
             continue
         group_base = handoff_contract.production_group_base_name(material.name)
@@ -5109,7 +5110,12 @@ def rebind_blocked_speedtree_group_variants(objects):
             }
         )
         blocked_source = _blocked_atlas_texture_path(source_fbx)
-        if not blocked_source and not blocked_images:
+        # The batch deliberately imports an FBX from its isolated bark
+        # workspace.  Only image paths can leak that workspace into the saved
+        # prototype, so preserve a material whose current images already point
+        # at safe production files even when its source-FBX provenance remains
+        # isolated.
+        if not blocked_images:
             continue
         group_base = handoff_contract.production_group_base_name(material.name)
         group_key = _speedtree_material_name_key(group_base)
