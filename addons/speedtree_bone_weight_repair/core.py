@@ -9635,7 +9635,7 @@ def _is_semantic_bark_intent(intent):
 def normalize_merged_speedtree_placeholder_material(
     merged_obj, texture_contract=None
 ):
-    """Replace a proven Default/None slot with the one proven managed bark slot.
+    """Replace a proven Default/None slot with a deterministic bark slot.
 
     This is deliberately a post-merge operation.  The final mesh's real
     material slots are the mutation boundary, while the strict preflight
@@ -9724,7 +9724,7 @@ def normalize_merged_speedtree_placeholder_material(
 
     candidate_materials = []
     seen_candidates = set()
-    for material in old_materials:
+    for slot_index, material in enumerate(old_materials):
         if material is None or material.as_pointer() in seen_candidates:
             continue
         if str(material.get(UNREAL_TREE_PART_PROPERTY) or "") != "bark":
@@ -9737,15 +9737,17 @@ def normalize_merged_speedtree_placeholder_material(
         ):
             continue
         seen_candidates.add(material.as_pointer())
-        candidate_materials.append(material)
-    if len(candidate_materials) != 1:
-        message = (
-            "SpeedTree merged Default placeholder requires exactly one actual "
-            "bark material slot; found "
-            + str(len(candidate_materials))
-        )
-        raise RuntimeError(message)
-    target_material = candidate_materials[0]
+        candidate_materials.append((slot_index, material))
+    if not candidate_materials:
+        return {
+            "status": "not_applicable",
+            "reason": "no_semantic_bark_candidate_preserved_default",
+            "placeholder_slots": placeholder_slots,
+            "candidate_count": 0,
+            "selection_policy": "preserve_default_without_semantic_bark",
+        }
+    target_slot_index, target_material = candidate_materials[0]
+    candidate_count = len(candidate_materials)
 
     if merged_obj.data.users > 1:
         merged_obj.data = merged_obj.data.copy()
@@ -9777,12 +9779,29 @@ def normalize_merged_speedtree_placeholder_material(
     return {
         "status": "applied",
         "proof": (
-            "runtime_stmat_default_to_unique_semantic_bark"
+            (
+                "runtime_stmat_default_to_unique_semantic_bark"
+                if candidate_count == 1
+                else "runtime_stmat_default_to_first_semantic_bark"
+            )
             if runtime_tolerant
-            else "strict_stmat_default_to_unique_managed_bark"
+            else (
+                "strict_stmat_default_to_unique_managed_bark"
+                if candidate_count == 1
+                else "strict_stmat_default_to_first_managed_bark"
+            )
         ),
         "placeholder_slots": placeholder_slots,
         "target_material": target_material.name,
+        "target_material_slot": target_slot_index,
+        "candidate_count": candidate_count,
+        "candidate_material_slots": [
+            slot_index for slot_index, _material in candidate_materials
+        ],
+        "candidate_materials": [
+            material.name for _slot_index, material in candidate_materials
+        ],
+        "selection_policy": "first_semantic_bark_in_material_slot_order",
         "changed_face_count": changed_faces,
         "material_count_before": len(old_materials),
         "material_count_after": len(mesh.materials),
