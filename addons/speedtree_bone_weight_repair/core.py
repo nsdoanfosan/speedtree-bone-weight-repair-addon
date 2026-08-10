@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import bpy
+import bmesh
 import numpy as np
 from mathutils import Vector, kdtree
 
@@ -55,6 +56,37 @@ JSON_PREVIEW_OBJECT_KEYS = (
     # Legacy key from the old material-swap preview; still cleared off old scenes.
     "codex_json_preview_original_materials",
 )
+
+
+def _live_file_identity(path):
+    """Hash one live source file without trusting a historical receipt."""
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise RuntimeError(f"SpeedTree live source does not exist: {source}")
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "canonical_path": str(source),
+        "sha256": digest.hexdigest(),
+        "size": source.stat().st_size,
+    }
+
+
+def _live_speedtree_source_identity(spm_path, stmat_paths):
+    """Describe the current SPM/STMAT files used by this exact import."""
+    return {
+        "spm": _live_file_identity(spm_path),
+        "stmat": sorted(
+            (_live_file_identity(path) for path in stmat_paths),
+            key=lambda row: (
+                row["canonical_path"].casefold(),
+                row["sha256"],
+                row["size"],
+            ),
+        ),
+    }
 
 
 def write_report(path, data):
@@ -112,14 +144,10 @@ def load_speedtree_texture_readiness_contract(
             raise RuntimeError(
                 f"SpeedTree material contract could not be read: {exc}"
             ) from exc
-        live_source = {
-            "spm": {"canonical_path": str(Path(spm_path).resolve())},
-            "stmat": [
-                {"canonical_path": str(path.resolve())}
-                for path in stmat_paths
-            ],
-            "historical_identity_fields_are_diagnostic": True,
-        }
+        live_source = _live_speedtree_source_identity(
+            spm_path, stmat_paths
+        )
+        live_source["historical_identity_fields_are_diagnostic"] = True
         tree_user_data = validated.get("tree_user_data") or {}
         profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
         reported_profile = handoff_contract.normalize_instance_profile(
@@ -5882,7 +5910,12 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
     for (provenance, base_name), entries in grouped.items():
         provenance_type, provenance_value = provenance
         group_tokens = sorted({entry[3] for entry in entries})
-        if len(group_tokens) < 2:
+        # A single Atlas Builder child material is still a group variant.  In
+        # particular, a source FBX can contain only ``*_atlas_01_green`` while
+        # its strict intent records ``*_atlas_01`` as the production-group
+        # base.  Requiring two different suffixes left that proven dummy name
+        # on the exported prototype and leaked it into Unreal Assembly slots.
+        if not group_tokens:
             continue
         source_materials = []
         seen_materials = set()
@@ -5896,10 +5929,32 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
         target_name = unified_material_name(base_name, source_materials)
         if strict_contract:
-            target_intent = handoff_contract.resolve_material_intent(
-                target_name,
-                texture_contract["speedtree_pipeline_contract"],
-            )
+            try:
+                target_intent = handoff_contract.resolve_material_intent(
+                    target_name,
+                    texture_contract["speedtree_pipeline_contract"],
+                )
+            except RuntimeError as exc:
+                # Two differently classified child groups can share the same
+                # textual base.  With no exact base intent, that ambiguity is
+                # evidence to preserve both source slots, not to collapse one
+                # just because it is the only member of its semantic group.
+                if (
+                    len(group_tokens) == 1
+                    and "Conflicting SpeedTree material intents" in str(exc)
+                ):
+                    skipped_groups.append(
+                        {
+                            "mode": "production_group_suffix",
+                            "target_material": target_name,
+                            "source_materials": [
+                                material.name for material in source_materials
+                            ],
+                            "reason": "conflicting production-group intents",
+                        }
+                    )
+                    continue
+                raise
             expected_semantics = tuple(provenance_value[1][1:])
             target_semantics = (
                 str((target_intent or {}).get("tree_part") or ""),
@@ -5911,6 +5966,19 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                     "SpeedTree production-group target intent conflicts with "
                     f"its source variants: {target_name}"
                 )
+            target_proof = json.dumps(
+                {
+                    "production_group_base": provenance_value[1][0],
+                    "tree_part": target_semantics[0],
+                    "tree_shading": target_semantics[1],
+                    "instance_profile": target_semantics[2],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        else:
+            target_proof = ""
         readiness_mode = provenance_type
         if provenance_type == "material_intent":
             target_material = next(
@@ -5922,6 +5990,27 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                 ),
                 None,
             )
+            if target_material is None:
+                # The Assembly builder can normalize multiple exact provider
+                # contracts in one Blender scene. Reuse only a suffix-free
+                # material previously created from the same strict production
+                # identity; never merge an untagged name match.
+                target_material = next(
+                    (
+                        candidate
+                        for candidate in bpy.data.materials
+                        if _speedtree_material_name_key(candidate.name)
+                        == _speedtree_material_name_key(target_name)
+                        and str(
+                            candidate.get(
+                                "codex_speedtree_consolidation_target_proof",
+                                "",
+                            )
+                        )
+                        == target_proof
+                    ),
+                    None,
+                )
         else:
             target_material = next(
                 (
@@ -5945,6 +6034,10 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             target_material = source_materials[0].copy()
             target_material.name = target_name
             target_material["codex_speedtree_consolidated_from"] = [material.name for material in source_materials]
+        if strict_contract:
+            target_material[
+                "codex_speedtree_consolidation_target_proof"
+            ] = target_proof
 
         slots_by_object = defaultdict(list)
         for obj, slot_index, _material, _token in entries:
@@ -6616,6 +6709,269 @@ def ensure_cluster_source_skin_contract(
     }
 
 
+UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
+    "discard_unassigned_geometry_before_repair"
+)
+UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 2
+
+
+def _cleanup_default_material_authorized(material, texture_contract):
+    """Accept only the strict STMAT Default intent, never a name guess."""
+    if material is None or not isinstance(texture_contract, dict):
+        return False
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        return False
+    api = handoff_contract.central_contract_api()
+    material_base = api.production_group_base_name(material.name)
+    if api.normalize_material_key(material_base) != "default":
+        return False
+    matches = _strict_material_intents_for_name(material_base, envelope)
+    return len(matches) == 1 and _is_unmanaged_empty_default_intent(
+        matches[0]
+    )
+
+
+def _cleanup_live_identity(texture_contract, spm_path, source_fbx_path):
+    """Authorize deletion only from the current strict FBX handoff inputs."""
+    if not isinstance(texture_contract, dict) or not texture_contract.get(
+        "strict_speedtree_pipeline_contract"
+    ):
+        return None
+    if not spm_path or not source_fbx_path:
+        return None
+    stmat_path = Path(source_fbx_path).with_suffix(".stmat")
+    return _live_speedtree_source_identity(spm_path, [stmat_path])
+
+
+def _cleanup_face_reason(polygon, materials, texture_contract):
+    slot_index = int(polygon.material_index)
+    if slot_index < 0 or slot_index >= len(materials):
+        return "material_slot_out_of_range"
+    material = materials[slot_index]
+    if material is None:
+        return "empty_material_slot"
+    if _cleanup_default_material_authorized(material, texture_contract):
+        return "canonical_unmanaged_default_material"
+    return ""
+
+
+def renderable_geometry_evidence(objects):
+    meshes = [
+        obj
+        for obj in objects or []
+        if obj is not None
+        and obj.type == "MESH"
+        and obj.data is not None
+        and len(obj.data.polygons) > 0
+    ]
+    return {
+        "status": "ok" if meshes else "empty",
+        "mesh_object_count": len(meshes),
+        "face_count": sum(len(obj.data.polygons) for obj in meshes),
+    }
+
+
+def _cleanup_record_base(
+    *, texture_contract, spm_path, source_fbx_path, objects
+):
+    live_identity = _cleanup_live_identity(
+        texture_contract, spm_path, source_fbx_path
+    )
+    if live_identity is None:
+        return None
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            live_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "policy": UNASSIGNED_GEOMETRY_CLEANUP_POLICY,
+        "cleanup_contract_version": (
+            UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION
+        ),
+        "status": "not_applicable",
+        "strict_speedtree_pipeline_contract": True,
+        "cleanup_authorized": True,
+        "live_source_identity_validated": True,
+        "source_identity": str(Path(spm_path).resolve()),
+        "source_fbx": str(Path(source_fbx_path).resolve()),
+        "live_source_identity": live_identity,
+        "live_source_identity_fingerprint": fingerprint,
+        "inspected_mesh_object_count": len(objects),
+        "changed_object_count": 0,
+        "removed_object_count": 0,
+        "removed_face_count": 0,
+        "removed_edge_count": 0,
+        "removed_vertex_count": 0,
+        "removed_material_slot_count": 0,
+        "objects": [],
+        "removed_objects": [],
+    }
+
+
+def discard_unassigned_geometry_before_repair(
+    objects, *, texture_contract, spm_path, source_fbx_path
+):
+    """Discard only Full-FBX faces that have no production material.
+
+    This runs before Blender joins material-grouped imports. Otherwise a
+    no-slot object is silently mapped to the first valid join material, which
+    can make collision/unused geometry masquerade as cluster planes.
+    """
+    mesh_objects = [
+        obj
+        for obj in objects or []
+        if obj is not None and obj.type == "MESH" and obj.data is not None
+    ]
+    record = _cleanup_record_base(
+        texture_contract=texture_contract,
+        spm_path=spm_path,
+        source_fbx_path=source_fbx_path,
+        objects=mesh_objects,
+    )
+
+    candidates = []
+    for obj in mesh_objects:
+        materials = list(obj.data.materials)
+        invalid = [
+            (int(polygon.index), reason)
+            for polygon in obj.data.polygons
+            if (
+                reason := _cleanup_face_reason(
+                    polygon, materials, texture_contract
+                )
+            )
+        ]
+        if invalid:
+            candidates.append((obj, materials, invalid))
+
+    if record is None:
+        if candidates:
+            raise RuntimeError(
+                "Full FBX contains unassigned/Default geometry, but the "
+                "current strict SpeedTree SPM/STMAT handoff is unavailable; "
+                "refusing to let Blender promote it during join"
+            )
+        return {
+            "status": "not_authorized",
+            "reason": "strict_speedtree_pipeline_contract_not_present",
+        }
+
+    for obj, old_materials, invalid in candidates:
+        mesh = obj.data
+        object_name = obj.name
+        faces_before = len(mesh.polygons)
+        edges_before = len(mesh.edges)
+        vertices_before = len(mesh.vertices)
+        slots_before = len(old_materials)
+        reason_counts = dict(sorted(Counter(reason for _, reason in invalid).items()))
+        invalid_indices = {index for index, _reason in invalid}
+        remove_entire_object = len(invalid_indices) == faces_before
+
+        if remove_entire_object:
+            removed_slot_names = [
+                material.name if material is not None else None
+                for material in old_materials
+            ]
+            remove_object_and_orphan_mesh(obj)
+            row = {
+                "object": object_name,
+                "removed_object": True,
+                "faces_before": faces_before,
+                "faces_after": 0,
+                "removed_face_count": faces_before,
+                "edges_before": edges_before,
+                "edges_after": 0,
+                "removed_edge_count": edges_before,
+                "vertices_before": vertices_before,
+                "vertices_after": 0,
+                "removed_vertex_count": vertices_before,
+                "material_slots_before": slots_before,
+                "material_slots_after": 0,
+                "removed_material_slots": removed_slot_names,
+                "removed_face_reasons": reason_counts,
+            }
+        else:
+            bm = bmesh.new()
+            try:
+                bm.from_mesh(mesh)
+                doomed_faces = [
+                    face for face in bm.faces
+                    if int(face.index) in invalid_indices
+                ]
+                bmesh.ops.delete(bm, geom=doomed_faces, context="FACES")
+                orphan_vertices = [
+                    vertex for vertex in bm.verts if not vertex.link_faces
+                ]
+                if orphan_vertices:
+                    bmesh.ops.delete(
+                        bm, geom=orphan_vertices, context="VERTS"
+                    )
+                bm.to_mesh(mesh)
+            finally:
+                bm.free()
+            mesh.update()
+
+            surviving_old_slots = [
+                int(polygon.material_index) for polygon in mesh.polygons
+            ]
+            used_slots = sorted(set(surviving_old_slots))
+            slot_remap = {
+                old_index: new_index
+                for new_index, old_index in enumerate(used_slots)
+            }
+            kept_materials = [old_materials[index] for index in used_slots]
+            mesh.materials.clear()
+            for material in kept_materials:
+                mesh.materials.append(material)
+            for polygon, old_index in zip(
+                mesh.polygons, surviving_old_slots
+            ):
+                polygon.material_index = slot_remap[old_index]
+            removed_slot_names = [
+                material.name if material is not None else None
+                for index, material in enumerate(old_materials)
+                if index not in used_slots
+            ]
+            row = {
+                "object": object_name,
+                "removed_object": False,
+                "faces_before": faces_before,
+                "faces_after": len(mesh.polygons),
+                "removed_face_count": faces_before - len(mesh.polygons),
+                "edges_before": edges_before,
+                "edges_after": len(mesh.edges),
+                "removed_edge_count": edges_before - len(mesh.edges),
+                "vertices_before": vertices_before,
+                "vertices_after": len(mesh.vertices),
+                "removed_vertex_count": vertices_before - len(mesh.vertices),
+                "material_slots_before": slots_before,
+                "material_slots_after": len(mesh.materials),
+                "removed_material_slots": removed_slot_names,
+                "removed_face_reasons": reason_counts,
+            }
+
+        record["objects"].append(row)
+        if row["removed_object"]:
+            record["removed_objects"].append(object_name)
+        record["removed_object_count"] += int(row["removed_object"])
+        record["removed_face_count"] += row["removed_face_count"]
+        record["removed_edge_count"] += row["removed_edge_count"]
+        record["removed_vertex_count"] += row["removed_vertex_count"]
+        record["removed_material_slot_count"] += len(
+            row["removed_material_slots"]
+        )
+
+    record["changed_object_count"] = len(record["objects"])
+    if record["changed_object_count"]:
+        record["status"] = "applied"
+    return record
+
+
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
@@ -6651,6 +7007,16 @@ def run_import_source_fbx(
         path,
         source_identity_path=source_identity_path,
     )
+    unassigned_geometry_cleanup = (
+        discard_unassigned_geometry_before_repair(
+            imported,
+            texture_contract=texture_contract,
+            spm_path=spm_path,
+            source_fbx_path=str(path),
+        )
+    )
+    imported = [obj for obj in bpy.data.objects if obj.name not in before]
+    renderable_geometry = renderable_geometry_evidence(imported)
     texture_preflight = preflight_speedtree_material_texture_contracts(
         imported,
         texture_contract,
@@ -6693,6 +7059,7 @@ def run_import_source_fbx(
 
     return {
         "source_fbx": str(path),
+        "source_identity": str(spm_path or ""),
         "source_collection": source_collection.name,
         "imported_object_count": len(imported),
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
@@ -6708,6 +7075,8 @@ def run_import_source_fbx(
         "texture_normalization": texture_normalization,
         "rigid_fallback": rigid_fallback_result,
         "cluster_source_skin_contract": cluster_source_skin_result,
+        "unassigned_geometry_cleanup": unassigned_geometry_cleanup,
+        "renderable_geometry": renderable_geometry,
     }
 
 
@@ -10234,6 +10603,19 @@ def run_merge_export(
     material_slot_validation = validate_face_assigned_material_slots(
         merged_obj
     )
+    api = handoff_contract.central_contract_api()
+    material_slot_validation["placeholder_cleanup_authorized"] = bool(
+        isinstance(texture_contract, dict)
+        and texture_contract.get("strict_speedtree_pipeline_contract")
+    )
+    material_slot_validation["canonical_default_slot_indices"] = [
+        index
+        for index, material in enumerate(merged_obj.data.materials)
+        if material is not None
+        and api.normalize_material_key(
+            api.production_group_base_name(material.name)
+        ) == "default"
+    ]
     source_geometry_coverage = (
         validate_source_geometry_coverage(expected_source_objects, merged_obj)
         if expected_source_objects is not None
@@ -10775,6 +11157,9 @@ def run_full_pipeline(settings):
         }
     )
     reports["export_structure"] = export.get("export_structure", {})
+    reports["material_slot_validation"] = export.get(
+        "material_slot_validation", {}
+    )
     stage_save(paths["export_blend"])
     reports["status"] = "done"
     reports["grouping_health"] = export.get("grouping_health", {})
@@ -10936,6 +11321,8 @@ def run_import_and_repair(settings):
     reports = run_full_pipeline(settings)
     reports["cleanup"] = cleanup
     reports["import"] = {
+        "source_fbx": imported.get("source_fbx", ""),
+        "source_identity": imported.get("source_identity", ""),
         "imported_object_count": imported.get("imported_object_count", 0),
         "imported_mesh_count": imported.get("imported_mesh_count", 0),
         "imported_armature_count": imported.get("imported_armature_count", 0),
@@ -10949,7 +11336,34 @@ def run_import_and_repair(settings):
         "cluster_source_skin_contract": imported.get(
             "cluster_source_skin_contract"
         ),
+        "unassigned_geometry_cleanup": imported.get(
+            "unassigned_geometry_cleanup"
+        ),
+        "renderable_geometry": imported.get("renderable_geometry", {}),
     }
+    import_cleanup = imported.get("unassigned_geometry_cleanup")
+    if (
+        isinstance(import_cleanup, dict)
+        and import_cleanup.get("cleanup_authorized") is True
+    ):
+        reports["unassigned_geometry_cleanup"] = import_cleanup
+        reports["renderable_geometry_after_cleanup"] = (
+            imported.get("renderable_geometry", {})
+        )
+        source_fbx_path = settings.get("source_fbx_path", "")
+        current_source_objects = [
+            obj
+            for obj in bpy.context.scene.objects
+            if belongs_to_source_fbx(obj, source_fbx_path)
+        ]
+        reports["unassigned_geometry_cleanup_recheck"] = (
+            discard_unassigned_geometry_before_repair(
+                current_source_objects,
+                texture_contract=texture_contract,
+                spm_path=settings.get("spm_path", ""),
+                source_fbx_path=source_fbx_path,
+            )
+        )
     pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
     if pipeline_path:
         write_report(pipeline_path, reports)

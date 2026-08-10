@@ -145,6 +145,112 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     source_fbx.with_suffix(".stmat").write_text(
         "<Materials />", encoding="utf-8"
     )
+    source_spm = root / "shared" / "SK_Runtime.spm"
+    source_spm.write_bytes(b"current-spm-fixture")
+
+    # SpeedTree can export collision/unused geometry as a no-slot Default
+    # object. It must be discarded before Blender join can silently assign its
+    # faces to the first production material (including a cluster material).
+    cleanup_material = bpy.data.materials.new("M_cluster_Runtime_01")
+    cleanup_renderable = make_mesh_object(
+        "CleanupRenderable", [cleanup_material]
+    )
+    cleanup_unassigned = make_mesh_object("Default", [])
+    cleanup_contract = strict_runtime_contract(
+        [
+            make_intent("Default", 0, tree_part=None),
+            make_intent("M_cluster_Runtime_01", 1),
+        ]
+    )
+    cleanup_result = core.discard_unassigned_geometry_before_repair(
+        [cleanup_renderable, cleanup_unassigned],
+        texture_contract=cleanup_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert cleanup_result["status"] == "applied", cleanup_result
+    assert cleanup_result["cleanup_contract_version"] == 2, cleanup_result
+    assert cleanup_result["inspected_mesh_object_count"] == 2, cleanup_result
+    assert cleanup_result["changed_object_count"] == 1, cleanup_result
+    assert cleanup_result["removed_object_count"] == 1, cleanup_result
+    assert cleanup_result["removed_face_count"] == 1, cleanup_result
+    assert cleanup_result["removed_objects"] == ["Default"], cleanup_result
+    assert bpy.data.objects.get("Default") is None
+    assert len(cleanup_renderable.data.polygons) == 1
+    assert core.renderable_geometry_evidence([cleanup_renderable]) == {
+        "status": "ok",
+        "mesh_object_count": 1,
+        "face_count": 1,
+    }
+    cleanup_recheck = core.discard_unassigned_geometry_before_repair(
+        [cleanup_renderable],
+        texture_contract=cleanup_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert cleanup_recheck["status"] == "not_applicable", cleanup_recheck
+
+    cleanup_default_material = bpy.data.materials.new("Default")
+    cleanup_mixed = make_mesh_object(
+        "CleanupMixed",
+        [cleanup_default_material, cleanup_material],
+    )
+    mixed_result = core.discard_unassigned_geometry_before_repair(
+        [cleanup_mixed],
+        texture_contract=cleanup_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert mixed_result["status"] == "applied", mixed_result
+    assert mixed_result["removed_object_count"] == 0, mixed_result
+    assert mixed_result["removed_face_count"] == 1, mixed_result
+    assert len(cleanup_mixed.data.polygons) == 1
+    assert material_names(cleanup_mixed) == ["M_cluster_Runtime_01"]
+    assert cleanup_mixed.data.polygons[0].material_index == 0
+
+    # A source FBX may use only one Atlas Builder child collection.  The
+    # strict intent still proves that its suffix is a production-group token,
+    # so the dummy child name must collapse to the suffix-free atlas base.
+    single_name = "M_leaf_Weeping_Willow_atlas_01_green"
+    single_material = bpy.data.materials.new(single_name)
+    single_material["codex_source_fbx"] = str(source_fbx)
+    single_object = make_mesh_object(
+        "SingleAtlasGroupObject", [single_material]
+    )
+    single_contract = strict_runtime_contract(
+        [make_intent(single_name, 0)]
+    )
+    single_result = core.consolidate_speedtree_group_materials(
+        [single_object], texture_contract=single_contract
+    )
+    assert material_names(single_object) == [
+        "M_leaf_Weeping_Willow_atlas_01"
+    ], single_result
+    single_groups = [
+        row
+        for row in single_result["groups"]
+        if row.get("mode") == "production_group_suffix"
+    ]
+    assert len(single_groups) == 1, single_result
+    assert single_groups[0]["group_tokens"] == ["green"]
+    assert single_groups[0]["changed_faces"] == 1
+
+    # Separate provider contracts in one Assembly build must reuse the exact
+    # strict production target instead of creating a Blender ``.001`` name.
+    second_single_material = bpy.data.materials.new(single_name)
+    second_single_object = make_mesh_object(
+        "SecondSingleAtlasGroupObject", [second_single_material]
+    )
+    second_single_result = core.consolidate_speedtree_group_materials(
+        [second_single_object], texture_contract=single_contract
+    )
+    assert material_names(second_single_object) == [
+        "M_leaf_Weeping_Willow_atlas_01"
+    ], second_single_result
+    assert (
+        second_single_object.data.materials[0]
+        is single_object.data.materials[0]
+    ), second_single_result
 
     # Texture completeness is not structural consolidation evidence. Two
     # exact, same-semantic intents still merge when one is partial and the
