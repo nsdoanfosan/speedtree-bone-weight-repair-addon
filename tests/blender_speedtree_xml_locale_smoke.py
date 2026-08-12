@@ -27,6 +27,22 @@ def main():
     assert bones[0]["start"] == (21.0313, 0.5, -2.70936)
     assert bones[0]["end"] == (21.2172, 2.49074, 1.36796)
     assert bones[0]["mass"] == 0.0001
+    subset = core._cluster_named_axis_root_contract(
+        [1, 3],
+        [{"id": 0}, {"id": 1}, {"id": 2}],
+    )
+    assert subset["roots_by_ordinal"][1]["id"] == 0
+    assert subset["roots_by_ordinal"][3]["id"] == 2
+    assert subset["unused_xml_root_ids"] == [1]
+    try:
+        core._cluster_named_axis_root_contract(
+            [1, 4],
+            [{"id": 0}, {"id": 1}, {"id": 2}],
+        )
+    except RuntimeError as exc:
+        assert "do not exist: [3]" in str(exc)
+    else:
+        raise AssertionError("Missing FBX->XML bone identity did not fail")
     print("SpeedTree localized XML wind parser smoke: PASS")
 
 

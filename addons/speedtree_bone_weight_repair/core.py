@@ -6330,13 +6330,48 @@ def _cluster_geometry_scale(meshes):
     )
 
 
+def _cluster_named_axis_root_contract(axis_ordinals, roots):
+    """Map FBX Bone_N identities to XML ID N-1 with B as a subset of A."""
+    ordinals = sorted({int(value) for value in axis_ordinals})
+    if not ordinals or any(ordinal <= 0 for ordinal in ordinals):
+        raise RuntimeError(
+            "Cluster axis bone ordinals must be positive; found "
+            f"{ordinals}."
+        )
+    roots_by_id = {}
+    for root in roots:
+        root_id = int(root["id"])
+        if root_id in roots_by_id:
+            raise RuntimeError(
+                f"Cluster Raw XML contains duplicate structural root ID {root_id}."
+            )
+        roots_by_id[root_id] = root
+    requested_xml_ids = {ordinal - 1 for ordinal in ordinals}
+    missing_xml_ids = sorted(requested_xml_ids.difference(roots_by_id))
+    if missing_xml_ids:
+        raise RuntimeError(
+            "Cluster FBX axis names reference structural XML root IDs that do "
+            f"not exist: {missing_xml_ids}."
+        )
+    return {
+        "roots_by_ordinal": {
+            ordinal: roots_by_id[ordinal - 1] for ordinal in ordinals
+        },
+        "unused_xml_root_ids": sorted(
+            set(roots_by_id).difference(requested_xml_ids)
+        ),
+    }
+
+
 def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
     """Replace SpeedTree Start/End markers with one real axis bone per XML root.
 
     Stage 1 authors Raw XML structural roots only for the first *renderable*
     Branch below each Tree root. Meshless Trunk/Branch placement splines are
-    therefore absent from this contract. This function consumes those roots by
-    coordinates; generator names are report-only and never select a bone.
+    therefore absent from this contract. Imported ``Bone_N_Start/End`` names
+    resolve only to XML root ID ``N - 1``. Extra XML roots are valid; geometry
+    coordinates diagnose export drift and select units, but never select bone
+    identity.
     """
     roots = _cluster_xml_structural_roots(xml_path)
     axes = {}
@@ -6363,66 +6398,12 @@ def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
         raise RuntimeError(
             "Cluster armature contains no numbered Start/End axis bones."
         )
-    expected_ordinals = list(range(1, len(axes) + 1))
-    if sorted(axes) != expected_ordinals:
-        raise RuntimeError(
-            "Cluster axis bone ordinals must be consecutive 1..N; found "
-            f"{sorted(axes)}."
-        )
-    if len(roots) != len(axes):
-        raise RuntimeError(
-            "Cluster Raw XML structural-root count does not match imported axis "
-            f"count: {len(roots)} roots vs {len(axes)} axes."
-        )
+    named_root_contract = _cluster_named_axis_root_contract(axes, roots)
+    roots_by_ordinal = named_root_contract["roots_by_ordinal"]
 
-    world_heads = [
-        armature.matrix_world @ bone.head_local
-        for bone in armature.data.bones
-    ]
-    scale_scores = []
-    for scale in CLUSTER_XML_SCALE_CANDIDATES:
-        endpoints = [
-            point / scale
-            for root in roots
-            for point in (root["start_raw"], root["end_raw"])
-        ]
-        distances = [
-            min((head - endpoint).length for endpoint in endpoints)
-            for head in world_heads
-        ]
-        ordered = sorted(float(value) for value in distances)
-        middle = len(ordered) // 2
-        median = (
-            ordered[middle]
-            if len(ordered) % 2
-            else (ordered[middle - 1] + ordered[middle]) * 0.5
-        )
-        scale_scores.append(
-            {
-                "scale": float(scale),
-                "median_nearest": float(median),
-                "max_nearest": float(max(ordered)),
-            }
-        )
-    scale_scores.sort(
-        key=lambda row: (
-            row["median_nearest"],
-            row["max_nearest"],
-            row["scale"],
-        )
-    )
-    xml_scale = scale_scores[0]["scale"]
-    world_roots = [
-        {
-            **root,
-            "start_world": root["start_raw"] / xml_scale,
-            "end_world": root["end_raw"] / xml_scale,
-        }
-        for root in roots
-    ]
-
-    candidates = []
-    for ordinal, axis in axes.items():
+    named_pairs = []
+    for ordinal in sorted(axes):
+        axis = axes[ordinal]
         start_bone = axis.get("start")
         end_bone = axis.get("end")
         if start_bone is None and end_bone is None:
@@ -6434,71 +6415,96 @@ def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
                 if end_bone is not None
                 else armature.matrix_world @ start_bone.tail_local
             )
-            policy = "start_and_endpoint_match"
+            marker_policy = "start_and_endpoint_present"
         else:
             source_start = None
             source_end = armature.matrix_world @ end_bone.head_local
-            policy = "orphan_end_recovers_missing_start"
-        for root_index, root in enumerate(world_roots):
-            start_error = (
-                float((source_start - root["start_world"]).length)
-                if source_start is not None
-                else 0.0
+            marker_policy = "orphan_end_recovers_named_missing_start"
+        named_pairs.append(
+            {
+                "ordinal": ordinal,
+                "root": roots_by_ordinal[ordinal],
+                "source_start": source_start,
+                "source_end": source_end,
+                "marker_policy": marker_policy,
+            }
+        )
+
+    scale_scores = []
+    for scale in CLUSTER_XML_SCALE_CANDIDATES:
+        distances = []
+        for pair in named_pairs:
+            root = pair["root"]
+            if pair["source_start"] is not None:
+                distances.append(
+                    float(
+                        (
+                            pair["source_start"]
+                            - root["start_raw"] / scale
+                        ).length
+                    )
+                )
+            distances.append(
+                float(
+                    (
+                        pair["source_end"]
+                        - root["end_raw"] / scale
+                    ).length
+                )
             )
-            end_error = float((source_end - root["end_world"]).length)
-            candidates.append(
-                {
-                    "ordinal": ordinal,
-                    "root_index": root_index,
-                    "cost": start_error + end_error,
-                    "start_error": start_error,
-                    "end_error": end_error,
-                    "policy": policy,
-                }
-            )
+        ordered = sorted(float(value) for value in distances)
+        middle = len(ordered) // 2
+        median = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) * 0.5
+        )
+        scale_scores.append(
+            {
+                "scale": float(scale),
+                "median_named_error": float(median),
+                "max_named_error": float(max(ordered)),
+            }
+        )
+    scale_scores.sort(
+        key=lambda row: (
+            row["median_named_error"],
+            row["max_named_error"],
+            row["scale"],
+        )
+    )
+    xml_scale = scale_scores[0]["scale"]
     geometry_scale = _cluster_geometry_scale(meshes)
     tolerance = max(geometry_scale * 1.0e-4, 1.0e-6)
-    candidates_by_axis = defaultdict(list)
-    for candidate in candidates:
-        if (
-            candidate["start_error"] <= tolerance
-            and candidate["end_error"] <= tolerance
-        ):
-            candidates_by_axis[candidate["ordinal"]].append(candidate)
-    ambiguous_axes = {
-        ordinal: rows
-        for ordinal, rows in candidates_by_axis.items()
-        if len(rows) != 1
-    }
-    missing_axes = [
-        ordinal for ordinal in axes if ordinal not in candidates_by_axis
-    ]
-    if ambiguous_axes or missing_axes:
-        details = []
-        for ordinal in sorted(axes):
-            rows = candidates_by_axis.get(ordinal) or []
-            details.append(
-                f"axis {ordinal}: candidate XML IDs "
-                f"{[world_roots[row['root_index']]['id'] for row in rows]}"
-            )
-        raise RuntimeError(
-            "Cluster XML axis matching is missing or ambiguous at geometry-relative "
-            f"tolerance {tolerance:.9g}: " + "; ".join(details)
+    matches = []
+    for pair in named_pairs:
+        root = {
+            **pair["root"],
+            "start_world": pair["root"]["start_raw"] / xml_scale,
+            "end_world": pair["root"]["end_raw"] / xml_scale,
+        }
+        start_error = (
+            float((pair["source_start"] - root["start_world"]).length)
+            if pair["source_start"] is not None
+            else 0.0
         )
-    matches = [
-        candidates_by_axis[ordinal][0]
-        for ordinal in sorted(axes)
-    ]
-    matched_root_indices = [row["root_index"] for row in matches]
-    if len(set(matched_root_indices)) != len(matched_root_indices):
-        duplicates = sorted(
-            world_roots[index]["id"]
-            for index, count in Counter(matched_root_indices).items()
-            if count > 1
+        end_error = float(
+            (pair["source_end"] - root["end_world"]).length
         )
-        raise RuntimeError(
-            "Multiple imported axes resolve to the same XML structural root: "
-            + ", ".join(str(value) for value in duplicates)
+        matches.append(
+            {
+                "ordinal": pair["ordinal"],
+                "root": root,
+                "policy": "exact_bone_ordinal_to_xml_root_id_v1",
+                "marker_policy": pair["marker_policy"],
+                "start_error": start_error,
+                "end_error": end_error,
+                "coordinate_validation": (
+                    "within_tolerance"
+                    if start_error <= tolerance and end_error <= tolerance
+                    else "diagnostic_mismatch"
+                ),
+            }
         )
 
     by_ordinal = {row["ordinal"]: row for row in matches}
@@ -6514,7 +6520,7 @@ def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
         world_to_armature = armature.matrix_world.inverted_safe()
         for ordinal in sorted(by_ordinal):
             match = by_ordinal[ordinal]
-            root = world_roots[match["root_index"]]
+            root = match["root"]
             bone = edit_bones.new(f"Bone_{ordinal}_Start")
             bone.head = world_to_armature @ root["start_world"]
             bone.tail = world_to_armature @ root["end_world"]
@@ -6533,6 +6539,10 @@ def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
         "xml_scale": float(xml_scale),
         "xml_scale_scores": scale_scores,
         "axis_count": len(matches),
+        "identity_contract": "fbx_named_axes_subset_of_xml_roots_v1",
+        "unused_xml_root_ids": named_root_contract[
+            "unused_xml_root_ids"
+        ],
         "bone_names": [
             f"Bone_{ordinal}_Start" for ordinal in sorted(by_ordinal)
         ],
@@ -6541,18 +6551,20 @@ def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
         "axes": [
             {
                 "ordinal": row["ordinal"],
-                "xml_bone_id": int(world_roots[row["root_index"]]["id"]),
-                "xml_generator": world_roots[row["root_index"]]["generator"],
+                "xml_bone_id": int(row["root"]["id"]),
+                "xml_generator": row["root"]["generator"],
                 "source_match_policy": row["policy"],
+                "source_marker_policy": row["marker_policy"],
                 "start_error": float(row["start_error"]),
                 "end_error": float(row["end_error"]),
+                "coordinate_validation": row["coordinate_validation"],
                 "start_world": [
                     float(value)
-                    for value in world_roots[row["root_index"]]["start_world"]
+                    for value in row["root"]["start_world"]
                 ],
                 "end_world": [
                     float(value)
-                    for value in world_roots[row["root_index"]]["end_world"]
+                    for value in row["root"]["end_world"]
                 ],
             }
             for row in sorted(matches, key=lambda item: item["ordinal"])
