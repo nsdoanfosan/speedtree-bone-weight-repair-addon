@@ -56,10 +56,18 @@ bone_names = [bone.name for bone in armature.data.bones]
 if (
     expected_axes <= 0
     or len(bone_names) != expected_axes
-    or bone_names != [f"Bone_{index}_Start" for index in range(1, expected_axes + 1)]
+    or bone_names != list(axis_normalization.get("bone_names") or [])
+    or axis_normalization.get("identity_contract")
+    != "fbx_named_axes_subset_of_xml_roots_v1"
+    or any(
+        int(row["xml_bone_id"]) != int(row["ordinal"]) - 1
+        or row.get("source_match_policy")
+        != "exact_bone_ordinal_to_xml_root_id_v1"
+        for row in axis_normalization.get("axes") or []
+    )
 ):
     raise RuntimeError(
-        f"Cluster axes were not canonicalized to one Start bone per XML root: "
+        f"Cluster axes were not canonicalized by exact FBX name/XML ID: "
         f"{bone_names}, contract={axis_normalization}"
     )
 bone_name = contract.get("bone")
