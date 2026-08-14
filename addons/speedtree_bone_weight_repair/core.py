@@ -1,5 +1,4 @@
 import colorsys
-import gzip
 import hashlib
 import json
 import math
@@ -9,13 +8,14 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 import bpy
 import bmesh
 import numpy as np
 from mathutils import Vector, kdtree
 
-from . import handoff_contract, speedtree_cli
+from . import handoff_contract, speedtree_cli, spm_reader
 from .preview_texture_contract import (
     PREVIEW_ONLY_USAGE,
     PREVIEW_RECEIPT_VERSION,
@@ -209,7 +209,11 @@ LEGACY_BUNDLED_EXPORT_OPTIONS = Path(__file__).parent / "presets" / "Options_Fbx
 
 def inspect_spm_bone_generators(spm_path):
     try:
-        root = ET.fromstring(read_spm_xml(spm_path))
+        return spm_reader.get_derived(
+            spm_path,
+            "bone_generators_v1",
+            _inspect_spm_bone_generators_root,
+        )
     except Exception as exc:
         return {
             "inspection_ok": False,
@@ -218,6 +222,9 @@ def inspect_spm_bone_generators(spm_path):
             "enabled_branch_generators": 1,
             "disabled_generators": [],
         }
+
+
+def _inspect_spm_bone_generators_root(root):
     visible = []
     enabled = []
     disabled = []
@@ -7055,10 +7062,15 @@ def run_import_source_fbx(
     rigid_fallback_result = None
     cluster_source_skin_result = None
     if cluster_source_skin_contract:
+        cluster_source_skin_started = perf_counter()
         cluster_source_skin_result = ensure_cluster_source_skin_contract(
             imported,
             armature_name,
             cluster_source_xml_path,
+        )
+        cluster_source_skin_result["duration_seconds"] = round(
+            perf_counter() - cluster_source_skin_started,
+            6,
         )
     elif rigid_fallback:
         rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
@@ -8021,13 +8033,8 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
 
 
 def read_spm_xml(path):
-    with open(path, "rb") as handle:
-        magic = handle.read(2)
-    if magic == b"\x1f\x8b":
-        with gzip.open(path, "rb") as handle:
-            return handle.read()
-    with open(path, "rb") as handle:
-        return handle.read()
+    """Compatibility wrapper for callers that consume decoded SPM XML bytes."""
+    return spm_reader.read_spm_xml(path)
 
 
 def child_text(element, name, default=None):
@@ -8076,31 +8083,45 @@ def normalize_unreal_instance_profile(value):
 
 def inspect_spm_unreal_instance_profile(spm_path):
     """Read Tree Generator > SpeedTree SDK > User data directly from an SPM."""
-    result = {
-        "status": "inspection_error",
+    try:
+        return spm_reader.get_derived(
+            spm_path,
+            "unreal_instance_profile_v1",
+            lambda root: _inspect_spm_unreal_instance_profile_root(
+                root,
+                spm_path,
+            ),
+        )
+    except Exception as exc:
+        return {
+            "status": "inspection_error",
+            "spm": str(spm_path or ""),
+            "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
+            "profile": "",
+            "error": str(exc),
+        }
+
+
+def _inspect_spm_unreal_instance_profile_root(root, spm_path):
+    tree_generators = [
+        generator
+        for generator in root.findall(".//Generator")
+        if generator.attrib.get("Type") == "Tree"
+    ]
+    if not tree_generators:
+        raise ValueError("SPM has no Tree Generator.")
+    raw_value = element_property_value(
+        tree_generators[0], SPEEDTREE_MODEL_USER_DATA_PROPERTY
+    )
+    profile = normalize_unreal_instance_profile(raw_value)
+    return {
+        "status": "ok" if profile else "empty",
         "spm": str(spm_path or ""),
         "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
-        "profile": "",
+        "profile": profile,
+        "raw_value": str(raw_value or ""),
+        "tree_generator_count": len(tree_generators),
     }
-    try:
-        root = ET.fromstring(read_spm_xml(spm_path))
-        tree_generators = [
-            generator
-            for generator in root.findall(".//Generator")
-            if generator.attrib.get("Type") == "Tree"
-        ]
-        if not tree_generators:
-            raise ValueError("SPM has no Tree Generator.")
-        raw_value = element_property_value(
-            tree_generators[0], SPEEDTREE_MODEL_USER_DATA_PROPERTY
-        )
-        result["raw_value"] = str(raw_value or "")
-        result["tree_generator_count"] = len(tree_generators)
-        result["profile"] = normalize_unreal_instance_profile(raw_value)
-        result["status"] = "ok" if result["profile"] else "empty"
-    except Exception as exc:
-        result["error"] = str(exc)
-    return result
 
 
 def apply_spm_unreal_instance_profile(objects, spm_path):
@@ -8180,58 +8201,60 @@ def get_armature(name):
 
 
 def parse_speedtree(path):
-    root = ET.fromstring(read_spm_xml(path))
-    generators = {}
-    nodes = {}
-    node_order = []
+    def build(root):
+        generators = {}
+        nodes = {}
+        node_order = []
 
-    for gen in root.findall(".//Generator"):
-        guid = child_text(gen, "GUID")
-        if not guid:
-            continue
-        bone_style = element_property_value(gen, "Physics:Bone style")
-        bone_count = element_property_value(gen, "Physics:Bones")
-        hidden = child_bool(gen, "Hidden", False)
-        generators[guid] = {
-            "guid": guid,
-            "type": gen.attrib.get("Type"),
-            "name": child_text(gen, "Name", ""),
-            "level": child_text(gen, "Level"),
-            "hidden": hidden,
-            "bone_style": float(bone_style) if bone_style is not None else None,
-            "bone_count": float(bone_count) if bone_count is not None else None,
-            "bone_enabled": (
-                not hidden
-                and bone_style is not None
-                and bone_count is not None
-                and not (float(bone_style) == 0.0 and float(bone_count) == 0.0)
-            ),
+        for gen in root.findall(".//Generator"):
+            guid = child_text(gen, "GUID")
+            if not guid:
+                continue
+            bone_style = element_property_value(gen, "Physics:Bone style")
+            bone_count = element_property_value(gen, "Physics:Bones")
+            hidden = child_bool(gen, "Hidden", False)
+            generators[guid] = {
+                "guid": guid,
+                "type": gen.attrib.get("Type"),
+                "name": child_text(gen, "Name", ""),
+                "level": child_text(gen, "Level"),
+                "hidden": hidden,
+                "bone_style": float(bone_style) if bone_style is not None else None,
+                "bone_count": float(bone_count) if bone_count is not None else None,
+                "bone_enabled": (
+                    not hidden
+                    and bone_style is not None
+                    and bone_count is not None
+                    and not (float(bone_style) == 0.0 and float(bone_count) == 0.0)
+                ),
+            }
+
+        for node in root.findall(".//Node"):
+            guid = child_text(node, "GUID")
+            if not guid:
+                continue
+            name = child_text(node, "Name", "")
+            extra = node.find("Extra")
+            nodes[guid] = {
+                "guid": guid,
+                "type": node.attrib.get("Type"),
+                "gen": child_text(node, "GeneratorGUID"),
+                "parent": child_text(node, "ParentGUID"),
+                "name": name,
+                "coord": parse_coord(name),
+                "has_skin": child_bool(extra, "m_bHasSkin", False),
+                "valid_position": child_bool(extra, "m_bValidPosition", True),
+            }
+            node_order.append(guid)
+
+        return {
+            "generators": generators,
+            "nodes": nodes,
+            "node_order": node_order,
+            "version": root.attrib.get("VersionString", root.attrib.get("Version")),
         }
 
-    for node in root.findall(".//Node"):
-        guid = child_text(node, "GUID")
-        if not guid:
-            continue
-        name = child_text(node, "Name", "")
-        extra = node.find("Extra")
-        nodes[guid] = {
-            "guid": guid,
-            "type": node.attrib.get("Type"),
-            "gen": child_text(node, "GeneratorGUID"),
-            "parent": child_text(node, "ParentGUID"),
-            "name": name,
-            "coord": parse_coord(name),
-            "has_skin": child_bool(extra, "m_bHasSkin", False),
-            "valid_position": child_bool(extra, "m_bValidPosition", True),
-        }
-        node_order.append(guid)
-
-    return {
-        "generators": generators,
-        "nodes": nodes,
-        "node_order": node_order,
-        "version": root.attrib.get("VersionString", root.attrib.get("Version")),
-    }
+    return spm_reader.get_derived(path, "parse_speedtree_v1", build)
 
 
 def find_base_ref_pairs(tree, raw_tolerance=0.05):
@@ -11174,6 +11197,7 @@ def run_full_pipeline(settings):
     )
     stage_save(paths["export_blend"])
     reports["status"] = "done"
+    reports["spm_read_cache"] = spm_reader.cache_info()
     reports["grouping_health"] = export.get("grouping_health", {})
     reports["warnings"] = export.get("unreal_json_warnings", [])
     write_report(paths["pipeline_report"], reports)
