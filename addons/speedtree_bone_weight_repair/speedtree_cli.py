@@ -777,3 +777,202 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
         "artifacts": artifacts,
         "export_attempts": export_attempts,
     }
+
+
+def export_bundle(exe, spm, targets, timeout_seconds=900):
+    """Export FBX and XML through one collision-CLI/Modeler process.
+
+    Each target keeps its independent content cache. A one-target miss still
+    uses ``export_target``; only two simultaneous misses pay for the bundled
+    native-CLI invocation.
+    """
+    exe = Path(exe)
+    spm = Path(spm)
+    prepared = []
+    results = {}
+    for kind, target, options in targets:
+        kind = str(kind).lower()
+        target = Path(target)
+        options = Path(options)
+        require_texture_skip_writing(
+            options, purpose=f"SpeedTree {kind.upper()} export"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fingerprint, inputs = _input_fingerprint(
+            exe, spm, options, kind, target
+        )
+        cache_path = _cache_path(target)
+        started = _utc_timestamp()
+        cache = _load_cache(cache_path)
+        if _cache_hit(cache, fingerprint, kind, target, inputs):
+            results[kind] = {
+                "path": str(target),
+                "export_options": str(options),
+                "exists": True,
+                "size": target.stat().st_size,
+                "returncode": 0,
+                "started": started,
+                "finished": _utc_timestamp(),
+                "stdout": "",
+                "stderr": "",
+                "cache_hit": True,
+                "cache_seeded": False,
+                "cache_path": str(cache_path),
+                "input_fingerprint": fingerprint,
+                "artifacts": cache.get("artifacts", []),
+                "bundled_process": False,
+            }
+            continue
+        prepared.append(
+            {
+                "kind": kind,
+                "target": target,
+                "options": options,
+                "fingerprint": fingerprint,
+                "inputs": inputs,
+                "cache_path": cache_path,
+                "started": started,
+            }
+        )
+
+    if not prepared:
+        return results
+    if len(prepared) == 1:
+        item = prepared[0]
+        results[item["kind"]] = export_target(
+            exe=exe,
+            spm=spm,
+            options=item["options"],
+            kind=item["kind"],
+            target=item["target"],
+            timeout_seconds=timeout_seconds,
+        )
+        results[item["kind"]]["bundled_process"] = False
+        return results
+    if len(prepared) != 2:
+        raise RuntimeError("Bundled SpeedTree export requires exactly FBX and XML.")
+
+    prepared.sort(key=lambda item: item["kind"] != "fbx")
+    primary, secondary = prepared
+    common_root = Path(
+        os.path.commonpath(
+            [str(item["target"].parent.resolve()) for item in prepared]
+        )
+    )
+    export_attempts = []
+    stdout = ""
+    stderr = ""
+    for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
+        with tempfile.TemporaryDirectory(
+            prefix="bwr_speedtree_bundle_"
+        ) as temp_dir:
+            staging_root = Path(temp_dir)
+            staged = {}
+            for item in prepared:
+                relative = item["target"].resolve().relative_to(common_root)
+                staged[item["kind"]] = staging_root / relative
+                staged[item["kind"]].parent.mkdir(parents=True, exist_ok=True)
+            command = [
+                str(exe),
+                "--secondary-export-options",
+                str(secondary["options"]),
+                "--secondary-export",
+                str(staged[secondary["kind"]]),
+                str(spm),
+                "-export_options",
+                str(primary["options"]),
+                "-export",
+                str(staged[primary["kind"]]),
+            ]
+            try:
+                returncode, stdout, stderr = _run_process(
+                    command,
+                    cwd=spm.parent,
+                    timeout_seconds=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                detail = (
+                    str(exc.stderr or "") or str(exc.stdout or "")
+                )[-1000:]
+                suffix = f" Last output: {detail}" if detail else ""
+                raise RuntimeError(
+                    "Bundled SpeedTree FBX/XML export timed out after "
+                    f"{timeout_seconds} seconds; its process tree was "
+                    f"terminated.{suffix}"
+                ) from exc
+
+            attempt_record = {
+                "attempt": attempt,
+                "returncode": returncode,
+                "windows_exit_code": f"0x{_windows_exit_code(returncode):08X}",
+            }
+            export_attempts.append(attempt_record)
+            if returncode != 0:
+                failure_kind = _retryable_export_failure_kind(returncode)
+                attempt_record["failure_kind"] = (
+                    failure_kind or "process_export_failed"
+                )
+                if failure_kind and attempt < _EXPORT_RETRY_ATTEMPTS:
+                    backoff = _EXPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                    attempt_record["retry_backoff_seconds"] = backoff
+                    time.sleep(backoff)
+                    continue
+                detail = (stderr or stdout)[-1000:]
+                raise RuntimeError(
+                    "Bundled SpeedTree FBX/XML export failed with code "
+                    f"{returncode}: {detail}"
+                )
+            invalid = [
+                item["kind"]
+                for item in prepared
+                if not _basic_output_is_valid(
+                    item["kind"], staged[item["kind"]], parse_xml=True
+                )
+            ]
+            if invalid:
+                raise RuntimeError(
+                    "Bundled SpeedTree export produced invalid staged output: "
+                    + ", ".join(invalid)
+                )
+            _transactional_promote(staging_root, common_root)
+            break
+
+    finished = _utc_timestamp()
+    for item in prepared:
+        artifact_paths = [item["target"]]
+        if item["kind"] == "fbx":
+            artifact_paths.append(item["target"].with_suffix(".stmat"))
+        artifacts = [
+            _artifact_record(path, item["target"].parent)
+            for path in artifact_paths
+        ]
+        cache_data = {
+            "version": EXPORT_CACHE_VERSION,
+            "kind": item["kind"],
+            "target": str(item["target"].resolve()),
+            "input_fingerprint": item["fingerprint"],
+            "inputs": item["inputs"],
+            "artifacts": artifacts,
+            "completed_at": finished,
+            "bundled_process": True,
+        }
+        _write_cache(item["cache_path"], cache_data)
+        results[item["kind"]] = {
+            "path": str(item["target"]),
+            "export_options": str(item["options"]),
+            "exists": item["target"].exists(),
+            "size": item["target"].stat().st_size,
+            "returncode": 0,
+            "started": item["started"],
+            "finished": finished,
+            "stdout": stdout[-4000:],
+            "stderr": stderr[-4000:],
+            "cache_hit": False,
+            "cache_seeded": False,
+            "cache_path": str(item["cache_path"]),
+            "input_fingerprint": item["fingerprint"],
+            "artifacts": artifacts,
+            "export_attempts": export_attempts,
+            "bundled_process": True,
+        }
+    return results
