@@ -349,14 +349,26 @@ def run_speedtree_cli_export(
             raise RuntimeError(f"SpeedTree {kind.upper()} export options INI does not exist: {options}")
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
-        results[kind] = speedtree_cli.export_target(
+    if (
+        len(targets) == 2
+        and exe.name.casefold() == "speedtree_collision_cli.exe"
+    ):
+        results = speedtree_cli.export_bundle(
             exe=exe,
             spm=spm,
-            options=options,
-            kind=kind,
-            target=target,
+            targets=targets,
             timeout_seconds=timeout_seconds,
         )
+    else:
+        for kind, target, options in targets:
+            results[kind] = speedtree_cli.export_target(
+                exe=exe,
+                spm=spm,
+                options=options,
+                kind=kind,
+                target=target,
+                timeout_seconds=timeout_seconds,
+            )
 
     bundle_mtime_sync = None
     if "fbx" in results and "xml" in results:
