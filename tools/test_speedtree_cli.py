@@ -421,6 +421,50 @@ class SpeedTreeCliTests(unittest.TestCase):
                 target.with_suffix(".stmat").read_text(),
             )
 
+    def test_other_fatal_windows_status_is_also_retryable(self):
+        self.assertEqual(
+            speedtree_cli._retryable_export_failure_kind(0xC0000094),
+            "process_exporter_crash",
+        )
+
+    def test_disappeared_persistent_session_retries_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.xml"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    return FakeProcess(
+                        command,
+                        kwargs["stdout"],
+                        kwargs["stderr"],
+                        returncode=12,
+                    )
+                Path(command[-1]).write_text(
+                    "<SpeedTreeRaw />", encoding="utf-8"
+                )
+                return FakeProcess(
+                    command, kwargs["stdout"], kwargs["stderr"]
+                )
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ), mock.patch.object(speedtree_cli.time, "sleep") as sleep:
+                result = speedtree_cli.export_target(
+                    exe, spm, options, "xml", target
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(target.is_file())
+            self.assertEqual(
+                result["export_attempts"][0]["failure_kind"],
+                "persistent_session_unavailable",
+            )
+            sleep.assert_called_once_with(0.25)
+
     def test_non_crash_export_failure_is_not_retried(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

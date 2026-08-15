@@ -16,6 +16,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -51,7 +52,11 @@ except ImportError:
 EXPORT_CACHE_VERSION = 1
 _HASH_CHUNK_SIZE = 1024 * 1024
 _WINDOWS_ACCESS_VIOLATION = 0xC0000005
-_CRASH_RETRY_ATTEMPTS = 3
+_WINDOWS_STACK_BUFFER_OVERRUN = 0xC0000409
+_WINDOWS_HEAP_CORRUPTION = 0xC0000374
+_PERSISTENT_SESSION_UNAVAILABLE = 12
+_EXPORT_RETRY_ATTEMPTS = 3
+_EXPORT_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -125,8 +130,17 @@ def _windows_exit_code(returncode):
     return int(returncode) & 0xFFFFFFFF
 
 
-def _is_retryable_exporter_crash(returncode):
-    return _windows_exit_code(returncode) == _WINDOWS_ACCESS_VIOLATION
+def _retryable_export_failure_kind(returncode):
+    code = _windows_exit_code(returncode)
+    if code in {
+        _WINDOWS_ACCESS_VIOLATION,
+        _WINDOWS_STACK_BUFFER_OVERRUN,
+        _WINDOWS_HEAP_CORRUPTION,
+    } or code >= 0xC0000000:
+        return "process_exporter_crash"
+    if code == _PERSISTENT_SESSION_UNAVAILABLE:
+        return "persistent_session_unavailable"
+    return ""
 
 
 def _sha256_file(path):
@@ -641,7 +655,7 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
     stderr = ""
     export_attempts = []
     promoted = []
-    for attempt in range(1, _CRASH_RETRY_ATTEMPTS + 1):
+    for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
         with tempfile.TemporaryDirectory(
             prefix=f"bwr_speedtree_{kind}_"
         ) as temp_dir:
@@ -681,22 +695,20 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
             }
             export_attempts.append(attempt_record)
             if returncode != 0:
-                retryable_crash = _is_retryable_exporter_crash(returncode)
+                failure_kind = _retryable_export_failure_kind(returncode)
                 attempt_record["failure_kind"] = (
-                    "process_exporter_crash"
-                    if retryable_crash
-                    else "process_export_failed"
+                    failure_kind or "process_export_failed"
                 )
-                if (
-                    retryable_crash
-                    and attempt < _CRASH_RETRY_ATTEMPTS
-                ):
+                if failure_kind and attempt < _EXPORT_RETRY_ATTEMPTS:
+                    backoff = _EXPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                    attempt_record["retry_backoff_seconds"] = backoff
+                    time.sleep(backoff)
                     continue
                 detail = (stderr or stdout)[-1000:]
-                if retryable_crash:
+                if failure_kind:
                     raise RuntimeError(
                         f"SpeedTree {kind.upper()} export failed; "
-                        "failure_kind=process_exporter_crash; "
+                        f"failure_kind={failure_kind}; "
                         f"attempts={attempt}; "
                         "windows_exit_code="
                         f"0x{_windows_exit_code(returncode):08X}: {detail}"
