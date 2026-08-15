@@ -427,6 +427,62 @@ class SpeedTreeCliTests(unittest.TestCase):
             "process_exporter_crash",
         )
 
+    def test_wrapper_stall_and_startup_failures_are_retryable(self):
+        self.assertEqual(
+            speedtree_cli._retryable_export_failure_kind(24),
+            "process_export_stalled",
+        )
+        self.assertEqual(
+            speedtree_cli._retryable_export_failure_kind(13),
+            "process_startup_failed",
+        )
+        self.assertEqual(
+            speedtree_cli._retryable_export_failure_kind(14),
+            "process_startup_failed",
+        )
+
+    def test_stalled_wrapper_retries_with_fresh_staging_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            exe, spm, options = make_inputs(root)
+            target = root / "out" / "SK_test.xml"
+            calls = []
+
+            def popen(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 1:
+                    return FakeProcess(
+                        command,
+                        kwargs["stdout"],
+                        kwargs["stderr"],
+                        returncode=24,
+                    )
+                Path(command[-1]).write_text(
+                    "<SpeedTreeRaw />", encoding="utf-8"
+                )
+                return FakeProcess(
+                    command, kwargs["stdout"], kwargs["stderr"]
+                )
+
+            with mock.patch.object(
+                speedtree_cli.subprocess, "Popen", side_effect=popen
+            ), mock.patch.object(speedtree_cli.time, "sleep") as sleep:
+                result = speedtree_cli.export_target(
+                    exe, spm, options, "xml", target
+                )
+
+            self.assertEqual(len(calls), 2)
+            self.assertNotEqual(
+                Path(calls[0][-1]).parent,
+                Path(calls[1][-1]).parent,
+            )
+            self.assertTrue(target.is_file())
+            self.assertEqual(
+                result["export_attempts"][0]["failure_kind"],
+                "process_export_stalled",
+            )
+            sleep.assert_called_once_with(0.25)
+
     def test_disappeared_persistent_session_retries_then_succeeds(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
