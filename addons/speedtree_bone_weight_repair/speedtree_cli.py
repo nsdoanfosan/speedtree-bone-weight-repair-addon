@@ -55,6 +55,9 @@ _WINDOWS_ACCESS_VIOLATION = 0xC0000005
 _WINDOWS_STACK_BUFFER_OVERRUN = 0xC0000409
 _WINDOWS_HEAP_CORRUPTION = 0xC0000374
 _PERSISTENT_SESSION_UNAVAILABLE = 12
+_PROCESS_INITIALIZATION_FAILED = 13
+_PRIVATE_DESKTOP_CREATION_FAILED = 14
+_PROCESS_EXPORT_STALLED = 24
 _EXPORT_RETRY_ATTEMPTS = 3
 _EXPORT_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
@@ -140,6 +143,13 @@ def _retryable_export_failure_kind(returncode):
         return "process_exporter_crash"
     if code == _PERSISTENT_SESSION_UNAVAILABLE:
         return "persistent_session_unavailable"
+    if code in {
+        _PROCESS_INITIALIZATION_FAILED,
+        _PRIVATE_DESKTOP_CREATION_FAILED,
+    }:
+        return "process_startup_failed"
+    if code == _PROCESS_EXPORT_STALLED:
+        return "process_export_stalled"
     return ""
 
 
