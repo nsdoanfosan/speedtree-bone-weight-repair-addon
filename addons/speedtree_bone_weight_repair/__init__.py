@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SpeedTree Bone/Weight Repair",
     "author": "OpenAI Codex",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > SpeedTree > Bone/Weight Repair",
     "description": "Repair SpeedTree orphan branch root bones, loose leaf/cap instances, invalid weights, and export a merged skeletal FBX.",
@@ -15,8 +15,9 @@ bl_info = {
 #
 # 1. Repair skeleton hierarchy from the original SPM.
 #    SpeedTree exports can leave branch root bones with no usable parent
-#    relationship. Rebuild those Base/BaseRef links first; all later generated
-#    3D geometry must bind to this repaired armature, not to the broken import.
+#    relationship. Rebuild only relationships proven by Base/BaseRef links;
+#    independent roots with no such evidence must remain sibling stems. All
+#    later generated 3D geometry binds to this repaired armature.
 #
 # 2. Parked note: convert branch/frond cards into 3D branch clusters.
 #    This direction is currently not part of the active add-on UI/operator set.
