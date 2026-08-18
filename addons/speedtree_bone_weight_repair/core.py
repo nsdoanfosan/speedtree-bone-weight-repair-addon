@@ -8597,22 +8597,40 @@ def resolve_true_root_bone(bones, requested):
     return min(candidates, key=lambda name: (bone_number(name), name)), "inferred"
 
 
-def build_root_fallback_reparent_map(bones, true_root):
-    roots = [name for name, bone in bones.items() if bone["parent"] is None]
-    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
-    if true_root not in bones:
-        return {}, [], [{"error": "true root bone not found", "true_root": true_root}], roots, orphan_roots
-    mapping = {root: true_root for root in orphan_roots}
-    details = [
+def build_independent_root_preservation_details(root_names, reason):
+    return [
         {
             "child_bone": root,
-            "parent_bone": true_root,
-            "method": "fallback_parent_orphan_roots_to_true_root",
-            "reason": "SPM contains no Base/BaseRef branch records",
+            "parent_bone": None,
+            "method": "preserve_independent_root_without_baseref",
+            "reason": reason,
         }
-        for root in orphan_roots
+        for root in root_names
     ]
-    return mapping, details, [], roots, orphan_roots
+
+
+def build_root_fallback_reparent_map(bones, true_root):
+    """Preserve independent FBX roots when the SPM has no BaseRef contract.
+
+    A Base/BaseRef pair is positive evidence that one SpeedTree branch is
+    attached to another.  The absence of every pair is not evidence that all
+    roots belong under the first deforming stem.  Ground-cover exports in
+    particular intentionally contain many sibling roots, so keep them as
+    independent armature bones; the FBX armature-object root will parent them
+    in Unreal's single-root reference skeleton.
+
+    The historical function name is retained for add-on/API compatibility.
+    """
+    roots = [name for name, bone in bones.items() if bone["parent"] is None]
+    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
+    details = build_independent_root_preservation_details(
+        orphan_roots,
+        (
+            "SPM contains no Base/BaseRef evidence for a parent-child "
+            "relationship"
+        ),
+    )
+    return {}, details, [], roots, orphan_roots
 
 
 def apply_reparent_mapping(armature, mapping):
@@ -8673,27 +8691,34 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
     fallback_reason = ""
     if not records:
         mapping, details, problems, roots_before, orphan_roots = build_root_fallback_reparent_map(bones, true_root)
-        fallback_reason = "no_base_ref_records"
+        fallback_reason = "no_base_ref_records_preserved_independent_roots"
     else:
         mapping, details, problems, roots_before, orphan_roots = build_reparent_map(
             records, bones, children, true_root, scale, tolerance
         )
         unmatched_orphans = [root for root in orphan_roots if root not in mapping]
         if unmatched_orphans:
-            # Some files mix Base/BaseRef-attached branches with independent
-            # top-level branches. Those top-level roots have no Base record by
-            # design; connect only the leftovers to the resolved true root.
-            for root in unmatched_orphans:
-                mapping[root] = true_root
-                details.append(
-                    {
-                        "child_bone": root,
-                        "parent_bone": true_root,
-                        "method": "fallback_unmatched_orphan_to_true_root",
-                        "reason": "no usable Base/BaseRef record for this FBX root",
-                    }
+            # Some files mix BaseRef-attached branches with independent
+            # top-level stems.  An unmatched root has no positive attachment
+            # evidence, so preserve it instead of inventing a relationship to
+            # the first deforming root.
+            details.extend(
+                build_independent_root_preservation_details(
+                    unmatched_orphans,
+                    "no usable Base/BaseRef match for this FBX root",
                 )
-            fallback_reason = "unmatched_orphan_roots_to_true_root"
+            )
+            fallback_reason = (
+                "unmatched_orphan_roots_preserved_without_baseref_match"
+            )
+
+    preserved_independent_roots = [
+        detail["child_bone"]
+        for detail in details
+        if str(detail.get("method", "")).startswith(
+            "preserve_independent_root_"
+        )
+    ]
 
     report = {
         "blend": bpy.data.filepath,
@@ -8720,15 +8745,27 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
         "fallback_mapping_count": sum(
             1 for detail in details if str(detail.get("method", "")).startswith("fallback_")
         ),
+        "preserved_independent_root_count": sum(
+            1
+            for detail in details
+            if str(detail.get("method", "")).startswith(
+                "preserve_independent_root_"
+            )
+        ),
+        "preserved_independent_roots": preserved_independent_roots[:100],
+        "root_parent_contract": (
+            "base_ref_evidence_only"
+            if records
+            else "independent_roots_without_base_ref"
+        ),
         "applied": False,
     }
 
-    # Strict mode should block only when the usable orphan-root mapping is
-    # incomplete or the SPM parse itself has issues. Some SpeedTree 10.1 files
-    # contain extra BaseRef records that do not correspond to remaining orphan
-    # roots; those are still reported as problems, but should not stop the
-    # export structure when every orphan root has a parent mapping.
-    blocked = strict and len(mapping) != len(orphan_roots)
+    # Every root must be accounted for either by a BaseRef-backed mapping or by
+    # explicit independent-root preservation. Strict mode must not reinterpret
+    # the absence of a relationship as an incomplete map.
+    processed_roots = set(mapping) | set(preserved_independent_roots)
+    blocked = strict and processed_roots != set(orphan_roots)
     if blocked:
         report["status"] = "blocked"
         report["error"] = "Reparent mapping was not complete; no changes applied."
@@ -8737,7 +8774,13 @@ def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto"
         roots_after = [bone.name for bone in armature.data.bones if bone.parent is None]
         report.update(
             {
-                "status": "applied",
+                "status": (
+                    "applied_with_independent_roots_preserved"
+                    if mapping and preserved_independent_roots
+                    else "applied"
+                    if mapping
+                    else "preserved_independent_roots"
+                ),
                 "applied": True,
                 "applied_count": applied,
                 "roots_after": len(roots_after),

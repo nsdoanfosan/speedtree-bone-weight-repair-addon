@@ -70,7 +70,7 @@ Cap geometry should not be grouped as leaves. SpeedTree documentation describes 
 1. **Repair branch bone hierarchy**
    - Source data: original SpeedTree `.spm` plus the imported Blender armature.
    - Problem: SpeedTree exports can produce branch `_Start` bones whose parent relationship is effectively missing.
-   - Output: a repaired armature where only the configured true root remains a root, and all later generated geometry can bind to stable bones.
+   - Output: a repaired armature where Base/BaseRef-backed branches are connected, while authored independent roots remain sibling stems under the exported FBX armature-object root. All later generated geometry can bind to stable bones.
 
 2. **Parked note: convert branch/frond cards to 3D branch clusters**
    - Source data: SpeedTree XML `Frond_*` records, branch atlas material IDs, and pre-grouped 3D cluster meshes.
@@ -127,7 +127,8 @@ The repair pipeline handles four related failure cases:
    - SpeedTree FBX exports can leave many `_Start` bones with parent `-1`/no parent.
    - The add-on reads the original `.spm` file and recovers `Base` / `BaseRef` branch relationships.
    - It maps those SPM branches back to Blender bones by comparing branch coordinates to bone head/tail positions.
-   - Only the configured true root, usually `Bone_1_Start`, remains a real root.
+   - A parent is created only when a matching `Base` / `BaseRef` pair provides positive attachment evidence.
+   - If an SPM contains no `BaseRef` records, its FBX root bones remain independent siblings. Unreal receives them beneath the exported armature-object root instead of collapsing every stem under the first deforming bone.
 
 2. Disconnected loose leaf/cap meshes
    - Some meshes are separate instance objects, so they do not inherit usable skeletal deformation.
