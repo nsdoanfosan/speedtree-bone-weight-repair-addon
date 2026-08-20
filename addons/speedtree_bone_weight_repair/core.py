@@ -5341,15 +5341,56 @@ def unified_material_name(base_name, materials):
     return "SpeedTree_Atlas_Material"
 
 
-def remap_mesh_materials(mesh, slot_map, new_materials):
-    remapped = []
-    for poly in mesh.polygons:
-        remapped.append(slot_map.get(poly.material_index, 0))
+def mesh_polygon_material_indices(mesh):
+    """Read polygon material indices through Blender's bulk RNA API."""
+    count = len(mesh.polygons)
+    values = np.empty(count, dtype=np.int32)
+    if not count:
+        return values
+    try:
+        mesh.polygons.foreach_get("material_index", values)
+    except (AttributeError, TypeError, ValueError):
+        values[:] = np.fromiter(
+            (int(poly.material_index) for poly in mesh.polygons),
+            dtype=np.int32,
+            count=count,
+        )
+    return values
+
+
+def remap_mesh_materials(
+    mesh,
+    slot_map,
+    new_materials,
+    *,
+    material_indices=None,
+):
+    indices = (
+        mesh_polygon_material_indices(mesh)
+        if material_indices is None
+        else np.asarray(material_indices, dtype=np.int32)
+    )
+    highest_index = max(
+        [int(indices.max()) if indices.size else -1, *slot_map.keys()],
+        default=-1,
+    )
+    lookup = np.zeros(highest_index + 1, dtype=np.int32)
+    for old_index, new_index in slot_map.items():
+        if int(old_index) >= 0:
+            lookup[int(old_index)] = int(new_index)
+    remapped = (
+        lookup[indices]
+        if indices.size
+        else np.empty(0, dtype=np.int32)
+    )
     mesh.materials.clear()
     for material in new_materials:
         mesh.materials.append(material)
-    for poly, material_index in zip(mesh.polygons, remapped):
-        poly.material_index = material_index
+    try:
+        mesh.polygons.foreach_set("material_index", remapped)
+    except (AttributeError, TypeError, ValueError):
+        for poly, material_index in zip(mesh.polygons, remapped):
+            poly.material_index = int(material_index)
     mesh.update()
 
 
@@ -5787,11 +5828,16 @@ def _consolidate_blender_numeric_material_duplicates(
             material_targets.get(material, material)
             for material in old_materials
         ]
-        for polygon in mesh.polygons:
-            if old_materials[polygon.material_index] in material_targets:
-                changed_faces[
-                    material_targets[old_materials[polygon.material_index]]
-                ] += 1
+        material_indices = mesh_polygon_material_indices(mesh)
+        slot_counts = np.bincount(
+            material_indices,
+            minlength=len(old_materials),
+        )
+        for slot_index, material in enumerate(old_materials):
+            if material in material_targets:
+                changed_faces[material_targets[material]] += int(
+                    slot_counts[slot_index]
+                )
 
         if any(material is None for material in replacements):
             # Preserve empty-slot indices for the later explicit preflight.
@@ -5808,7 +5854,12 @@ def _consolidate_blender_numeric_material_duplicates(
                     new_indices[replacement] = len(new_materials)
                     new_materials.append(replacement)
                 slot_map[old_index] = new_indices[replacement]
-            remap_mesh_materials(mesh, slot_map, new_materials)
+            remap_mesh_materials(
+                mesh,
+                slot_map,
+                new_materials,
+                material_indices=material_indices,
+            )
 
         for source, target in material_targets.items():
             if source in old_materials:
@@ -6069,9 +6120,16 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                 obj.data = obj.data.copy()
             mesh = obj.data
             candidate_slots = set(candidate_slots)
-            for poly in mesh.polygons:
-                if poly.material_index in candidate_slots:
-                    changed_faces += 1
+            material_indices = mesh_polygon_material_indices(mesh)
+            if material_indices.size:
+                changed_faces += int(
+                    np.count_nonzero(
+                        np.isin(
+                            material_indices,
+                            tuple(candidate_slots),
+                        )
+                    )
+                )
             if any(material is None for material in mesh.materials):
                 # Preserve every empty slot and its face assignments for the
                 # later structural validator. Only replace proven group slots
@@ -6090,7 +6148,12 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                         non_candidate_indices[material.name] = len(new_materials)
                         new_materials.append(material)
                     slot_map[old_index] = non_candidate_indices[material.name]
-                remap_mesh_materials(mesh, slot_map, new_materials)
+                remap_mesh_materials(
+                    mesh,
+                    slot_map,
+                    new_materials,
+                    material_indices=material_indices,
+                )
             obj["codex_speedtree_unified_material"] = target_material.name
             changed_objects.append(obj.name)
 
@@ -10230,11 +10293,18 @@ def normalize_merged_speedtree_placeholder_material(
         )
     for slot_index in placeholder_slots:
         slot_map[slot_index] = target_new_index
-    changed_faces = sum(
-        1 for polygon in mesh.polygons
-        if polygon.material_index in placeholder_set
+    material_indices = mesh_polygon_material_indices(mesh)
+    changed_faces = int(
+        np.count_nonzero(
+            np.isin(material_indices, tuple(placeholder_set))
+        )
     )
-    remap_mesh_materials(mesh, slot_map, new_materials)
+    remap_mesh_materials(
+        mesh,
+        slot_map,
+        new_materials,
+        material_indices=material_indices,
+    )
     return {
         "status": "applied",
         "proof": (
@@ -10280,28 +10350,35 @@ def validate_face_assigned_material_slots(mesh_obj):
             "Material-slot validation requires a final merged mesh"
         )
     materials = list(mesh_obj.data.materials)
-    invalid_faces = []
-    invalid_slots = set()
-    for polygon in mesh_obj.data.polygons:
-        slot_index = int(polygon.material_index)
+    material_indices = mesh_polygon_material_indices(mesh_obj.data)
+    invalid_slot_values = {
+        int(slot_index)
+        for slot_index in np.unique(material_indices)
         if (
-            slot_index < 0
-            or slot_index >= len(materials)
-            or materials[slot_index] is None
-        ):
-            invalid_faces.append(int(polygon.index))
-            invalid_slots.add(slot_index)
+            int(slot_index) < 0
+            or int(slot_index) >= len(materials)
+            or materials[int(slot_index)] is None
+        )
+    }
+    invalid_slots = set(invalid_slot_values)
+    invalid_faces = (
+        np.flatnonzero(
+            np.isin(material_indices, tuple(invalid_slot_values))
+        )[:40].astype(int).tolist()
+        if invalid_slot_values
+        else []
+    )
     if invalid_faces:
         raise RuntimeError(
             "Final merged mesh has polygon-assigned empty material slots: "
             f"object={mesh_obj.name}, slots={sorted(invalid_slots)}, "
-            f"faces={invalid_faces[:40]}"
+            f"faces={invalid_faces}"
         )
     return {
         "status": "ok",
         "material_count": len(materials),
         "assigned_slot_indices": sorted(
-            {int(polygon.material_index) for polygon in mesh_obj.data.polygons}
+            int(value) for value in np.unique(material_indices)
         ),
         "unused_empty_slot_indices": [
             index
@@ -10562,11 +10639,17 @@ def park_cluster_source_full_reference(
 def _mesh_face_material_counts(obj):
     materials = list(obj.data.materials)
     counts = Counter()
-    for polygon in obj.data.polygons:
-        slot = int(polygon.material_index)
+    material_indices = mesh_polygon_material_indices(obj.data)
+    slot_counts = np.bincount(
+        material_indices,
+        minlength=len(materials),
+    )
+    for slot, count in enumerate(slot_counts):
+        if not count:
+            continue
         material = materials[slot] if 0 <= slot < len(materials) else None
         key = material.name if material is not None else f"<unassigned:{slot}>"
-        counts[key] += 1
+        counts[key] += int(count)
     return counts
 
 
