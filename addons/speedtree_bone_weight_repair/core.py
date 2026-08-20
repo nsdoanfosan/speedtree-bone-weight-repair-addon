@@ -10942,19 +10942,36 @@ def save_blend(path):
     bpy.ops.wm.save_as_mainfile(filepath=path)
 
 
-def run_full_pipeline(settings):
+def run_full_pipeline(
+    settings,
+    *,
+    import_result=None,
+    runtime_texture_contract=None,
+    write_pipeline_report=True,
+):
     paths = default_paths(settings)
-    reports = {"paths": paths, "steps": [], "saved_blends": []}
+    reports = {
+        "paths": paths,
+        "steps": [],
+        "saved_blends": [],
+        "stage_timings_seconds": {},
+    }
     save_stage_blends = settings.get("save_intermediate_blends", False)
 
-    # New-schema provenance/profile validation must finish before any Blender
-    # mutation.  The operational BAT boundary still treats texture assignment
-    # as runtime-tolerant; strict publication remains available to audit calls.
-    texture_contract = load_speedtree_runtime_texture_contract(
-        settings.get("texture_contract_path", ""),
-        spm_path=settings.get("spm_path", ""),
-        source_fbx_path=settings.get("source_fbx_path", ""),
-    )
+    def record_stage(name, started):
+        reports["stage_timings_seconds"][name] = round(
+            perf_counter() - started,
+            6,
+        )
+
+    source_preparation_started = perf_counter()
+    texture_contract = runtime_texture_contract
+    if texture_contract is None:
+        texture_contract = load_speedtree_runtime_texture_contract(
+            settings.get("texture_contract_path", ""),
+            spm_path=settings.get("spm_path", ""),
+            source_fbx_path=settings.get("source_fbx_path", ""),
+        )
     if isinstance(texture_contract, dict) and texture_contract.get(
         "strict_speedtree_pipeline_contract"
     ):
@@ -10975,28 +10992,47 @@ def run_full_pipeline(settings):
             else "codex_source_fbx" in obj
         )
     ]
-    texture_preflight = preflight_speedtree_material_texture_contracts(
-        source_import_objects,
-        texture_contract,
-        source_fbx_override=source_fbx_path,
-    )
-    texture_contract = texture_preflight["texture_contract"]
+    if import_result is None:
+        texture_preflight = preflight_speedtree_material_texture_contracts(
+            source_import_objects,
+            texture_contract,
+            source_fbx_override=source_fbx_path,
+        )
+        texture_contract = texture_preflight["texture_contract"]
+        applied_scales = apply_object_scales(source_import_objects)
+    else:
+        texture_preflight = import_result.get(
+            "speedtree_material_texture_preflight", {}
+        )
+        texture_contract = texture_preflight.get(
+            "texture_contract", texture_contract
+        )
+        applied_scales = import_result.get("applied_scales", [])
     reports["speedtree_material_texture_preflight"] = texture_preflight
-    applied_scales = apply_object_scales(source_import_objects)
     if applied_scales:
         reports["steps"].append({"name": "apply_import_scales", "status": "applied", "applied": applied_scales})
 
     source_import_meshes = [obj for obj in source_import_objects if obj.type == "MESH"]
-    tag_existing_source_materials(source_import_meshes)
-    renamed_materials = strip_speedtree_material_suffixes(source_import_meshes)
+    if import_result is None:
+        tag_existing_source_materials(source_import_meshes)
+        renamed_materials = strip_speedtree_material_suffixes(
+            source_import_meshes
+        )
+    else:
+        renamed_materials = import_result.get("renamed_materials", [])
     if renamed_materials:
         reports["steps"].append(
             {"name": "normalize_material_names", "status": "applied", "renamed": renamed_materials}
         )
 
-    material_consolidation = consolidate_speedtree_group_materials(
-        source_import_meshes, texture_contract=texture_contract
-    )
+    if import_result is None:
+        material_consolidation = consolidate_speedtree_group_materials(
+            source_import_meshes, texture_contract=texture_contract
+        )
+    else:
+        material_consolidation = import_result.get(
+            "material_consolidation", {}
+        )
     reports["steps"].append(
         {
             "name": "consolidate_speedtree_group_materials",
@@ -11007,9 +11043,14 @@ def run_full_pipeline(settings):
         }
     )
 
-    material_intents = apply_speedtree_material_intents(
-        source_import_meshes, texture_contract=texture_contract
-    )
+    if import_result is None:
+        material_intents = apply_speedtree_material_intents(
+            source_import_meshes, texture_contract=texture_contract
+        )
+    else:
+        material_intents = import_result.get(
+            "speedtree_material_intents", {}
+        )
     reports["speedtree_material_intents"] = material_intents
     reports["steps"].append(
         {
@@ -11019,9 +11060,12 @@ def run_full_pipeline(settings):
         }
     )
 
-    instance_profile = apply_spm_unreal_instance_profile(
-        source_import_meshes, settings["spm_path"]
-    )
+    if import_result is None:
+        instance_profile = apply_spm_unreal_instance_profile(
+            source_import_meshes, settings["spm_path"]
+        )
+    else:
+        instance_profile = import_result.get("unreal_instance_profile", {})
     reports["unreal_instance_profile"] = instance_profile
     reports["steps"].append(
         {
@@ -11032,9 +11076,14 @@ def run_full_pipeline(settings):
         }
     )
 
-    texture_normalization = normalize_speedtree_material_textures(
-        source_import_meshes, texture_contract=texture_contract
-    )
+    if import_result is None:
+        texture_normalization = normalize_speedtree_material_textures(
+            source_import_meshes, texture_contract=texture_contract
+        )
+    else:
+        texture_normalization = import_result.get(
+            "texture_normalization", {}
+        )
     reports["texture_normalization"] = texture_normalization
     reports["steps"].append(
         {
@@ -11060,17 +11109,23 @@ def run_full_pipeline(settings):
         }
     )
 
-    removed_phantoms = remove_phantom_image_nodes(bpy.context.scene.objects)
+    removed_phantoms = (
+        remove_phantom_image_nodes(bpy.context.scene.objects)
+        if import_result is None
+        else import_result.get("removed_phantom_texture_nodes", [])
+    )
     if removed_phantoms:
         reports["steps"].append(
             {"name": "remove_phantom_texture_nodes", "status": "applied", "removed": removed_phantoms}
         )
+    record_stage("source_material_preparation", source_preparation_started)
 
     def stage_save(path):
         if save_stage_blends:
             save_blend(path)
             reports["saved_blends"].append(path)
 
+    reparent_started = perf_counter()
     if settings.get("cluster_source_skin_contract", False):
         cluster_armature = get_armature(
             settings.get("armature_name", "Root")
@@ -11118,6 +11173,7 @@ def run_full_pipeline(settings):
                 + f" Export structure was not built. Reparent report: {paths['reparent_report']}"
             )
         )
+    record_stage("reparent", reparent_started)
     stage_save(paths["fixed_blend"])
 
     # Material-grouped SpeedTree exports leave branch/frond plane geometry as
@@ -11127,6 +11183,7 @@ def run_full_pipeline(settings):
     # disconnected plane component rigidly to the nearest already-skinned bark
     # surface so the authored M_branch_* material/geometry pair survives the
     # final Full SK merge.
+    branch_planes_started = perf_counter()
     branch_planes = run_skin_loose_instances(
         settings.get("armature_name", "Root"),
         "branch",
@@ -11150,10 +11207,12 @@ def run_full_pipeline(settings):
         }
     )
     represented_source_objects = set(branch_planes.get("source_objects", []))
+    record_stage("skin_branch_planes", branch_planes_started)
 
     if settings.get("skip_leaf_skin", False):
         reports["steps"].append({"name": "skin_loose_instances", "status": "skipped"})
     else:
+        leaf_started = perf_counter()
         leaf = run_skin_loose_instances(
             settings.get("armature_name", "Root"),
             settings.get("leaf_name_contains", "leaf"),
@@ -11170,12 +11229,14 @@ def run_full_pipeline(settings):
         represented_source_objects.update(leaf.get("source_objects", []))
         reports["steps"].append({"name": "skin_loose_instances", "status": leaf.get("status"), "report": paths["leaf_report"]})
         stage_save(paths["leaf_blend"])
+        record_stage("skin_loose_instances", leaf_started)
 
     # Preserve every remaining authored render mesh, regardless of naming.
     # Scan-derived trunks and their stitch surfaces commonly use M_tree_* or
     # M_bark_* names and therefore bypass the historical branch/leaf passes.
     # Restrict the catch-all to this exact FBX import and exclude source meshes
     # already represented by the semantic passes so each face is copied once.
+    residual_started = perf_counter()
     residual_geometry = run_skin_loose_instances(
         settings.get("armature_name", "Root"),
         "",
@@ -11200,7 +11261,9 @@ def run_full_pipeline(settings):
             "created_faces": residual_geometry.get("created_faces", 0),
         }
     )
+    record_stage("skin_residual_geometry", residual_started)
 
+    weights_started = perf_counter()
     weights = run_repair_invalid_weights(
         settings.get("armature_name", "Root"),
         mesh_regex=settings.get("mesh_regex", ""),
@@ -11209,6 +11272,7 @@ def run_full_pipeline(settings):
         max_samples_per_object=settings.get("max_samples_per_object", 20),
         report_path=paths["weight_report"],
     )
+    record_stage("repair_invalid_weights", weights_started)
     reports["steps"].append(
         {
             "name": "repair_invalid_weights",
@@ -11219,6 +11283,7 @@ def run_full_pipeline(settings):
     )
     stage_save(paths["weight_blend"])
 
+    merge_export_started = perf_counter()
     export = run_merge_export(
         settings.get("armature_name", "Root"),
         paths["merged_name"],
@@ -11230,6 +11295,7 @@ def run_full_pipeline(settings):
         texture_contract=texture_contract,
         expected_source_objects=source_import_meshes,
     )
+    record_stage("merge_export", merge_export_started)
     reports["steps"].append(
         {
             "name": "merge_export",
@@ -11255,7 +11321,10 @@ def run_full_pipeline(settings):
     reports["spm_read_cache"] = spm_reader.cache_info()
     reports["grouping_health"] = export.get("grouping_health", {})
     reports["warnings"] = export.get("unreal_json_warnings", [])
-    write_report(paths["pipeline_report"], reports)
+    if write_pipeline_report:
+        report_write_started = perf_counter()
+        write_report(paths["pipeline_report"], reports)
+        record_stage("pipeline_report_write", report_write_started)
     return reports
 
 
@@ -11383,6 +11452,7 @@ def run_import_and_repair(settings):
     # settings must already carry source_fbx_path (and ideally xml_path) from the
     # SpeedTree export step. Wipes the previous build, re-imports, re-runs the
     # full repair pipeline. Pressing the button again is a clean update.
+    total_started = perf_counter()
     if not settings.get("source_fbx_path"):
         raise RuntimeError("Source FBX path is required (run the SpeedTree export first).")
     texture_contract = load_speedtree_runtime_texture_contract(
@@ -11390,7 +11460,10 @@ def run_import_and_repair(settings):
         spm_path=settings.get("spm_path", ""),
         source_fbx_path=settings.get("source_fbx_path", ""),
     )
+    cleanup_started = perf_counter()
     cleanup = clear_previous_codex_build(settings)
+    cleanup_duration = perf_counter() - cleanup_started
+    import_started = perf_counter()
     imported = run_import_source_fbx(
         settings["source_fbx_path"],
         settings.get("source_collection_name", "SpeedTree_Source"),
@@ -11406,10 +11479,22 @@ def run_import_and_repair(settings):
         cluster_source_xml_path=settings.get("xml_path", ""),
         source_identity_path=settings.get("source_identity_path", ""),
     )
+    import_duration = perf_counter() - import_started
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:
         source_collection.hide_viewport = False
-    reports = run_full_pipeline(settings)
+    pipeline_started = perf_counter()
+    reports = run_full_pipeline(
+        settings,
+        import_result=imported,
+        runtime_texture_contract=texture_contract,
+        write_pipeline_report=False,
+    )
+    pipeline_duration = perf_counter() - pipeline_started
+    timings = reports.setdefault("stage_timings_seconds", {})
+    timings["cleanup_previous_build"] = round(cleanup_duration, 6)
+    timings["import_source_fbx"] = round(import_duration, 6)
+    timings["pipeline_core"] = round(pipeline_duration, 6)
     reports["cleanup"] = cleanup
     reports["import"] = {
         "source_fbx": imported.get("source_fbx", ""),
@@ -11441,21 +11526,16 @@ def run_import_and_repair(settings):
         reports["renderable_geometry_after_cleanup"] = (
             imported.get("renderable_geometry", {})
         )
-        source_fbx_path = settings.get("source_fbx_path", "")
-        current_source_objects = [
-            obj
-            for obj in bpy.context.scene.objects
-            if belongs_to_source_fbx(obj, source_fbx_path)
-        ]
-        reports["unassigned_geometry_cleanup_recheck"] = (
-            discard_unassigned_geometry_before_repair(
-                current_source_objects,
-                texture_contract=texture_contract,
-                spm_path=settings.get("spm_path", ""),
-                source_fbx_path=source_fbx_path,
-            )
-        )
     pipeline_path = reports.get("paths", {}).get("pipeline_report", "")
-    if pipeline_path:
+    if pipeline_path and not settings.get("defer_pipeline_report_write", False):
+        report_write_started = perf_counter()
         write_report(pipeline_path, reports)
+        timings["pipeline_report_write"] = round(
+            perf_counter() - report_write_started,
+            6,
+        )
+    timings["total_import_and_repair"] = round(
+        perf_counter() - total_started,
+        6,
+    )
     return reports
