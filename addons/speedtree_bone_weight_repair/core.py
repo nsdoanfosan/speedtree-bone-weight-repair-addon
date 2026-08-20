@@ -6806,24 +6806,44 @@ def ensure_cluster_source_skin_contract(
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
     "discard_unassigned_geometry_before_repair"
 )
-UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 2
+UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 3
+UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS = frozenset({
+    "default",
+    "material",
+})
 
 
-def _cleanup_default_material_authorized(material, texture_contract):
-    """Accept only the strict STMAT Default intent, never a name guess."""
+def _cleanup_placeholder_material_key(material, texture_contract):
+    """Return a proven generic STMAT placeholder key, never a name guess.
+
+    SpeedTree's explicit dummy material can be exported as either ``Default``
+    or ``Material``.  The generic name alone is insufficient: deletion also
+    requires the exact current STMAT intent to be unmanaged and source-empty.
+    """
     if material is None or not isinstance(texture_contract, dict):
-        return False
+        return ""
     envelope = texture_contract.get("speedtree_pipeline_contract")
     if not isinstance(envelope, dict):
-        return False
+        return ""
     api = handoff_contract.central_contract_api()
     material_base = api.production_group_base_name(material.name)
-    if api.normalize_material_key(material_base) != "default":
-        return False
+    material_key = api.normalize_material_key(material_base)
+    if material_key not in UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS:
+        return ""
     matches = _strict_material_intents_for_name(material_base, envelope)
-    return len(matches) == 1 and _is_unmanaged_empty_default_intent(
-        matches[0]
-    )
+    if len(matches) != 1:
+        return ""
+    intent = matches[0]
+    binding = intent.get("texture_binding")
+    files = binding.get("files") if isinstance(binding, dict) else None
+    if (
+        api.normalize_material_key(intent.get("material_key")) != material_key
+        or str(intent.get("texture_source_mode") or "")
+        == "managed_texture_set"
+        or files
+    ):
+        return ""
+    return material_key
 
 
 def _cleanup_live_identity(texture_contract, spm_path, source_fbx_path):
@@ -6845,8 +6865,14 @@ def _cleanup_face_reason(polygon, materials, texture_contract):
     material = materials[slot_index]
     if material is None:
         return "empty_material_slot"
-    if _cleanup_default_material_authorized(material, texture_contract):
+    placeholder_key = _cleanup_placeholder_material_key(
+        material,
+        texture_contract,
+    )
+    if placeholder_key == "default":
         return "canonical_unmanaged_default_material"
+    if placeholder_key == "material":
+        return "canonical_unmanaged_material_placeholder"
     return ""
 
 
@@ -6910,11 +6936,13 @@ def _cleanup_record_base(
 def discard_unassigned_geometry_before_repair(
     objects, *, texture_contract, spm_path, source_fbx_path
 ):
-    """Discard only Full-FBX faces that have no production material.
+    """Discard only Full-FBX faces with a proven generic dummy material.
 
     This runs before Blender joins material-grouped imports. Otherwise a
     no-slot object is silently mapped to the first valid join material, which
-    can make collision/unused geometry masquerade as cluster planes.
+    can make collision/unused geometry masquerade as cluster planes.  Exact
+    current STMAT evidence admits source-empty ``Default`` and ``Material``;
+    a name by itself never authorizes deletion.
     """
     mesh_objects = [
         obj

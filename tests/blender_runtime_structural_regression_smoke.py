@@ -169,7 +169,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         source_fbx_path=str(source_fbx),
     )
     assert cleanup_result["status"] == "applied", cleanup_result
-    assert cleanup_result["cleanup_contract_version"] == 2, cleanup_result
+    assert cleanup_result["cleanup_contract_version"] == 3, cleanup_result
     assert cleanup_result["inspected_mesh_object_count"] == 2, cleanup_result
     assert cleanup_result["changed_object_count"] == 1, cleanup_result
     assert cleanup_result["removed_object_count"] == 1, cleanup_result
@@ -207,6 +207,59 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     assert len(cleanup_mixed.data.polygons) == 1
     assert material_names(cleanup_mixed) == ["M_cluster_Runtime_01"]
     assert cleanup_mixed.data.polygons[0].material_index == 0
+
+    # A SpeedTree dummy can also be assigned to the generic STMAT ``Material``
+    # entry.  Admit it only when the exact current intent is unmanaged and has
+    # no texture files; this removes the dummy mesh before the Blender join.
+    generic_dummy_material = bpy.data.materials.new("Material")
+    generic_dummy = make_mesh_object(
+        "GenericMaterialDummy",
+        [generic_dummy_material],
+    )
+    generic_dummy_contract = strict_runtime_contract(
+        [
+            make_intent("Material", 0, tree_part=None),
+            make_intent("M_cluster_Runtime_01", 1),
+        ]
+    )
+    generic_dummy_result = core.discard_unassigned_geometry_before_repair(
+        [cleanup_renderable, generic_dummy],
+        texture_contract=generic_dummy_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert generic_dummy_result["status"] == "applied", generic_dummy_result
+    assert generic_dummy_result["removed_objects"] == [
+        "GenericMaterialDummy"
+    ], generic_dummy_result
+    assert generic_dummy_result["objects"][0]["removed_face_reasons"] == {
+        "canonical_unmanaged_material_placeholder": 1
+    }, generic_dummy_result
+    assert bpy.data.objects.get("GenericMaterialDummy") is None
+
+    # The generic name is not deletion authority when the current intent owns
+    # a managed texture source.
+    managed_generic = make_mesh_object(
+        "ManagedGenericMaterial",
+        [generic_dummy_material],
+    )
+    managed_generic_contract = strict_runtime_contract(
+        [
+            make_intent(
+                "Material",
+                0,
+                files={"color": root / "texture" / "Material_color.tga"},
+            ),
+        ]
+    )
+    managed_generic_result = core.discard_unassigned_geometry_before_repair(
+        [managed_generic],
+        texture_contract=managed_generic_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert managed_generic_result["status"] == "not_applicable"
+    assert bpy.data.objects.get("ManagedGenericMaterial") is managed_generic
 
     # A source FBX may use only one Atlas Builder child collection.  The
     # strict intent still proves that its suffix is a production-group token,
