@@ -35,7 +35,6 @@ from .preview_texture_contract import (
 
 
 EPSILON = 1e-6
-COORD_RE = re.compile(r"X:([-+0-9.eE]+),\s*Y:([-+0-9.eE]+),\s*Z:([-+0-9.eE]+)")
 JSON_PREVIEW_ATTR_NAME = "Codex_JSON_Group_Preview"
 JSON_PREVIEW_SCENE_KEY = "codex_json_preview_active"
 JSON_PREVIEW_COLLECTION_HIDE_KEY = "codex_json_preview_original_hide_viewport"
@@ -485,7 +484,7 @@ def belongs_to_source_identity(datablock, source_identity_path):
 def source_fbx_cleanup_lineage(source_fbx_path):
     """Return canonical FBX plus its retired unprefixed compatibility alias.
 
-    Cluster output names are now canonicalized to ``SK_*``.  Older repair runs
+    Cluster output names are now canonicalized to ``SK_*``. Older outputs
     may still have Blender datablocks tagged with the sibling FBX name without
     that prefix.  The alias is used only by the idempotent cleanup pass and only
     for ``Cluster/fbx`` outputs; normal provenance checks remain exact-path
@@ -5073,7 +5072,7 @@ def rebind_blocked_speedtree_group_variants(objects):
     """Replace stale isolated variant images with one canonical T_ group set.
 
     Cluster normalization can retain a generated material variant such as
-    ``M_leaf_x_atlas_01_green`` while a later canonical source repair creates
+    ``M_leaf_x_atlas_01_green`` while a later canonical source import creates
     the authoritative base material ``M_leaf_x_atlas_01``.  A saved prototype
     must not keep image paths inside ``.sk_batch_isolated_bark`` merely because
     its material name includes that production-group suffix.  The imported FBX
@@ -6269,542 +6268,8 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
     }
 
 
-def build_rigid_fallback_armature(objects, armature_name="Root", bone_name="Bone_1_Start"):
-    if any(obj.type == "ARMATURE" for obj in objects):
-        return None
-    meshes = [obj for obj in objects if obj.type == "MESH" and obj.data and len(obj.data.vertices) > 0]
-    if not meshes:
-        return None
-
-    world_points = [obj.matrix_world @ Vector(corner) for obj in meshes for corner in obj.bound_box]
-    low = Vector((min(point.x for point in world_points), min(point.y for point in world_points), min(point.z for point in world_points)))
-    high = Vector((max(point.x for point in world_points), max(point.y for point in world_points), max(point.z for point in world_points)))
-    center = (low + high) * 0.5
-    height = max(high.z - low.z, 0.1)
-
-    armature_data = bpy.data.armatures.new(armature_name)
-    armature = bpy.data.objects.new(armature_name, armature_data)
-    bpy.context.scene.collection.objects.link(armature)
-    ensure_object_mode()
-    deselect_all()
-    bpy.context.view_layer.objects.active = armature
-    armature.select_set(True)
-    bpy.ops.object.mode_set(mode="EDIT")
-    edit_bone = armature.data.edit_bones.new(bone_name)
-    edit_bone.head = (center.x, center.y, low.z)
-    edit_bone.tail = (center.x, center.y, low.z + height)
-    bpy.ops.object.mode_set(mode="OBJECT")
-
-    for obj in meshes:
-        group = obj.vertex_groups.get(bone_name) or obj.vertex_groups.new(name=bone_name)
-        group.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
-        parent_keep_world(obj, armature)
-        modifier = next((item for item in obj.modifiers if item.type == "ARMATURE"), None)
-        if modifier is None:
-            modifier = obj.modifiers.new(name=armature_name, type="ARMATURE")
-        modifier.object = armature
-
-    return {
-        "armature": armature.name,
-        "bone": bone_name,
-        "meshes": [obj.name for obj in meshes],
-        "reason": "SpeedTree FBX contained geometry but no armature",
-    }
-
-
-CLUSTER_XML_SCALE_CANDIDATES = (100.0, 1.0, 3.28084, 30.48, 0.01)
-CLUSTER_AXIS_BONE_RE = re.compile(
-    r"^Bone_(\d+)_(Start|End)$",
-    flags=re.IGNORECASE,
-)
-
-
-def _cluster_xml_number(value, label):
-    text = str("" if value is None else value).strip()
-    if not text:
-        raise RuntimeError(f"Cluster XML {label} is empty.")
-    if "," in text:
-        if "." in text or text.count(",") != 1:
-            raise RuntimeError(
-                f"Cluster XML {label} has ambiguous decimal separators: {text!r}"
-            )
-        text = text.replace(",", ".")
-    number = float(text)
-    if not math.isfinite(number):
-        raise RuntimeError(f"Cluster XML {label} is not finite: {value!r}")
-    return number
-
-
-def _cluster_xml_structural_roots(xml_path):
-    path = Path(str(xml_path or "")).expanduser()
-    if not path.is_file():
-        raise RuntimeError(
-            "Cluster source skin normalization requires the matching Raw XML: "
-            f"{path}"
-        )
-    try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError) as exc:
-        raise RuntimeError(f"Cluster Raw XML could not be parsed: {path} ({exc})") from exc
-
-    bones = []
-    for element in root.iter("Bone"):
-        attrs = element.attrib
-        required = (
-            "ID",
-            "ParentID",
-            "StartX",
-            "StartY",
-            "StartZ",
-            "EndX",
-            "EndY",
-            "EndZ",
-        )
-        missing = [name for name in required if name not in attrs]
-        if missing:
-            raise RuntimeError(
-                "Cluster Raw XML Bone is missing required attributes: "
-                + ", ".join(missing)
-            )
-        bones.append(
-            {
-                "id": int(attrs["ID"]),
-                "parent_id": int(attrs["ParentID"]),
-                "generator": str(attrs.get("Generator") or ""),
-                "start_raw": Vector(
-                    (
-                        _cluster_xml_number(attrs["StartX"], "StartX"),
-                        _cluster_xml_number(attrs["StartY"], "StartY"),
-                        _cluster_xml_number(attrs["StartZ"], "StartZ"),
-                    )
-                ),
-                "end_raw": Vector(
-                    (
-                        _cluster_xml_number(attrs["EndX"], "EndX"),
-                        _cluster_xml_number(attrs["EndY"], "EndY"),
-                        _cluster_xml_number(attrs["EndZ"], "EndZ"),
-                    )
-                ),
-            }
-        )
-    if not bones:
-        raise RuntimeError(f"Cluster Raw XML contains no Bone entries: {path}")
-    roots = [bone for bone in bones if bone["parent_id"] == -1]
-    if not roots:
-        raise RuntimeError(
-            f"Cluster Raw XML contains no structural root (ParentID=-1): {path}"
-        )
-    return roots
-
-
-def _cluster_geometry_scale(meshes):
-    points = [
-        obj.matrix_world @ Vector(corner)
-        for obj in meshes
-        for corner in obj.bound_box
-    ]
-    if not points:
-        return 0.0
-    return max(
-        max(point[axis] for point in points)
-        - min(point[axis] for point in points)
-        for axis in range(3)
-    )
-
-
-def _cluster_named_axis_root_contract(axis_ordinals, roots):
-    """Map FBX Bone_N identities to XML ID N-1 with B as a subset of A."""
-    ordinals = sorted({int(value) for value in axis_ordinals})
-    if not ordinals or any(ordinal <= 0 for ordinal in ordinals):
-        raise RuntimeError(
-            "Cluster axis bone ordinals must be positive; found "
-            f"{ordinals}."
-        )
-    roots_by_id = {}
-    for root in roots:
-        root_id = int(root["id"])
-        if root_id in roots_by_id:
-            raise RuntimeError(
-                f"Cluster Raw XML contains duplicate structural root ID {root_id}."
-            )
-        roots_by_id[root_id] = root
-    requested_xml_ids = {ordinal - 1 for ordinal in ordinals}
-    missing_xml_ids = sorted(requested_xml_ids.difference(roots_by_id))
-    if missing_xml_ids:
-        raise RuntimeError(
-            "Cluster FBX axis names reference structural XML root IDs that do "
-            f"not exist: {missing_xml_ids}."
-        )
-    return {
-        "roots_by_ordinal": {
-            ordinal: roots_by_id[ordinal - 1] for ordinal in ordinals
-        },
-        "unused_xml_root_ids": sorted(
-            set(roots_by_id).difference(requested_xml_ids)
-        ),
-    }
-
-
-def _canonicalize_cluster_axis_bones(armature, meshes, xml_path):
-    """Replace SpeedTree Start/End markers with one real axis bone per XML root.
-
-    Stage 1 authors Raw XML structural roots only for the first *renderable*
-    Branch below each Tree root. Meshless Trunk/Branch placement splines are
-    therefore absent from this contract. Imported ``Bone_N_Start/End`` names
-    resolve only to XML root ID ``N - 1``. Extra XML roots are valid; geometry
-    coordinates diagnose export drift and select units, but never select bone
-    identity.
-    """
-    roots = _cluster_xml_structural_roots(xml_path)
-    axes = {}
-    unexpected = []
-    for bone in armature.data.bones:
-        match = CLUSTER_AXIS_BONE_RE.fullmatch(bone.name)
-        if match is None:
-            unexpected.append(bone.name)
-            continue
-        ordinal = int(match.group(1))
-        role = match.group(2).casefold()
-        row = axes.setdefault(ordinal, {"ordinal": ordinal})
-        if role in row:
-            raise RuntimeError(
-                f"Cluster armature has duplicate {role} axis bone ordinal {ordinal}."
-            )
-        row[role] = bone
-    if unexpected:
-        raise RuntimeError(
-            "Cluster armature contains non-axis bones after Stage 1 calibration: "
-            + ", ".join(sorted(unexpected))
-        )
-    if not axes:
-        raise RuntimeError(
-            "Cluster armature contains no numbered Start/End axis bones."
-        )
-    named_root_contract = _cluster_named_axis_root_contract(axes, roots)
-    roots_by_ordinal = named_root_contract["roots_by_ordinal"]
-
-    named_pairs = []
-    for ordinal in sorted(axes):
-        axis = axes[ordinal]
-        start_bone = axis.get("start")
-        end_bone = axis.get("end")
-        if start_bone is None and end_bone is None:
-            raise RuntimeError(f"Cluster axis {ordinal} has no Start or End marker.")
-        if start_bone is not None:
-            source_start = armature.matrix_world @ start_bone.head_local
-            source_end = (
-                armature.matrix_world @ end_bone.head_local
-                if end_bone is not None
-                else armature.matrix_world @ start_bone.tail_local
-            )
-            marker_policy = "start_and_endpoint_present"
-        else:
-            source_start = None
-            source_end = armature.matrix_world @ end_bone.head_local
-            marker_policy = "orphan_end_recovers_named_missing_start"
-        named_pairs.append(
-            {
-                "ordinal": ordinal,
-                "root": roots_by_ordinal[ordinal],
-                "source_start": source_start,
-                "source_end": source_end,
-                "marker_policy": marker_policy,
-            }
-        )
-
-    scale_scores = []
-    for scale in CLUSTER_XML_SCALE_CANDIDATES:
-        distances = []
-        for pair in named_pairs:
-            root = pair["root"]
-            if pair["source_start"] is not None:
-                distances.append(
-                    float(
-                        (
-                            pair["source_start"]
-                            - root["start_raw"] / scale
-                        ).length
-                    )
-                )
-            distances.append(
-                float(
-                    (
-                        pair["source_end"]
-                        - root["end_raw"] / scale
-                    ).length
-                )
-            )
-        ordered = sorted(float(value) for value in distances)
-        middle = len(ordered) // 2
-        median = (
-            ordered[middle]
-            if len(ordered) % 2
-            else (ordered[middle - 1] + ordered[middle]) * 0.5
-        )
-        scale_scores.append(
-            {
-                "scale": float(scale),
-                "median_named_error": float(median),
-                "max_named_error": float(max(ordered)),
-            }
-        )
-    scale_scores.sort(
-        key=lambda row: (
-            row["median_named_error"],
-            row["max_named_error"],
-            row["scale"],
-        )
-    )
-    xml_scale = scale_scores[0]["scale"]
-    geometry_scale = _cluster_geometry_scale(meshes)
-    tolerance = max(geometry_scale * 1.0e-4, 1.0e-6)
-    matches = []
-    for pair in named_pairs:
-        root = {
-            **pair["root"],
-            "start_world": pair["root"]["start_raw"] / xml_scale,
-            "end_world": pair["root"]["end_raw"] / xml_scale,
-        }
-        start_error = (
-            float((pair["source_start"] - root["start_world"]).length)
-            if pair["source_start"] is not None
-            else 0.0
-        )
-        end_error = float(
-            (pair["source_end"] - root["end_world"]).length
-        )
-        matches.append(
-            {
-                "ordinal": pair["ordinal"],
-                "root": root,
-                "policy": "exact_bone_ordinal_to_xml_root_id_v1",
-                "marker_policy": pair["marker_policy"],
-                "start_error": start_error,
-                "end_error": end_error,
-                "coordinate_validation": (
-                    "within_tolerance"
-                    if start_error <= tolerance and end_error <= tolerance
-                    else "diagnostic_mismatch"
-                ),
-            }
-        )
-
-    by_ordinal = {row["ordinal"]: row for row in matches}
-    ensure_object_mode()
-    deselect_all()
-    bpy.context.view_layer.objects.active = armature
-    armature.select_set(True)
-    bpy.ops.object.mode_set(mode="EDIT")
-    try:
-        edit_bones = armature.data.edit_bones
-        for bone in list(edit_bones):
-            edit_bones.remove(bone)
-        world_to_armature = armature.matrix_world.inverted_safe()
-        for ordinal in sorted(by_ordinal):
-            match = by_ordinal[ordinal]
-            root = match["root"]
-            bone = edit_bones.new(f"Bone_{ordinal}_Start")
-            bone.head = world_to_armature @ root["start_world"]
-            bone.tail = world_to_armature @ root["end_world"]
-            bone.use_deform = True
-            if (bone.tail - bone.head).length <= max(tolerance * 1.0e-3, 1.0e-8):
-                raise RuntimeError(
-                    f"Cluster XML axis {ordinal} is geometrically degenerate."
-                )
-    finally:
-        bpy.ops.object.mode_set(mode="OBJECT")
-        armature.select_set(False)
-
-    return {
-        "status": "canonicalized_xml_render_roots",
-        "xml_path": str(Path(xml_path).resolve()),
-        "xml_scale": float(xml_scale),
-        "xml_scale_scores": scale_scores,
-        "axis_count": len(matches),
-        "identity_contract": "fbx_named_axes_subset_of_xml_roots_v1",
-        "unused_xml_root_ids": named_root_contract[
-            "unused_xml_root_ids"
-        ],
-        "bone_names": [
-            f"Bone_{ordinal}_Start" for ordinal in sorted(by_ordinal)
-        ],
-        "geometry_scale": float(geometry_scale),
-        "match_tolerance": float(tolerance),
-        "axes": [
-            {
-                "ordinal": row["ordinal"],
-                "xml_bone_id": int(row["root"]["id"]),
-                "xml_generator": row["root"]["generator"],
-                "source_match_policy": row["policy"],
-                "source_marker_policy": row["marker_policy"],
-                "start_error": float(row["start_error"]),
-                "end_error": float(row["end_error"]),
-                "coordinate_validation": row["coordinate_validation"],
-                "start_world": [
-                    float(value)
-                    for value in row["root"]["start_world"]
-                ],
-                "end_world": [
-                    float(value)
-                    for value in row["root"]["end_world"]
-                ],
-            }
-            for row in sorted(matches, key=lambda item: item["ordinal"])
-        ],
-    }
-
-
-def ensure_cluster_source_skin_contract(
-    objects,
-    armature_name="Root",
-    xml_path="",
-):
-    """Canonicalize render-root axes and preserve authored Cluster skin.
-
-    Imported ``*_End`` joints are endpoint markers, not valid mesh-axis bones.
-    The matching Raw XML roots are converted to one complete ``*_Start`` deform
-    bone spanning Start->End for every renderable structural root.
-
-    Multi-piece authored skin remains partitioned across those axes. A
-    completely unskinned source is rigid-bound only when the XML contract has
-    exactly one render-root axis; multi-axis membership is never guessed.
-    """
-    armatures = [obj for obj in objects if obj.type == "ARMATURE"]
-    if len(armatures) != 1:
-        raise RuntimeError(
-            "Cluster source skin contract requires exactly one imported armature; "
-            f"found {len(armatures)}."
-        )
-    armature = armatures[0]
-    if armature_name and armature.name != armature_name:
-        raise RuntimeError(
-            "Cluster source skin contract imported an unexpected armature: "
-            f"expected {armature_name!r}, got {armature.name!r}."
-        )
-    meshes = [
-        obj
-        for obj in objects
-        if obj.type == "MESH" and obj.data and len(obj.data.vertices) > 0
-    ]
-    if not meshes:
-        raise RuntimeError(
-            "Cluster source skin contract found no imported mesh geometry."
-        )
-
-    axis_normalization = _canonicalize_cluster_axis_bones(
-        armature,
-        meshes,
-        xml_path,
-    )
-    deform_bones = [bone for bone in armature.data.bones if bone.use_deform]
-    deform_bone_names = {bone.name for bone in deform_bones}
-    skinned_meshes = []
-    unskinned_meshes = []
-    for obj in meshes:
-        has_armature_modifier = any(
-            modifier.type == "ARMATURE" and modifier.object == armature
-            for modifier in obj.modifiers
-        )
-        deform_group_indices = {
-            group.index
-            for group in obj.vertex_groups
-            if group.name in deform_bone_names
-        }
-        weighted_vertices = sum(
-            1
-            for vertex in obj.data.vertices
-            if any(
-                element.group in deform_group_indices
-                and float(element.weight) > 0.0
-                for element in vertex.groups
-            )
-        )
-        if has_armature_modifier and weighted_vertices:
-            skinned_meshes.append(
-                {
-                    "mesh": obj.name,
-                    "vertices": len(obj.data.vertices),
-                    "weighted_vertices": weighted_vertices,
-                    "deform_groups": [
-                        group.name
-                        for group in obj.vertex_groups
-                        if group.name in deform_bone_names
-                    ],
-                }
-            )
-        else:
-            unskinned_meshes.append(
-                {
-                    "mesh": obj.name,
-                    "vertices": len(obj.data.vertices),
-                    "has_armature_modifier": has_armature_modifier,
-                    "weighted_vertices": weighted_vertices,
-                }
-            )
-    if skinned_meshes:
-        return {
-            "status": "preserved_authored_skin",
-            "armature": armature.name,
-            "bone_count": len(armature.data.bones),
-            "deform_bone_count": len(deform_bones),
-            "deform_bones": [bone.name for bone in deform_bones],
-            "mesh_count": len(meshes),
-            "skinned_mesh_count": len(skinned_meshes),
-            "unskinned_mesh_count": len(unskinned_meshes),
-            "skinned_meshes": skinned_meshes,
-            "unskinned_meshes": unskinned_meshes,
-            "axis_normalization": axis_normalization,
-            "reason": (
-                "Authored Cluster axis weights are present and were preserved "
-                "for connected deform-cluster normalization"
-            ),
-        }
-
-    if len(deform_bones) != 1:
-        raise RuntimeError(
-            "Cluster source is completely unskinned, so the single-axis repair "
-            "requires exactly one deform bone; "
-            f"found {len(deform_bones)} in {armature.name!r}."
-        )
-    bone = deform_bones[0]
-    bound = []
-    for obj in meshes:
-        while obj.vertex_groups:
-            obj.vertex_groups.remove(obj.vertex_groups[0])
-        group = obj.vertex_groups.new(name=bone.name)
-        group.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
-        for modifier in list(obj.modifiers):
-            if modifier.type == "ARMATURE":
-                obj.modifiers.remove(modifier)
-        modifier = obj.modifiers.new(name=armature.name, type="ARMATURE")
-        modifier.object = armature
-        parent_keep_world(obj, armature)
-        bound.append(
-            {
-                "mesh": obj.name,
-                "vertices": len(obj.data.vertices),
-                "bone": bone.name,
-            }
-        )
-
-    return {
-        "status": "bound_unskinned_single_axis",
-        "armature": armature.name,
-        "bone": bone.name,
-        "bone_head": [float(value) for value in bone.head_local],
-        "bone_tail": [float(value) for value in bone.tail_local],
-        "mesh_count": len(bound),
-        "vertex_count": sum(row["vertices"] for row in bound),
-        "meshes": bound,
-        "axis_normalization": axis_normalization,
-        "reason": (
-            "Cluster FBX contained one XML render-root axis but no skin deformers"
-        ),
-    }
-
-
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
-    "discard_unassigned_geometry_before_repair"
+    "discard_unassigned_geometry_before_assembly"
 )
 UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 3
 UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS = frozenset({
@@ -6933,7 +6398,7 @@ def _cleanup_record_base(
     }
 
 
-def discard_unassigned_geometry_before_repair(
+def discard_unassigned_geometry_before_assembly(
     objects, *, texture_contract, spm_path, source_fbx_path
 ):
     """Discard only Full-FBX faces with a proven generic dummy material.
@@ -7097,13 +6562,8 @@ def discard_unassigned_geometry_before_repair(
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
-    rigid_fallback=False,
-    armature_name="Root",
-    true_root="Bone_1_Start",
     spm_path="",
     texture_contract=None,
-    cluster_source_skin_contract=False,
-    cluster_source_xml_path="",
     source_identity_path="",
 ):
     path = Path(source_fbx_path)
@@ -7130,7 +6590,7 @@ def run_import_source_fbx(
         source_identity_path=source_identity_path,
     )
     unassigned_geometry_cleanup = (
-        discard_unassigned_geometry_before_repair(
+        discard_unassigned_geometry_before_assembly(
             imported,
             texture_contract=texture_contract,
             spm_path=spm_path,
@@ -7162,34 +6622,15 @@ def run_import_source_fbx(
         imported, texture_contract=texture_contract
     )
     removed_phantoms = remove_phantom_image_nodes(imported)
-    rigid_fallback_result = None
-    cluster_source_skin_result = None
-    if cluster_source_skin_contract:
-        cluster_source_skin_started = perf_counter()
-        cluster_source_skin_result = ensure_cluster_source_skin_contract(
-            imported,
-            armature_name,
-            cluster_source_xml_path,
-        )
-        cluster_source_skin_result["duration_seconds"] = round(
-            perf_counter() - cluster_source_skin_started,
-            6,
-        )
-    elif rigid_fallback:
-        rigid_fallback_result = build_rigid_fallback_armature(imported, armature_name, true_root)
-        if rigid_fallback_result:
-            armature = bpy.data.objects.get(rigid_fallback_result["armature"])
-            if armature:
-                armature["codex_source_fbx"] = str(path)
-                ensure_only_collection(armature, source_collection)
-                imported.append(armature)
-
     return {
         "source_fbx": str(path),
         "source_identity": str(spm_path or ""),
         "source_collection": source_collection.name,
         "imported_object_count": len(imported),
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
+        "imported_armatures": [
+            obj.name for obj in imported if obj.type == "ARMATURE"
+        ],
         "imported_mesh_count": sum(1 for obj in imported if obj.type == "MESH"),
         "imported_objects": [obj.name for obj in imported[:200]],
         "applied_scales": applied_scales,
@@ -7200,8 +6641,6 @@ def run_import_source_fbx(
         "speedtree_material_texture_preflight": texture_preflight,
         "unreal_instance_profile": instance_profile,
         "texture_normalization": texture_normalization,
-        "rigid_fallback": rigid_fallback_result,
-        "cluster_source_skin_contract": cluster_source_skin_result,
         "unassigned_geometry_cleanup": unassigned_geometry_cleanup,
         "renderable_geometry": renderable_geometry,
     }
@@ -7622,7 +7061,7 @@ def run_preview_json_groups(settings):
             continue
         if not armature_modifier_uses(obj, armature):
             continue
-        if is_codex_merged_output_name(obj.name):
+        if is_codex_assembled_output_name(obj.name):
             merged_targets.append(obj)
         else:
             source_targets.append(obj)
@@ -7989,50 +7428,8 @@ def build_dynamic_wind_data(
     }
 
 
-def build_armature_fallback_metadata(xml_path, armature, reason):
-    bones = list(armature.data.bones)
-    names = [bone.name for bone in bones]
-    records = [
-        {
-            "name": bone.name,
-            "bone_index": index,
-            "parent_index": (
-                armature.data.bones.find(bone.parent.name)
-                if bone.parent is not None
-                else -1
-            ),
-            "xml_id": None,
-            "generator": "RigidFallback",
-            "mass": 0.0,
-            "radius": 0.0,
-            "group": 0,
-            "match_distance": None,
-        }
-        for index, bone in enumerate(bones)
-    ]
-    group = {
-        "index": 0,
-        "generators": ["RigidFallback"],
-        "is_trunk_group": True,
-        "bone_count": len(names),
-        "mean_mass": 0.0,
-        "mean_radius": 0.0,
-    }
-    info = {
-        "source": str(xml_path),
-        "xml_bone_count": 0,
-        "armature_bone_count": len(names),
-        "synthetic": True,
-        "fallback_reason": reason,
-        "generators": {"RigidFallback": 0},
-        "simulation_groups": [group],
-        "match": {"median_distance": None, "max_distance": None},
-    }
-    return records, info
-
-
 def write_unreal_json_from_scene(settings, paths, export_report=None):
-    # Guard: never write the JSON from a scene without the repaired armature
+    # Guard: never write the JSON from a scene without the native armature
     # (e.g. a fresh default scene) — that would overwrite a valid JSON with
     # garbage. get_armature already raises when the named armature is missing.
     armature = get_armature(settings.get("armature_name", ""))
@@ -8046,19 +7443,11 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
     warnings = []
     xml_path = settings.get("xml_path", "")
     if xml_path:
-        try:
-            xml_bones, xml_info = build_xml_bone_metadata(
-                xml_path,
-                armature,
-                settings.get("xml_trunk_generator_regex", "trunk"),
-            )
-        except RuntimeError as exc:
-            if "No <Bone> entries" not in str(exc):
-                raise
-            xml_bones, xml_info = build_armature_fallback_metadata(xml_path, armature, str(exc))
-            warnings.append(
-                "SpeedTree XML had no bones; generated a rigid group-0 mapping from the fallback armature"
-            )
+        xml_bones, xml_info = build_xml_bone_metadata(
+            xml_path,
+            armature,
+            settings.get("xml_trunk_generator_regex", "trunk"),
+        )
 
     # Health check: MegaPlant consumes the per-bone simulation groups, so the
     # JSON is only meaningful ("not hollow") when there is XML and the bones
@@ -8131,7 +7520,7 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
 
 
 # ---------------------------------------------------------------------------
-# SPM parsing / bone reparent
+# SPM metadata parsing
 # ---------------------------------------------------------------------------
 
 
@@ -8257,40 +7646,6 @@ def apply_spm_unreal_instance_profile(objects, spm_path):
     }
 
 
-def parse_coord(text):
-    match = COORD_RE.search(text or "")
-    if not match:
-        return None
-    return tuple(float(match.group(index)) for index in range(1, 4))
-
-
-def coord_key(coord, places=4):
-    if coord is None:
-        return None
-    return tuple(round(value, places) for value in coord)
-
-
-def vec_div(value, scale):
-    return (value[0] / scale, value[1] / scale, value[2] / scale)
-
-
-def dist(a, b):
-    return math.sqrt(sum((a[index] - b[index]) ** 2 for index in range(3)))
-
-
-def distance_point_segment(point, start, end):
-    line = end - start
-    denom = line.dot(line)
-    if denom <= 1e-12:
-        return (point - start).length
-    t = max(0.0, min(1.0, (point - start).dot(line) / denom))
-    return (point - (start + line * t)).length
-
-
-def tuple_point_segment_distance(point, start, end):
-    return distance_point_segment(Vector(point), Vector(start), Vector(end))
-
-
 def get_armature(name):
     if name:
         obj = bpy.data.objects.get(name)
@@ -8303,1036 +7658,13 @@ def get_armature(name):
     return armatures[0]
 
 
-def parse_speedtree(path):
-    def build(root):
-        generators = {}
-        nodes = {}
-        node_order = []
-
-        for gen in root.findall(".//Generator"):
-            guid = child_text(gen, "GUID")
-            if not guid:
-                continue
-            bone_style = element_property_value(gen, "Physics:Bone style")
-            bone_count = element_property_value(gen, "Physics:Bones")
-            hidden = child_bool(gen, "Hidden", False)
-            generators[guid] = {
-                "guid": guid,
-                "type": gen.attrib.get("Type"),
-                "name": child_text(gen, "Name", ""),
-                "level": child_text(gen, "Level"),
-                "hidden": hidden,
-                "bone_style": float(bone_style) if bone_style is not None else None,
-                "bone_count": float(bone_count) if bone_count is not None else None,
-                "bone_enabled": (
-                    not hidden
-                    and bone_style is not None
-                    and bone_count is not None
-                    and not (float(bone_style) == 0.0 and float(bone_count) == 0.0)
-                ),
-            }
-
-        for node in root.findall(".//Node"):
-            guid = child_text(node, "GUID")
-            if not guid:
-                continue
-            name = child_text(node, "Name", "")
-            extra = node.find("Extra")
-            nodes[guid] = {
-                "guid": guid,
-                "type": node.attrib.get("Type"),
-                "gen": child_text(node, "GeneratorGUID"),
-                "parent": child_text(node, "ParentGUID"),
-                "name": name,
-                "coord": parse_coord(name),
-                "has_skin": child_bool(extra, "m_bHasSkin", False),
-                "valid_position": child_bool(extra, "m_bValidPosition", True),
-            }
-            node_order.append(guid)
-
-        return {
-            "generators": generators,
-            "nodes": nodes,
-            "node_order": node_order,
-            "version": root.attrib.get("VersionString", root.attrib.get("Version")),
-        }
-
-    return spm_reader.get_derived(path, "parse_speedtree_v1", build)
-
-
-def find_base_ref_pairs(tree, raw_tolerance=0.05):
-    nodes = tree["nodes"]
-    generators = tree.get("generators", {})
-    base_refs = [
-        node
-        for node in nodes.values()
-        if node["type"] == "BaseRef" and node["coord"] and node.get("valid_position", True)
-    ]
-    refs_by_key = defaultdict(list)
-    for ref in base_refs:
-        refs_by_key[coord_key(ref["coord"])].append(ref)
-
-    def generator_family(node):
-        name = generators.get(node.get("gen"), {}).get("name", "")
-        # SpeedTree commonly pairs Base "End 2" with BaseRef "End_01 2".
-        # Prefer that semantic pair when multiple references share (0, 0, 0).
-        return re.sub(r"(?:_01)+", "", re.sub(r"\s+", " ", name.lower())).strip()
-
-    records = []
-    issues = []
-    for guid in tree["node_order"]:
-        node = nodes[guid]
-        if node["type"] != "Branch":
-            continue
-        generator = generators.get(node.get("gen"), {})
-        if generator.get("bone_enabled") is False:
-            continue
-        base = nodes.get(node["parent"])
-        if (
-            not base
-            or base["type"] != "Base"
-            or not base["coord"]
-            or not node["coord"]
-            or not base.get("valid_position", True)
-            or not node.get("valid_position", True)
-        ):
-            continue
-
-        candidates = refs_by_key.get(coord_key(base["coord"]), [])
-        if not candidates:
-            candidates = [ref for ref in base_refs if dist(ref["coord"], base["coord"]) <= raw_tolerance]
-        candidates = [ref for ref in candidates if nodes.get(ref["parent"], {}).get("type") == "Branch"]
-        if not candidates:
-            issues.append({"child_branch": guid, "base": base["guid"], "error": "no matching BaseRef"})
-            continue
-
-        family = generator_family(base)
-        family_candidates = [ref for ref in candidates if generator_family(ref) == family]
-        if family_candidates:
-            candidates = family_candidates
-
-        ref = min(candidates, key=lambda item: dist(item["coord"], base["coord"]))
-        parent_branch = nodes[ref["parent"]]
-        records.append(
-            {
-                "child_branch_guid": guid,
-                "child_branch_name": node["name"],
-                "child_coord_raw": node["coord"],
-                "base_guid": base["guid"],
-                "base_name": base["name"],
-                "attach_coord_raw": base["coord"],
-                "base_ref_guid": ref["guid"],
-                "base_ref_name": ref["name"],
-                "parent_branch_guid": parent_branch["guid"],
-                "parent_branch_name": parent_branch["name"],
-                "parent_branch_coord_raw": parent_branch["coord"],
-            }
-        )
-    return records, issues
-
-
-def collect_bones(armature):
-    bones = {}
-    children = defaultdict(list)
-    matrix = armature.matrix_world
-    for bone in armature.data.bones:
-        head = matrix @ bone.head_local
-        tail = matrix @ bone.tail_local
-        parent = bone.parent.name if bone.parent else None
-        bones[bone.name] = {
-            "name": bone.name,
-            "parent": parent,
-            "head": (head.x, head.y, head.z),
-            "tail": (tail.x, tail.y, tail.z),
-        }
-        if parent:
-            children[parent].append(bone.name)
-    return bones, children
-
-
-def unique_scale_candidates(candidates, tolerance=1e-5):
-    result = []
-    for candidate in candidates:
-        try:
-            value = float(candidate)
-        except (TypeError, ValueError):
-            continue
-        if not math.isfinite(value) or value <= EPSILON:
-            continue
-        if any(abs(value - existing) <= tolerance * max(1.0, abs(existing)) for existing in result):
-            continue
-        result.append(value)
-    return result
-
-
-def point_array(points):
-    rows = []
-    for point in points:
-        if point is None:
-            continue
-        try:
-            row = [float(point[0]), float(point[1]), float(point[2])]
-        except (TypeError, ValueError, IndexError):
-            continue
-        if all(math.isfinite(value) for value in row):
-            rows.append(row)
-    if not rows:
-        return np.empty((0, 3), dtype=np.float64)
-    return np.array(rows, dtype=np.float64)
-
-
-def robust_span_candidates(source_points, target_points):
-    source = point_array(source_points)
-    target = point_array(target_points)
-    if len(source) < 2 or len(target) < 2:
-        return []
-
-    source_low, source_high = np.percentile(source, [5.0, 95.0], axis=0)
-    target_low, target_high = np.percentile(target, [5.0, 95.0], axis=0)
-    source_span = source_high - source_low
-    target_span = target_high - target_low
-
-    candidates = []
-    source_diag = float(np.linalg.norm(source_span))
-    target_diag = float(np.linalg.norm(target_span))
-    if source_diag > EPSILON and target_diag > EPSILON:
-        candidates.append(source_diag / target_diag)
-
-    for src, dst in zip(source_span, target_span):
-        src = float(abs(src))
-        dst = float(abs(dst))
-        if src > EPSILON and dst > EPSILON:
-            candidates.append(src / dst)
-
-    source_radius = np.percentile(np.linalg.norm(source, axis=1), 95.0)
-    target_radius = np.percentile(np.linalg.norm(target, axis=1), 95.0)
-    if source_radius > EPSILON and target_radius > EPSILON:
-        candidates.append(float(source_radius / target_radius))
-
-    return unique_scale_candidates(candidates)
-
-
-def build_scale_candidates(base_candidates, source_points, target_points):
-    return unique_scale_candidates(list(base_candidates) + robust_span_candidates(source_points, target_points))
-
-
-def choose_scale(records, orphan_roots, bones, candidates):
-    if not records or not orphan_roots:
-        return candidates[0], []
-    candidates = build_scale_candidates(
-        candidates,
-        [rec["child_coord_raw"] for rec in records],
-        [bones[root]["head"] for root in orphan_roots],
-    )
-    sample_records = records[: min(len(records), 2000)]
-    scores = []
-    for scale in candidates:
-        record_points = [vec_div(rec["child_coord_raw"], scale) for rec in sample_records]
-        nearest = []
-        # Only a subset of SPM Branch nodes receives bones after Relative
-        # rounding. Score from each actual FBX orphan root toward all SPM
-        # records, not the other way around; otherwise hundreds of unboned
-        # Base children dominate the median and invent scales such as 100-400.
-        for root in orphan_roots:
-            nearest.append(min(dist(bones[root]["head"], point) for point in record_points))
-        nearest.sort()
-        scores.append(
-            {
-                "scale": scale,
-                "median_nearest_child_root": nearest[len(nearest) // 2],
-                "max_nearest_child_root": nearest[-1],
-            }
-        )
-    scores.sort(key=lambda item: (item["median_nearest_child_root"], item["max_nearest_child_root"]))
-    return scores[0]["scale"], scores
-
-
-def nearest_unused_start(coord, candidates, bones, used):
-    best = None
-    best_distance = None
-    for name in candidates:
-        if name in used:
-            continue
-        distance = dist(coord, bones[name]["head"])
-        if best_distance is None or distance < best_distance:
-            best = name
-            best_distance = distance
-    return best, best_distance
-
-
-def nearest_start(coord, candidates, bones):
-    best = None
-    best_distance = None
-    for name in candidates:
-        distance = dist(coord, bones[name]["head"])
-        if best_distance is None or distance < best_distance:
-            best = name
-            best_distance = distance
-    return best, best_distance
-
-
-def branch_chain(start_bone, children):
-    chain = []
-    stack = [start_bone]
-    seen = set()
-    while stack:
-        name = stack.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        chain.append(name)
-        for child in children.get(name, []):
-            if child.endswith("_End"):
-                stack.append(child)
-    return chain
-
-
-def nearest_bone_on_chain(point, chain, bones):
-    best = None
-    best_distance = None
-    for name in chain:
-        bone = bones[name]
-        distance = tuple_point_segment_distance(point, bone["head"], bone["tail"])
-        if best_distance is None or distance < best_distance:
-            best = name
-            best_distance = distance
-    return best, best_distance
-
-
-def build_reparent_map(records, bones, children, true_root, scale, tolerance):
-    roots = [name for name, bone in bones.items() if bone["parent"] is None]
-    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
-    all_starts = [name for name in bones if name.endswith("_Start")]
-
-    mapping = {}
-    details = []
-    problems = []
-
-    # Match the smaller, authoritative set (actual FBX orphan roots) onto the
-    # larger SPM Base/BaseRef record set. A global nearest-pair greedy pass is
-    # deterministic and prevents irrelevant unboned SPM branches from
-    # consuming roots before their real record is reached.
-    pairs = []
-    record_points = [vec_div(rec["child_coord_raw"], scale) for rec in records]
-    for child_bone in orphan_roots:
-        child_head = bones[child_bone]["head"]
-        for record_index, child_point in enumerate(record_points):
-            pairs.append((dist(child_head, child_point), child_bone, record_index))
-    pairs.sort(key=lambda item: (item[0], item[1], item[2]))
-    matches = {}
-    used_records = set()
-    for child_distance, child_bone, record_index in pairs:
-        if child_bone in matches or record_index in used_records:
-            continue
-        matches[child_bone] = (record_index, child_distance)
-        used_records.add(record_index)
-        if len(matches) == len(orphan_roots):
-            break
-
-    for child_bone in orphan_roots:
-        match = matches.get(child_bone)
-        if not match:
-            problems.append({"child_bone": child_bone, "error": "no SPM Base/BaseRef record for orphan root"})
-            continue
-        record_index, child_distance = match
-        rec = records[record_index]
-        if child_distance > tolerance:
-            problems.append(
-                {**rec, "child_bone": child_bone, "error": "child root distance over tolerance", "distance": child_distance}
-            )
-            continue
-
-        parent_branch_point = vec_div(rec["parent_branch_coord_raw"], scale)
-        parent_start, parent_start_distance = nearest_start(parent_branch_point, all_starts, bones)
-        if not parent_start:
-            problems.append({**rec, "child_bone": child_bone, "error": "no parent branch start"})
-            continue
-
-        attach_point = vec_div(rec["attach_coord_raw"], scale)
-        chain = branch_chain(parent_start, children)
-        parent_bone, parent_distance = nearest_bone_on_chain(attach_point, chain, bones)
-        if not parent_bone:
-            problems.append({**rec, "child_bone": child_bone, "error": "empty parent branch chain"})
-            continue
-
-        mapping[child_bone] = parent_bone
-        details.append(
-            {
-                **rec,
-                "child_bone": child_bone,
-                "parent_branch_start_bone": parent_start,
-                "parent_bone": parent_bone,
-                "child_distance": child_distance,
-                "parent_branch_start_distance": parent_start_distance,
-                "parent_attach_distance": parent_distance,
-                "parent_chain_bones": len(chain),
-            }
-        )
-
-    return mapping, details, problems, roots, orphan_roots
-
-
-def resolve_true_root_bone(bones, requested):
-    roots = [name for name, bone in bones.items() if bone["parent"] is None]
-    if requested in bones and requested in roots:
-        return requested, "requested"
-
-    def bone_number(name):
-        match = re.search(r"(?:^|_)(\d+)(?:_|$)", name)
-        return int(match.group(1)) if match else 10**9
-
-    non_start_roots = [name for name in roots if not name.endswith("_Start")]
-    candidates = non_start_roots or roots
-    if not candidates:
-        return requested, "missing"
-    return min(candidates, key=lambda name: (bone_number(name), name)), "inferred"
-
-
-def build_independent_root_preservation_details(root_names, reason):
-    return [
-        {
-            "child_bone": root,
-            "parent_bone": None,
-            "method": "preserve_independent_root_without_baseref",
-            "reason": reason,
-        }
-        for root in root_names
-    ]
-
-
-def build_root_fallback_reparent_map(bones, true_root):
-    """Preserve independent FBX roots when the SPM has no BaseRef contract.
-
-    A Base/BaseRef pair is positive evidence that one SpeedTree branch is
-    attached to another.  The absence of every pair is not evidence that all
-    roots belong under the first deforming stem.  Ground-cover exports in
-    particular intentionally contain many sibling roots, so keep them as
-    independent armature bones; the FBX armature-object root will parent them
-    in Unreal's single-root reference skeleton.
-
-    The historical function name is retained for add-on/API compatibility.
-    """
-    roots = [name for name, bone in bones.items() if bone["parent"] is None]
-    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
-    details = build_independent_root_preservation_details(
-        orphan_roots,
-        (
-            "SPM contains no Base/BaseRef evidence for a parent-child "
-            "relationship"
-        ),
-    )
-    return {}, details, [], roots, orphan_roots
-
-
-def apply_reparent_mapping(armature, mapping):
-    ensure_object_mode()
-    require_in_view_layer(armature, "to edit its bones")
-    deselect_all()
-
-    # Edit mode requires the armature to be visible.
-    previous_hide_viewport = armature.hide_viewport
-    armature.hide_viewport = False
-    try:
-        previous_hidden = armature.hide_get()
-        armature.hide_set(False)
-    except RuntimeError:
-        previous_hidden = False
-
-    bpy.context.view_layer.objects.active = armature
-    armature.select_set(True)
-    try:
-        bpy.ops.object.mode_set(mode="EDIT")
-        edit_bones = armature.data.edit_bones
-        applied = 0
-        for child, parent in mapping.items():
-            if child not in edit_bones or parent not in edit_bones:
-                continue
-            edit_bones[child].use_connect = False
-            edit_bones[child].parent = edit_bones[parent]
-            applied += 1
-        bpy.ops.object.mode_set(mode="OBJECT")
-    finally:
-        try:
-            armature.hide_set(previous_hidden)
-        except RuntimeError:
-            pass
-        armature.hide_viewport = previous_hide_viewport
-    return applied
-
-
-def run_reparent_from_spm(spm_path, armature_name, true_root, scale_value="auto", tolerance=0.08, apply=True, strict=True, report_path=""):
-    tree = parse_speedtree(spm_path)
-    records, spm_issues = find_base_ref_pairs(tree)
-    armature = get_armature(armature_name)
-    bones, children = collect_bones(armature)
-    requested_true_root = true_root
-    true_root, true_root_source = resolve_true_root_bone(bones, requested_true_root)
-    roots_before = [name for name, bone in bones.items() if bone["parent"] is None]
-    orphan_roots = [root for root in roots_before if root != true_root and root.endswith("_Start")]
-
-    if scale_value == "auto":
-        if records and orphan_roots:
-            scale, scale_scores = choose_scale(records, orphan_roots, bones, [1.0, 3.28084, 100.0, 0.01])
-        else:
-            scale, scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
-    else:
-        scale = float(scale_value)
-        scale_scores = [{"scale": scale, "manual": True}]
-
-    fallback_reason = ""
-    if not records:
-        mapping, details, problems, roots_before, orphan_roots = build_root_fallback_reparent_map(bones, true_root)
-        fallback_reason = "no_base_ref_records_preserved_independent_roots"
-    else:
-        mapping, details, problems, roots_before, orphan_roots = build_reparent_map(
-            records, bones, children, true_root, scale, tolerance
-        )
-        unmatched_orphans = [root for root in orphan_roots if root not in mapping]
-        if unmatched_orphans:
-            # Some files mix BaseRef-attached branches with independent
-            # top-level stems.  An unmatched root has no positive attachment
-            # evidence, so preserve it instead of inventing a relationship to
-            # the first deforming root.
-            details.extend(
-                build_independent_root_preservation_details(
-                    unmatched_orphans,
-                    "no usable Base/BaseRef match for this FBX root",
-                )
-            )
-            fallback_reason = (
-                "unmatched_orphan_roots_preserved_without_baseref_match"
-            )
-
-    preserved_independent_roots = [
-        detail["child_bone"]
-        for detail in details
-        if str(detail.get("method", "")).startswith(
-            "preserve_independent_root_"
-        )
-    ]
-
-    report = {
-        "blend": bpy.data.filepath,
-        "spm": spm_path,
-        "spm_version": tree["version"],
-        "armature": armature.name,
-        "bones": len(bones),
-        "roots_before": len(roots_before),
-        "root_names_before": roots_before[:100],
-        "true_root": true_root,
-        "requested_true_root": requested_true_root,
-        "true_root_source": true_root_source,
-        "orphan_start_roots": len(orphan_roots),
-        "base_ref_records": len(records),
-        "mapping_count": len(mapping),
-        "scale": scale,
-        "scale_scores": scale_scores,
-        "spm_issues": spm_issues[:80],
-        "problem_count": len(problems),
-        "problems": problems[:80],
-        "mapping": mapping,
-        "details_sample": details[:30],
-        "fallback_reason": fallback_reason,
-        "fallback_mapping_count": sum(
-            1 for detail in details if str(detail.get("method", "")).startswith("fallback_")
-        ),
-        "preserved_independent_root_count": sum(
-            1
-            for detail in details
-            if str(detail.get("method", "")).startswith(
-                "preserve_independent_root_"
-            )
-        ),
-        "preserved_independent_roots": preserved_independent_roots[:100],
-        "root_parent_contract": (
-            "base_ref_evidence_only"
-            if records
-            else "independent_roots_without_base_ref"
-        ),
-        "applied": False,
-    }
-
-    # Every root must be accounted for either by a BaseRef-backed mapping or by
-    # explicit independent-root preservation. Strict mode must not reinterpret
-    # the absence of a relationship as an incomplete map.
-    processed_roots = set(mapping) | set(preserved_independent_roots)
-    blocked = strict and processed_roots != set(orphan_roots)
-    if blocked:
-        report["status"] = "blocked"
-        report["error"] = "Reparent mapping was not complete; no changes applied."
-    elif apply:
-        applied = apply_reparent_mapping(armature, mapping)
-        roots_after = [bone.name for bone in armature.data.bones if bone.parent is None]
-        report.update(
-            {
-                "status": (
-                    "applied_with_independent_roots_preserved"
-                    if mapping and preserved_independent_roots
-                    else "applied"
-                    if mapping
-                    else "preserved_independent_roots"
-                ),
-                "applied": True,
-                "applied_count": applied,
-                "roots_after": len(roots_after),
-                "root_names_after": roots_after,
-            }
-        )
-    else:
-        report["status"] = "dry-run-ok"
-
-    write_report(report_path, report)
-    return report
-
-
-# ---------------------------------------------------------------------------
-# Bone segment helpers (numpy accelerated nearest-bone queries)
-# ---------------------------------------------------------------------------
-
-
-def bone_world_segments(armature):
-    matrix = armature.matrix_world
-    segments = {}
-    for bone in armature.data.bones:
-        segments[bone.name] = (matrix @ bone.head_local, matrix @ bone.tail_local)
-    return segments
-
-
-def segments_to_arrays(segments, names):
-    heads = np.empty((len(names), 3), dtype=np.float64)
-    tails = np.empty((len(names), 3), dtype=np.float64)
-    for index, name in enumerate(names):
-        head, tail = segments[name]
-        heads[index] = (head.x, head.y, head.z)
-        tails[index] = (tail.x, tail.y, tail.z)
-    return heads, tails
-
-
-def nearest_segment(point, names, heads, tails):
-    p = np.array((point[0], point[1], point[2]), dtype=np.float64)
-    d = tails - heads
-    l2 = np.einsum("ij,ij->i", d, d)
-    t = np.clip(np.einsum("ij,ij->i", p - heads, d) / np.maximum(l2, 1e-12), 0.0, 1.0)
-    projected = heads + t[:, None] * d
-    delta = projected - p
-    dist2 = np.einsum("ij,ij->i", delta, delta)
-    index = int(np.argmin(dist2))
-    return names[index], float(math.sqrt(dist2[index]))
-
-
-# ---------------------------------------------------------------------------
-# SPM leaf node -> armature bone mapping
-# ---------------------------------------------------------------------------
-
-
-def resolve_spm_scale(tree, bones, true_root, scale_value="auto"):
-    if str(scale_value).lower() != "auto":
-        return float(scale_value), []
-
-    records, _issues = find_base_ref_pairs(tree)
-    roots = [name for name, bone in bones.items() if bone["parent"] is None]
-    orphan_roots = [root for root in roots if root != true_root and root.endswith("_Start")]
-    if records and orphan_roots:
-        return choose_scale(records, orphan_roots, bones, [1.0, 3.28084, 100.0, 0.01])
-
-    branch_nodes = [node for node in tree["nodes"].values() if node["type"] == "Branch" and node["coord"]]
-    start_bones = [name for name in bones if name.endswith("_Start")]
-    if not branch_nodes or not start_bones:
-        return 1.0, [{"scale": 1.0, "fallback": "no branch nodes or start bones"}]
-    scores = []
-    sample = branch_nodes[: min(len(branch_nodes), 500)]
-    candidates = build_scale_candidates(
-        [1.0, 3.28084, 100.0, 0.01],
-        [node["coord"] for node in branch_nodes],
-        [bones[name]["head"] for name in start_bones],
-    )
-    for scale in candidates:
-        nearest = []
-        for node in sample:
-            point = vec_div(node["coord"], scale)
-            nearest.append(min(dist(point, bones[name]["head"]) for name in start_bones))
-        nearest.sort()
-        scores.append({"scale": scale, "median_nearest_branch_start": nearest[len(nearest) // 2] if nearest else None})
-    scores.sort(key=lambda item: item["median_nearest_branch_start"] if item["median_nearest_branch_start"] is not None else float("inf"))
-    return scores[0]["scale"], scores
-
-
-def branch_node_bone_map(tree, bones, scale):
-    all_starts = [name for name in bones if name.endswith("_Start")]
-    mapping = {}
-    for guid, node in tree["nodes"].items():
-        if node["type"] != "Branch" or not node["coord"]:
-            continue
-        bone_name, distance = nearest_start(vec_div(node["coord"], scale), all_starts, bones)
-        if bone_name:
-            mapping[guid] = {"bone": bone_name, "distance": distance}
-    return mapping
-
-
-def parent_branch_node(tree, node):
-    nodes = tree["nodes"]
-    parent_guid = node.get("parent")
-    seen = set()
-    while parent_guid and parent_guid not in seen:
-        seen.add(parent_guid)
-        parent = nodes.get(parent_guid)
-        if not parent:
-            return None
-        if parent["type"] == "Branch":
-            return parent
-        parent_guid = parent.get("parent")
-    return None
-
-
-def mesh_component_centroid_tree(mesh_obj):
-    components = mesh_connected_components(mesh_obj.data)
-    tree = kdtree.KDTree(len(components))
-    matrix = mesh_obj.matrix_world
-    for index, component in enumerate(components):
-        centroid = matrix @ (component["sum"] / max(len(component["vertices"]), 1))
-        component["centroid_world"] = centroid
-        tree.insert(centroid, index)
-    tree.balance()
-    return components, tree
-
-
-def leaf_nodes_for_targets(tree, include_base_leaf_nodes=False):
-    generators = tree.get("generators", {})
-    nodes = []
-    for node in tree["nodes"].values():
-        if node["type"] == "Leaf Mesh":
-            generator = generators.get(node.get("gen"), {})
-            if generator.get("hidden"):
-                continue
-        elif include_base_leaf_nodes and node["type"] in {"Base", "BaseRef"}:
-            pass
-        else:
-            continue
-        if "leaf" not in (node["name"] or "").lower():
-            continue
-        if not node.get("coord"):
-            continue
-        if not node.get("valid_position", True):
-            continue
-        nodes.append(node)
-    return nodes
-
-
-def choose_spm_leaf_scale(leaf_nodes, component_tree=None, component_points=None, base_candidates=None):
-    candidates = build_scale_candidates(
-        base_candidates or [3.28084, 1.0, 30.48, 100.0, 0.01],
-        [node["coord"] for node in leaf_nodes],
-        component_points or [],
-    )
-    scores = []
-    sample_count = min(len(leaf_nodes), 5000)
-    sample_step = max(1, len(leaf_nodes) // sample_count) if sample_count else 1
-    sample = leaf_nodes[::sample_step][:sample_count]
-    if component_tree and sample:
-        for scale in candidates:
-            distances = []
-            for node in sample:
-                point = Vector(vec_div(node["coord"], scale))
-                _co, _index, distance = component_tree.find(point)
-                distances.append(distance)
-            distances.sort()
-            scores.append(
-                {
-                    "scale": scale,
-                    "median_leaf_component_distance": distances[len(distances) // 2],
-                    "p90_leaf_component_distance": distances[int(len(distances) * 0.9)],
-                }
-            )
-        scores.sort(key=lambda item: item["median_leaf_component_distance"])
-        return scores[0]["scale"], scores
-    return candidates[0], []
-
-
-def collect_spm_leaf_targets(
-    spm_path,
-    armature,
-    true_root="Bone_1_Start",
-    scale_value="auto",
-    leaf_mesh_obj=None,
-    include_base_leaf_nodes=False,
-):
-    if not spm_path or not Path(spm_path).exists():
-        return {"status": "missing-spm", "targets": []}
-
-    tree = parse_speedtree(spm_path)
-    bones, children = collect_bones(armature)
-    reparent_scale, reparent_scale_scores = resolve_spm_scale(tree, bones, true_root, scale_value)
-    leaf_nodes = leaf_nodes_for_targets(tree, include_base_leaf_nodes=include_base_leaf_nodes)
-    component_count = None
-    leaf_scale = reparent_scale
-    leaf_scale_scores = []
-    if str(scale_value).lower() == "auto":
-        component_tree = None
-        if leaf_mesh_obj is not None:
-            components, component_tree = mesh_component_centroid_tree(leaf_mesh_obj)
-            component_count = len(components)
-            component_points = [component["centroid_world"] for component in components]
-            leaf_scale, leaf_scale_scores = choose_spm_leaf_scale(
-                leaf_nodes,
-                component_tree=component_tree,
-                component_points=component_points,
-                base_candidates=[reparent_scale, 3.28084, 1.0, 30.48, 100.0, 0.01],
-            )
-
-    scale = leaf_scale
-    branch_map = branch_node_bone_map(tree, bones, scale)
-    targets = []
-    skipped = Counter()
-
-    for node in leaf_nodes:
-        branch = parent_branch_node(tree, node)
-        if not branch:
-            skipped["missing_parent_branch"] += 1
-            continue
-        branch_match = branch_map.get(branch["guid"])
-        if not branch_match:
-            skipped["unmatched_parent_branch"] += 1
-            continue
-
-        branch_bone = branch_match["bone"]
-        chain = branch_chain(branch_bone, children)
-        point = vec_div(node["coord"], scale)
-        bone_name, bone_distance = nearest_bone_on_chain(point, chain, bones)
-        if not bone_name:
-            skipped["empty_parent_chain"] += 1
-            continue
-
-        targets.append(
-            {
-                "guid": node["guid"],
-                "name": node["name"],
-                "type": node["type"],
-                "generator": tree.get("generators", {}).get(node.get("gen"), {}).get("name", ""),
-                "point": point,
-                "bone": bone_name,
-                "parent_branch_guid": branch["guid"],
-                "parent_branch_name": branch["name"],
-                "parent_branch_bone": branch_bone,
-                "parent_branch_distance": branch_match["distance"],
-                "bone_distance": bone_distance,
-            }
-        )
-
-    return {
-        "status": "ok" if targets else "no-targets",
-        "spm": str(spm_path),
-        "spm_version": tree.get("version"),
-        "scale": scale,
-        "leaf_scale": leaf_scale,
-        "leaf_scale_scores": leaf_scale_scores,
-        "reparent_scale": reparent_scale,
-        "reparent_scale_scores": reparent_scale_scores,
-        "leaf_node_count": len(leaf_nodes),
-        "leaf_component_count": component_count,
-        "targets": targets,
-        "target_count": len(targets),
-        "skipped": dict(skipped),
-    }
-
-
-def mesh_connected_components(mesh):
-    vertex_count = len(mesh.vertices)
-    parent = list(range(vertex_count))
-    rank = [0] * vertex_count
-
-    def find(index):
-        root = index
-        while parent[root] != root:
-            root = parent[root]
-        while parent[index] != index:
-            next_index = parent[index]
-            parent[index] = root
-            index = next_index
-        return root
-
-    def union(a, b):
-        ra = find(a)
-        rb = find(b)
-        if ra == rb:
-            return
-        if rank[ra] < rank[rb]:
-            parent[ra] = rb
-        elif rank[ra] > rank[rb]:
-            parent[rb] = ra
-        else:
-            parent[rb] = ra
-            rank[ra] += 1
-
-    for polygon in mesh.polygons:
-        vertices = polygon.vertices
-        if len(vertices) < 2:
-            continue
-        first = vertices[0]
-        for vertex_index in vertices[1:]:
-            union(first, vertex_index)
-
-    components = {}
-    for vertex in mesh.vertices:
-        root = find(vertex.index)
-        entry = components.get(root)
-        if entry is None:
-            entry = {"vertices": [], "sum": Vector((0.0, 0.0, 0.0))}
-            components[root] = entry
-        entry["vertices"].append(vertex.index)
-        entry["sum"] += vertex.co
-    return list(components.values())
-
-
-def assign_mesh_components_from_spm_leaf_targets(obj, duplicate, targets):
-    if not targets:
-        return None
-    target_bones = {target["bone"] for target in targets if target.get("bone")}
-    if len(target_bones) <= 1 and len(targets) > 16:
-        return None
-
-    tree = kdtree.KDTree(len(targets))
-    for index, target in enumerate(targets):
-        tree.insert(Vector(target["point"]), index)
-    tree.balance()
-
-    components = mesh_connected_components(duplicate.data)
-    groups_by_bone = defaultdict(list)
-    distances = []
-    sample_assignments = []
-    matrix = obj.matrix_world
-
-    for component_index, component in enumerate(components):
-        centroid_local = component["sum"] / max(len(component["vertices"]), 1)
-        centroid_world = matrix @ centroid_local
-        _co, target_index, distance = tree.find(centroid_world)
-        target = targets[target_index]
-        groups_by_bone[target["bone"]].extend(component["vertices"])
-        distances.append(distance)
-        if len(sample_assignments) < 50:
-            sample_assignments.append(
-                {
-                    "component": component_index,
-                    "vertices": len(component["vertices"]),
-                    "bone": target["bone"],
-                    "leaf_node": target["name"],
-                    "distance": distance,
-                }
-            )
-
-    for bone_name, vertex_indices in groups_by_bone.items():
-        duplicate.vertex_groups.new(name=bone_name).add(vertex_indices, 1.0, "REPLACE")
-
-    distances.sort()
-    return {
-        "method": "spm_leaf_node_parent_branch",
-        "weighting": "spm_leaf_node_parent_branch",
-        "components": len(components),
-        "targets": len(targets),
-        "assigned_bones": len(groups_by_bone),
-        "mean_match_distance": float(sum(distances) / len(distances)) if distances else 0.0,
-        "median_match_distance": float(distances[len(distances) // 2]) if distances else 0.0,
-        "max_match_distance": float(distances[-1]) if distances else 0.0,
-        "sample_assignments": sample_assignments,
-    }
-
-
-def collect_skinned_surface_targets(armature, exclude_names=None):
-    exclude_names = set(exclude_names or [])
-    valid_bones = {bone.name for bone in armature.data.bones}
-    points = []
-    for obj in bpy.context.scene.objects:
-        if obj.name in exclude_names or obj.type != "MESH":
-            continue
-        if "mergedskinned" in obj.name.lower():
-            continue
-        if any(slot.material and "leaf" in slot.material.name.lower() for slot in obj.material_slots):
-            continue
-        if not obj.vertex_groups or not armature_modifier(obj, armature):
-            continue
-        names_by_index = {group.index: group.name for group in obj.vertex_groups}
-        matrix = obj.matrix_world
-        for vertex in obj.data.vertices:
-            best_name = None
-            best_weight = 0.0
-            for group_ref in vertex.groups:
-                if group_ref.weight <= best_weight:
-                    continue
-                name = names_by_index.get(group_ref.group)
-                if name in valid_bones:
-                    best_name = name
-                    best_weight = group_ref.weight
-            if best_name:
-                co = matrix @ vertex.co
-                points.append(((co.x, co.y, co.z), best_name, obj.name))
-
-    if not points:
-        return {"status": "no-skinned-surface-targets", "points": [], "tree": None}
-
-    tree = kdtree.KDTree(len(points))
-    for index, (co, _bone, _object_name) in enumerate(points):
-        tree.insert(Vector(co), index)
-    tree.balance()
-    return {"status": "ok", "points": points, "tree": tree}
-
-
-def assign_mesh_components_from_skinned_surface(obj, duplicate, surface_targets):
-    if not surface_targets or surface_targets.get("status") != "ok":
-        return None
-
-    components = mesh_connected_components(duplicate.data)
-    groups_by_bone = defaultdict(list)
-    distances = []
-    sample_assignments = []
-    matrix = obj.matrix_world
-    points = surface_targets["points"]
-    tree = surface_targets["tree"]
-
-    for component_index, component in enumerate(components):
-        centroid_local = component["sum"] / max(len(component["vertices"]), 1)
-        centroid_world = matrix @ centroid_local
-        _co, target_index, distance = tree.find(centroid_world)
-        _point, bone_name, source_object = points[target_index]
-        groups_by_bone[bone_name].extend(component["vertices"])
-        distances.append(distance)
-        if len(sample_assignments) < 50:
-            sample_assignments.append(
-                {
-                    "component": component_index,
-                    "vertices": len(component["vertices"]),
-                    "bone": bone_name,
-                    "source_object": source_object,
-                    "distance": distance,
-                }
-            )
-
-    for bone_name, vertex_indices in groups_by_bone.items():
-        duplicate.vertex_groups.new(name=bone_name).add(vertex_indices, 1.0, "REPLACE")
-
-    distances.sort()
-    return {
-        "method": "skinned_surface_component_match",
-        "weighting": "skinned_surface_component_match",
-        "components": len(components),
-        "surface_points": len(points),
-        "assigned_bones": len(groups_by_bone),
-        "mean_match_distance": float(sum(distances) / len(distances)) if distances else 0.0,
-        "median_match_distance": float(distances[len(distances) // 2]) if distances else 0.0,
-        "max_match_distance": float(distances[-1]) if distances else 0.0,
-        "sample_assignments": sample_assignments,
-    }
-
-
-# ---------------------------------------------------------------------------
 # SpeedTree XML bone metadata (Generator/Mass/Radius -> wind simulation groups)
 # ---------------------------------------------------------------------------
 #
 # The SpeedTreeRaw XML export carries per-bone semantic data the FBX lacks:
 # Generator names (Trunk / Big N / Branch N / Root Twigs...), Mass, and Radius.
 # The Unreal-side DynamicWind import consumes "JointName -> SimulationGroupIndex",
-# so we match XML bones to armature bones by segment position (same idea as the
-# SPM reparent matching) and emit per-bone group suggestions into the JSON.
-# Note the XML bone hierarchy (ParentID) is broken the same way as the FBX
-# (orphan branch roots), so the SPM reparent step stays authoritative.
+# so XML segments are associated with the native armature for grouping JSON.
 
 XML_ATTR_RE = re.compile(r'([A-Za-z][A-Za-z0-9]*)="([^"]*)"')
 
@@ -9393,25 +7725,6 @@ def parse_speedtree_xml_bones(xml_path):
     return bones
 
 
-def choose_xml_scale(xml_bones, head_array, candidates=(100.0, 1.0, 3.28084, 30.48, 0.01)):
-    sample = xml_bones[: min(len(xml_bones), 300)]
-    candidates = build_scale_candidates(
-        candidates,
-        [bone["start"] for bone in xml_bones],
-        head_array.tolist() if hasattr(head_array, "tolist") else head_array,
-    )
-    scores = []
-    for scale in candidates:
-        nearest = []
-        for bone in sample:
-            point = np.array(bone["start"], dtype=np.float64) / scale
-            nearest.append(float(np.sqrt(((head_array - point) ** 2).sum(axis=1)).min()))
-        nearest.sort()
-        scores.append({"scale": scale, "median_nearest": nearest[len(nearest) // 2]})
-    scores.sort(key=lambda item: item["median_nearest"])
-    return scores[0]["scale"], scores
-
-
 def build_simulation_groups(xml_bones, trunk_generator_regex="trunk"):
     # Group bones by SpeedTree Generator. Trunk generators become simulation
     # group 0 (bIsTrunkGroup on the Unreal side); the rest are ordered by mean
@@ -9466,604 +7779,127 @@ def build_simulation_groups(xml_bones, trunk_generator_regex="trunk"):
     return groups, group_of_generator
 
 
+NATIVE_SPEEDTREE_BONE_NAME_RE = re.compile(r"^Bone_(\d+)_(Start|End)$")
+NATIVE_SPEEDTREE_XML_SCALE = 100.0
+NATIVE_SPEEDTREE_XML_COORDINATE_TOLERANCE = 0.001
+
+
 def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
     xml_bones = parse_speedtree_xml_bones(xml_path)
+    xml_by_id = {}
+    for xml_bone in xml_bones:
+        xml_id = xml_bone["id"]
+        if xml_id in xml_by_id:
+            raise RuntimeError(
+                f"Duplicate SpeedTree XML Bone ID: {xml_id}"
+            )
+        xml_by_id[xml_id] = xml_bone
+    expected_xml_ids = set(range(len(xml_bones)))
+    if set(xml_by_id) != expected_xml_ids:
+        raise RuntimeError(
+            "SpeedTree XML Bone IDs are not a contiguous zero-based range"
+        )
+
     matrix = armature.matrix_world
-    names = []
-    heads = np.empty((len(armature.data.bones), 3), dtype=np.float64)
-    tails = np.empty((len(armature.data.bones), 3), dtype=np.float64)
-    for index, bone in enumerate(armature.data.bones):
-        names.append(bone.name)
-        head = matrix @ bone.head_local
-        tail = matrix @ bone.tail_local
-        heads[index] = (head.x, head.y, head.z)
-        tails[index] = (tail.x, tail.y, tail.z)
-
-    scale, scale_scores = choose_xml_scale(xml_bones, heads)
-    starts = np.array([bone["start"] for bone in xml_bones], dtype=np.float64) / scale
-    ends = np.array([bone["end"] for bone in xml_bones], dtype=np.float64) / scale
-
     groups, group_of_generator = build_simulation_groups(xml_bones, trunk_generator_regex)
-
     bone_records = []
-    distances = []
-    for index, name in enumerate(names):
-        # FBX bones are joints (Blender synthesizes their tails on import), so
-        # match each joint head against XML segment endpoints: a _Start joint
-        # sits on its segment's start, chain/tip _End joints sit on segment
-        # boundaries/ends. On exact ties (a child branch root on its parent's
-        # segment end) prefer the start-endpoint match — the joint owns the
-        # segment it starts.
-        d_start = np.linalg.norm(starts - heads[index], axis=1)
-        d_end = np.linalg.norm(ends - heads[index], axis=1)
-        score = np.where(d_start <= d_end, d_start, d_end + 1e-9)
-        best = int(np.argmin(score))
-        xml_bone = xml_bones[best]
-        distance = float(min(d_start[best], d_end[best]))
-        distances.append(distance)
+    coordinate_errors = []
+    covered_xml_ids = set()
+    wrapper_roots = []
+    for index, bone in enumerate(armature.data.bones):
+        if bone.name == "Root":
+            wrapper_roots.append((index, bone))
+            continue
+        match = NATIVE_SPEEDTREE_BONE_NAME_RE.fullmatch(bone.name)
+        if match is None:
+            raise RuntimeError(
+                "Native SpeedTree bone name does not encode an XML Bone ID: "
+                + bone.name
+            )
+        xml_id = int(match.group(1)) - 1
+        xml_bone = xml_by_id.get(xml_id)
+        if xml_bone is None:
+            raise RuntimeError(
+                f"Native SpeedTree bone {bone.name} references missing XML "
+                f"Bone ID {xml_id}"
+            )
+        covered_xml_ids.add(xml_id)
+        endpoint = "start" if match.group(2) == "Start" else "end"
+        expected = np.array(
+            xml_bone[endpoint], dtype=np.float64
+        ) / NATIVE_SPEEDTREE_XML_SCALE
+        head = matrix @ bone.head_local
+        actual = np.array((head.x, head.y, head.z), dtype=np.float64)
+        coordinate_error = float(np.linalg.norm(actual - expected))
+        if coordinate_error > NATIVE_SPEEDTREE_XML_COORDINATE_TOLERANCE:
+            raise RuntimeError(
+                f"Native SpeedTree bone/XML coordinate contract failed for "
+                f"{bone.name}: error={coordinate_error}"
+            )
+        coordinate_errors.append(coordinate_error)
         bone_records.append(
             {
-                "name": name,
+                "name": bone.name,
                 "bone_index": index,
                 "parent_index": (
-                    armature.data.bones.find(armature.data.bones[index].parent.name)
-                    if armature.data.bones[index].parent is not None
+                    armature.data.bones.find(bone.parent.name)
+                    if bone.parent is not None
                     else -1
                 ),
-                "xml_id": xml_bone["id"],
+                "xml_id": xml_id,
                 "generator": xml_bone["generator"],
                 "mass": xml_bone["mass"],
                 "radius": xml_bone["radius"],
-                "group": group_of_generator.get(xml_bone["generator"], 0),
-                "match_distance": round(distance, 4),
+                "group": group_of_generator[xml_bone["generator"]],
+                "coordinate_error": coordinate_error,
             }
         )
-
-    distances.sort()
+    if len(wrapper_roots) != 1:
+        raise RuntimeError(
+            "Native SpeedTree skeleton requires exactly one Root wrapper; "
+            f"found {[bone.name for _index, bone in wrapper_roots]}"
+        )
+    missing_xml_ids = expected_xml_ids - covered_xml_ids
+    if missing_xml_ids:
+        raise RuntimeError(
+            "Native SpeedTree skeleton does not cover XML Bone IDs: "
+            + ", ".join(str(value) for value in sorted(missing_xml_ids))
+        )
+    root_index, root_bone = wrapper_roots[0]
+    bone_records.insert(
+        root_index,
+        {
+            "name": root_bone.name,
+            "bone_index": root_index,
+            "parent_index": -1,
+            "xml_id": None,
+            "generator": "NativeRootWrapper",
+            "mass": 0.0,
+            "radius": 0.0,
+            "group": 0,
+            "native_role": "fbx_wrapper_root",
+        },
+    )
+    coordinate_errors.sort()
     info = {
         "source": str(xml_path),
         "xml_bone_count": len(xml_bones),
-        "armature_bone_count": len(names),
-        "scale": scale,
-        "scale_scores": scale_scores,
+        "armature_bone_count": len(armature.data.bones),
+        "mapping_contract": "native_bone_ordinal_to_xml_id_v1",
+        "scale": NATIVE_SPEEDTREE_XML_SCALE,
         "trunk_generator_regex": trunk_generator_regex,
         "generators": {name: index for name, index in sorted(group_of_generator.items())},
         "simulation_groups": groups,
-        "match": {
-            "median_distance": round(distances[len(distances) // 2], 4) if distances else None,
-            "max_distance": round(distances[-1], 4) if distances else None,
+        "coordinate_validation": {
+            "tolerance": NATIVE_SPEEDTREE_XML_COORDINATE_TOLERANCE,
+            "median_error": (
+                coordinate_errors[len(coordinate_errors) // 2]
+                if coordinate_errors else None
+            ),
+            "max_error": coordinate_errors[-1] if coordinate_errors else None,
         },
     }
     return bone_records, info
-
-
-# ---------------------------------------------------------------------------
-# Loose instance skinning
-# ---------------------------------------------------------------------------
-
-
-def find_skinned_parent(obj, armature):
-    current = obj.parent
-    while current:
-        if current.type == "MESH":
-            for modifier in current.modifiers:
-                if modifier.type == "ARMATURE" and modifier.object == armature:
-                    return current
-        current = current.parent
-    return None
-
-
-def choose_bone_for_instance(obj, skinned_parent, armature, segments, candidate_cache, fallback_all_bones=False):
-    key = skinned_parent.name
-    cached = candidate_cache.get(key)
-    if cached is None:
-        names = [group.name for group in skinned_parent.vertex_groups if group.name in segments and group.name != "Root"]
-        if not names and fallback_all_bones:
-            names = [name for name in segments if name != "Root"]
-        if names:
-            heads, tails = segments_to_arrays(segments, names)
-            cached = (names, heads, tails)
-        else:
-            cached = ((), None, None)
-        candidate_cache[key] = cached
-    names, heads, tails = cached
-    if not names:
-        return None, None
-
-    corners = obj.bound_box
-    center_local = Vector(
-        (
-            sum(corner[0] for corner in corners) / 8.0,
-            sum(corner[1] for corner in corners) / 8.0,
-            sum(corner[2] for corner in corners) / 8.0,
-        )
-    )
-    center = obj.matrix_world @ center_local
-    return nearest_segment(center, names, heads, tails)
-
-
-def collect_loose_instances(
-    armature,
-    name_contains,
-    source_object_names=None,
-    exclude_object_names=None,
-):
-    instances = []
-    needle = name_contains.lower()
-    source_names = (
-        {str(name) for name in source_object_names}
-        if source_object_names is not None
-        else None
-    )
-    excluded_names = {str(name) for name in (exclude_object_names or [])}
-    for obj in bpy.context.scene.objects:
-        if obj.type != "MESH":
-            continue
-        if source_names is not None and obj.name not in source_names:
-            continue
-        if obj.name in excluded_names:
-            continue
-        if is_cluster_normalizer_generated(obj):
-            continue
-        if needle and needle not in obj.name.lower():
-            continue
-        if len(obj.data.vertices) == 0:
-            continue
-        if obj.vertex_groups:
-            continue
-        if any(modifier.type == "ARMATURE" for modifier in obj.modifiers):
-            continue
-        skinned_parent = find_skinned_parent(obj, armature)
-        if skinned_parent:
-            instances.append((obj, skinned_parent))
-            continue
-        # SpeedTree 10.1 material-grouped exports can place all leaf geometry
-        # under a zero-face source container rather than under a skinned parent
-        # mesh. Still create a skinned replacement object for it; the following
-        # weight-repair stage will fill zero-weight vertices by nearest bone.
-        instances.append((obj, None))
-    return instances
-
-
-def normalize_loose_speedtree_uv_contract(obj):
-    """Promote authored loose-plane UVs into the final SpeedTree contract.
-
-    Blender-authored Cluster planes commonly carry one default ``UVMap``.
-    Joining that mesh ahead of imported SpeedTree geometry makes Blender keep
-    ``UVMap`` at index 0 and zero-fill the later ``uv0``/``blend_ao`` layers for
-    the plane faces.  Preserve the authored coordinates by renaming that sole
-    layer to ``uv0`` before the join, then append neutral blend/AO values.
-
-    Ambiguous layouts fail closed; this function never deletes or guesses
-    between multiple authored UV sets.
-    """
-    if obj is None or obj.type != "MESH" or not obj.data:
-        raise RuntimeError("Loose SpeedTree UV normalization requires a mesh")
-    uv_layers = obj.data.uv_layers
-    names_before = [layer.name for layer in uv_layers]
-    uv0 = uv_layers.get("uv0")
-    legacy = uv_layers.get("UVMap")
-    renamed = False
-    if uv0 is None:
-        if legacy is None:
-            raise RuntimeError(
-                f"Loose SpeedTree plane has no uv0/UVMap layer: {obj.name}"
-            )
-        legacy.name = "uv0"
-        uv0 = legacy
-        renamed = True
-    if len(uv_layers) == 0 or uv_layers[0] != uv0:
-        raise RuntimeError(
-            f"Loose SpeedTree plane uv0 is not index 0: {obj.name}: "
-            + ", ".join(layer.name for layer in uv_layers)
-        )
-
-    blend_ao = uv_layers.get("blend_ao")
-    created_blend_ao = False
-    if blend_ao is None:
-        if len(uv_layers) != 1:
-            raise RuntimeError(
-                f"Loose SpeedTree plane has ambiguous UV layers: {obj.name}: "
-                + ", ".join(layer.name for layer in uv_layers)
-            )
-        blend_ao = uv_layers.new(name="blend_ao")
-        neutral_values = [1.0] * (len(blend_ao.data) * 2)
-        try:
-            blend_ao.data.foreach_set("uv", neutral_values)
-        except (AttributeError, TypeError, ValueError):
-            for item in blend_ao.data:
-                item.uv = (1.0, 1.0)
-        created_blend_ao = True
-
-    names_after = [layer.name for layer in uv_layers]
-    if names_after != ["uv0", "blend_ao"]:
-        raise RuntimeError(
-            f"Loose SpeedTree plane UV contract is not uv0/blend_ao: "
-            f"{obj.name}: {', '.join(names_after)}"
-        )
-    return {
-        "status": "normalized" if renamed or created_blend_ao else "preserved",
-        "layers_before": names_before,
-        "layers_after": names_after,
-        "renamed_uvmap_to_uv0": renamed,
-        "created_neutral_blend_ao": created_blend_ao,
-    }
-
-
-def build_skinned_instance_mesh(armature, instances, out_name, hide_originals, fallback_all_bones, leaf_targets=None):
-    # Duplicate each loose instance, weight it 1.0 to its nearest branch bone,
-    # then join. Join preserves UV layers, color attributes, custom split
-    # normals, and materials — the previous from_pydata rebuild lost all of
-    # them.
-    segments = bone_world_segments(armature)
-    candidate_cache = {}
-    copies = []
-    assignments = []
-    skipped = []
-    source_names = {obj.name for obj, _parent in instances}
-    surface_targets = collect_skinned_surface_targets(armature, exclude_names=source_names)
-    ensure_object_mode()
-
-    for obj, skinned_parent in instances:
-        duplicate = obj.copy()
-        duplicate.data = obj.data.copy()
-        duplicate.modifiers.clear()
-        duplicate.vertex_groups.clear()
-        duplicate.hide_viewport = False
-        duplicate.hide_render = False
-        uv_contract = normalize_loose_speedtree_uv_contract(duplicate)
-        bpy.context.scene.collection.objects.link(duplicate)
-        if skinned_parent:
-            bone_name, bone_distance = choose_bone_for_instance(
-                obj, skinned_parent, armature, segments, candidate_cache, fallback_all_bones
-            )
-            if not bone_name:
-                remove_object_and_orphan_mesh(duplicate)
-                skipped.append({"object": obj.name, "reason": "no_candidate_bone", "parent": skinned_parent.name})
-                continue
-            group = duplicate.vertex_groups.new(name=bone_name)
-            group.add(list(range(len(duplicate.data.vertices))), 1.0, "REPLACE")
-            assignment = {
-                "object": obj.name,
-                "parent_mesh": skinned_parent.name,
-                "bone": bone_name,
-                "vertex_count": len(obj.data.vertices),
-                "distance": bone_distance,
-                "uv_contract": uv_contract,
-            }
-        else:
-            spm_assignment = assign_mesh_components_from_spm_leaf_targets(obj, duplicate, leaf_targets or [])
-            surface_assignment = None
-            if not spm_assignment:
-                surface_assignment = assign_mesh_components_from_skinned_surface(obj, duplicate, surface_targets)
-            assignment = {
-                "object": obj.name,
-                "parent_mesh": "",
-                "bone": "",
-                "vertex_count": len(obj.data.vertices),
-                "distance": None,
-                "weighting": "deferred_to_weight_repair_nearest_bone",
-                "uv_contract": uv_contract,
-            }
-            if spm_assignment:
-                assignment.update(spm_assignment)
-            elif surface_assignment:
-                assignment.update(surface_assignment)
-        copies.append(duplicate)
-        assignments.append(assignment)
-
-        if hide_originals:
-            obj.hide_viewport = True
-            obj.hide_render = True
-
-    if not copies:
-        return None, assignments, skipped
-
-    leftover_meshes = [duplicate.data for duplicate in copies[1:]]
-    out_obj = join_objects(copies)
-    out_obj.name = out_name
-    out_obj.data.name = out_name + "Mesh"
-    for mesh in leftover_meshes:
-        if mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
-
-    parent_keep_world(out_obj, armature)
-    modifier = out_obj.modifiers.new(name="Armature", type="ARMATURE")
-    modifier.object = armature
-    return out_obj, assignments, skipped
-
-
-def run_skin_loose_instances(
-    armature_name,
-    name_contains,
-    out_name,
-    hide_originals=True,
-    fallback_all_bones=False,
-    apply=True,
-    report_path="",
-    spm_path="",
-    true_root="Bone_1_Start",
-    scale_value="auto",
-    source_object_names=None,
-    exclude_object_names=None,
-):
-    armature = get_armature(armature_name)
-    instances = collect_loose_instances(
-        armature,
-        name_contains,
-        source_object_names=source_object_names,
-        exclude_object_names=exclude_object_names,
-    )
-    leaf_target_info = {"status": "not-requested", "targets": []}
-    if spm_path:
-        leaf_mesh_obj = next((obj for obj, parent in instances if parent is None), None)
-        leaf_target_info = collect_spm_leaf_targets(
-            spm_path,
-            armature,
-            true_root=true_root,
-            scale_value=scale_value,
-            leaf_mesh_obj=leaf_mesh_obj,
-        )
-    report = {
-        "file": bpy.data.filepath,
-        "armature": armature.name,
-        "name_contains": name_contains,
-        "candidate_instances": len(instances),
-        "source_objects": [obj.name for obj, _parent in instances],
-        "source_scope_restricted": source_object_names is not None,
-        "excluded_source_objects": sorted(
-            {str(name) for name in (exclude_object_names or [])}
-        ),
-        "spm_leaf_targets": {
-            key: value
-            for key, value in leaf_target_info.items()
-            if key not in {"targets", "scale_scores"}
-        },
-        "apply": apply,
-    }
-    if not apply:
-        report["status"] = "dry-run-ok"
-    elif not instances:
-        report["status"] = "skipped-no-instances"
-    else:
-        remove_object_and_orphan_mesh(bpy.data.objects.get(out_name))
-        out_obj, assignments, skipped = build_skinned_instance_mesh(
-            armature,
-            instances,
-            out_name,
-            hide_originals,
-            fallback_all_bones,
-            leaf_targets=leaf_target_info.get("targets", []),
-        )
-        if out_obj is None:
-            report.update(
-                {
-                    "status": "skipped-no-assignable-instances",
-                    "skipped_instances": len(skipped),
-                    "skipped": skipped[:50],
-                }
-            )
-        else:
-            report.update(
-                {
-                    "status": "applied",
-                    "created_object": out_obj.name,
-                    "created_vertices": len(out_obj.data.vertices),
-                    "created_faces": len(out_obj.data.polygons),
-                    "created_uv_layers": [layer.name for layer in out_obj.data.uv_layers],
-                    "created_color_attributes": [attr.name for attr in out_obj.data.color_attributes],
-                    "assigned_instances": len(assignments),
-                    "skipped_instances": len(skipped),
-                    "sample_assignments": assignments[:50],
-                    "skipped": skipped[:50],
-                }
-            )
-    write_report(report_path, report)
-    return report
-
-
-# ---------------------------------------------------------------------------
-# Weight repair
-# ---------------------------------------------------------------------------
-
-
-def armature_modifier(obj, armature):
-    for modifier in obj.modifiers:
-        if modifier.type == "ARMATURE" and modifier.object == armature:
-            return modifier
-    return None
-
-
-def group_name_by_index(obj):
-    return {group.index: group.name for group in obj.vertex_groups}
-
-
-def candidate_bones_for_object(obj, armature, valid_bones, fallback_all=True):
-    candidates = set()
-    for group in obj.vertex_groups:
-        if group.name in valid_bones:
-            candidates.add(group.name)
-    for name in list(candidates):
-        bone = armature.data.bones.get(name)
-        if not bone:
-            continue
-        if bone.parent:
-            candidates.add(bone.parent.name)
-        for child in bone.children:
-            candidates.add(child.name)
-    if not candidates and fallback_all:
-        candidates = set(valid_bones)
-    return candidates
-
-
-def ensure_group(obj, name):
-    group = obj.vertex_groups.get(name)
-    if group is None:
-        group = obj.vertex_groups.new(name=name)
-    return group
-
-
-def remove_non_bone_groups(obj, valid_bones):
-    # After repair_object_weights every non-bone influence has been stripped,
-    # so all non-bone groups are empty and can be removed outright.
-    removed = []
-    for group in list(obj.vertex_groups):
-        if group.name not in valid_bones:
-            removed.append(group.name)
-            obj.vertex_groups.remove(group)
-    return removed
-
-
-def repair_object_weights(obj, armature, valid_bones, segments, fill_zero_weight=True, max_samples_per_object=20):
-    # Single read pass over the vertices, then batched group.remove()/add()
-    # calls. The previous implementation rebuilt the group-index map and
-    # touched every vertex group per vertex, which made big trees look frozen.
-    groups_by_index = {group.index: group for group in obj.vertex_groups}
-    names_by_index = {index: group.name for index, group in groups_by_index.items()}
-    valid_indices = {index for index, name in names_by_index.items() if name in valid_bones}
-    epsilon = EPSILON
-
-    remove_lists = defaultdict(list)
-    fill_vertices = []
-    invalid_counter = Counter()
-    repaired = 0
-    samples = []
-
-    for vertex in obj.data.vertices:
-        has_valid = False
-        removed_names = None
-        for group_ref in vertex.groups:
-            if group_ref.weight <= epsilon:
-                continue
-            index = group_ref.group
-            if index in valid_indices:
-                has_valid = True
-            else:
-                name = names_by_index.get(index, str(index))
-                remove_lists[index].append(vertex.index)
-                invalid_counter[name] += 1
-                if removed_names is None:
-                    removed_names = []
-                removed_names.append(name)
-        had_invalid = removed_names is not None
-        if had_invalid:
-            repaired += 1
-            if len(samples) < max_samples_per_object:
-                samples.append({"vertex": vertex.index, "removed_groups": removed_names})
-        if not has_valid and (had_invalid or fill_zero_weight):
-            fill_vertices.append((vertex.index, had_invalid))
-
-    for index, vertex_indices in remove_lists.items():
-        group = groups_by_index.get(index)
-        if group is not None:
-            group.remove(vertex_indices)
-
-    filled = 0
-    if fill_vertices:
-        candidates = [name for name in candidate_bones_for_object(obj, armature, valid_bones) if name in segments]
-        if candidates:
-            heads, tails = segments_to_arrays(segments, candidates)
-            matrix = obj.matrix_world
-            vertices = obj.data.vertices
-            fills_by_bone = defaultdict(list)
-            for vertex_index, had_invalid in fill_vertices:
-                world_point = matrix @ vertices[vertex_index].co
-                bone_name, distance = nearest_segment(world_point, candidates, heads, tails)
-                fills_by_bone[bone_name].append(vertex_index)
-                if not had_invalid:
-                    filled += 1
-                if len(samples) < max_samples_per_object:
-                    samples.append({"vertex": vertex_index, "filled_with": bone_name, "distance": distance})
-            for bone_name, vertex_indices in fills_by_bone.items():
-                ensure_group(obj, bone_name).add(vertex_indices, 1.0, "REPLACE")
-
-    return {
-        "object": obj.name,
-        "vertex_count": len(obj.data.vertices),
-        "invalid_groups": dict(invalid_counter.most_common()),
-        "repaired_invalid_vertices": repaired,
-        "filled_zero_weight_vertices": filled,
-        "samples": samples,
-    }
-
-
-def count_remaining_issues(objects, valid_bones):
-    invalid_weight_vertices = 0
-    zero_weight_vertices = 0
-    invalid_group_counts = Counter()
-    epsilon = EPSILON
-    for obj in objects:
-        names = group_name_by_index(obj)
-        valid_indices = {index for index, name in names.items() if name in valid_bones}
-        for vertex in obj.data.vertices:
-            total = 0.0
-            has_invalid = False
-            for group_ref in vertex.groups:
-                weight = group_ref.weight
-                if weight <= epsilon:
-                    continue
-                total += weight
-                if group_ref.group not in valid_indices:
-                    has_invalid = True
-                    invalid_group_counts[names.get(group_ref.group)] += 1
-            if total <= epsilon:
-                zero_weight_vertices += 1
-            if has_invalid:
-                invalid_weight_vertices += 1
-    return {
-        "remaining_invalid_weight_vertices": invalid_weight_vertices,
-        "remaining_zero_weight_vertices": zero_weight_vertices,
-        "remaining_invalid_group_counts": dict(invalid_group_counts.most_common()),
-    }
-
-
-def run_repair_invalid_weights(armature_name, mesh_regex="", fill_zero_weight=True, remove_empty_invalid_groups=True, max_samples_per_object=20, report_path=""):
-    armature = get_armature(armature_name)
-    name_filter = compile_optional_regex(mesh_regex)
-    valid_bones = {bone.name for bone in armature.data.bones}
-    segments = bone_world_segments(armature)
-    objects = []
-    object_reports = []
-    removed_groups = {}
-
-    for obj in bpy.context.scene.objects:
-        if obj.type != "MESH":
-            continue
-        if name_filter and not name_filter.search(obj.name):
-            continue
-        if not armature_modifier(obj, armature):
-            continue
-        objects.append(obj)
-
-    for obj in objects:
-        report = repair_object_weights(obj, armature, valid_bones, segments, fill_zero_weight, max_samples_per_object)
-        if report["repaired_invalid_vertices"] or report["filled_zero_weight_vertices"]:
-            object_reports.append(report)
-        if remove_empty_invalid_groups:
-            removed = remove_non_bone_groups(obj, valid_bones)
-            if removed:
-                removed_groups[obj.name] = removed
-
-    integrity = count_remaining_issues(objects, valid_bones)
-    roots = [bone.name for bone in armature.data.bones if bone.parent is None]
-    total_invalid_counts = Counter()
-    for item in object_reports:
-        total_invalid_counts.update(item["invalid_groups"])
-    final_report = {
-        "source_file": bpy.data.filepath,
-        "armature": armature.name,
-        "root_bones": roots,
-        "checked_meshes": len(objects),
-        "objects_repaired": len(object_reports),
-        "total_repaired_invalid_vertices": sum(item["repaired_invalid_vertices"] for item in object_reports),
-        "total_filled_zero_weight_vertices": sum(item["filled_zero_weight_vertices"] for item in object_reports),
-        "invalid_group_vertex_counts": dict(total_invalid_counts.most_common()),
-        "removed_empty_invalid_groups": removed_groups,
-        "integrity_after_repair": integrity,
-        "object_reports_sample": object_reports[:80],
-    }
-    write_report(report_path, final_report)
-    return final_report
 
 
 # ---------------------------------------------------------------------------
@@ -10077,9 +7913,8 @@ def armature_modifier_uses(obj, armature):
 
 def merge_skinned_meshes(armature, source_objects, merged_name):
     # Duplicate sources and join them. Join runs in C and preserves UV layers,
-    # color attributes, custom split normals, materials, and vertex groups —
-    # the previous Python from_pydata rebuild was slow and dropped all of them.
-    valid_bones = {bone.name for bone in armature.data.bones}
+    # color attributes, custom split normals, materials, and the native vertex
+    # groups/weights. Bone data is immutable at this assembly boundary.
     remove_object_and_orphan_mesh(bpy.data.objects.get(merged_name))
     ensure_object_mode()
 
@@ -10107,13 +7942,12 @@ def merge_skinned_meshes(armature, source_objects, merged_name):
         if mesh.users == 0:
             bpy.data.meshes.remove(mesh)
 
-    removed_invalid_groups = remove_non_bone_groups(merged_obj, valid_bones)
     parent_keep_world(merged_obj, armature)
     modifier = merged_obj.modifiers.new(name="Armature", type="ARMATURE")
     modifier.object = armature
 
     uv_names = [layer.name for layer in merged_obj.data.uv_layers]
-    return merged_obj, source_ranges, len(merged_obj.data.materials), uv_names, removed_invalid_groups
+    return merged_obj, source_ranges, len(merged_obj.data.materials), uv_names
 
 
 def _strict_material_intents_for_name(material_name, envelope):
@@ -10424,14 +8258,14 @@ def count_zero_weight_vertices(obj):
     return zero
 
 
-MERGED_SUFFIX = "_Codex_MergedSkinned_WeightsFixed"
+MERGED_SUFFIX = "_Codex_Assembled"
 
 
 def strip_blender_duplicate_suffix(name):
     return re.sub(r"\.\d{3}$", "", name)
 
 
-def is_codex_merged_output_name(name):
+def is_codex_assembled_output_name(name):
     return MERGED_SUFFIX.lower() in strip_blender_duplicate_suffix(name).lower()
 
 
@@ -10609,11 +8443,11 @@ def park_cluster_source_full_reference(
     export_collection_name="Export",
     source_collection_name="SpeedTree_Source",
 ):
-    """Keep the repaired Full SK reference out of Send2UE's Export collection.
+    """Keep the assembled Full SK reference out of Send2UE's Export collection.
 
     Cluster Normalizer owns the actual export pivots and always names them
     ``<source_stem>_01``, ``_02``, ... even when there is only one prototype.
-    BWR still needs its merged source for inspection and downstream repair
+    The pipeline still needs its merged source for inspection and downstream
     reports, but exposing that merge as the unsuffixed ``<source_stem>`` export
     unit creates an extra Unreal asset and violates the normalized naming
     contract.
@@ -10777,7 +8611,7 @@ def run_merge_export(
             continue
         if obj.name == merged_name:
             continue
-        if is_codex_merged_output_name(obj.name):
+        if is_codex_assembled_output_name(obj.name):
             continue
         if not armature_modifier_uses(obj, armature):
             continue
@@ -10793,7 +8627,7 @@ def run_merge_export(
 
     source_object_names = [obj.name for obj in source_objects]
 
-    merged_obj, ranges, _material_count, uv_names, removed_invalid_groups = merge_skinned_meshes(
+    merged_obj, ranges, _material_count, uv_names = merge_skinned_meshes(
         armature, source_objects, merged_name
     )
     placeholder_material_normalization = (
@@ -10884,7 +8718,7 @@ def run_merge_export(
         "merged_faces": len(merged_obj.data.polygons),
         "merged_vertex_groups": len(merged_obj.vertex_groups),
         "zero_weight_vertices": zero_weight_vertices,
-        "removed_invalid_groups": removed_invalid_groups,
+        "native_skin_passthrough": True,
         "material_count": len(merged_obj.data.materials),
         "placeholder_material_normalization": (
             placeholder_material_normalization
@@ -10902,7 +8736,7 @@ def run_merge_export(
     if settings and make_export_structure:
         source_fbx = settings.get("source_fbx_path", "")
         if (
-            settings.get("cluster_source_skin_contract", False)
+            settings.get("cluster_source_contract", False)
             and settings.get(
                 "defer_cluster_export_to_normalizer",
                 False,
@@ -11009,10 +8843,10 @@ def default_paths(settings):
     output_base_path = blend_path or source_fbx
     naming_base_path = source_fbx or blend_path
     if not output_base_path and not settings.get("out_dir"):
-        raise RuntimeError("Save/open a .blend, choose a Source FBX, or set an Output Directory before running the SpeedTree repair pipeline.")
+        raise RuntimeError("Save/open a .blend, choose a Source FBX, or set an Output Directory before running the SpeedTree assembly pipeline.")
     out_dir = settings.get("out_dir") or os.path.dirname(output_base_path)
     name_stem = settings.get("name_stem") or (Path(naming_base_path).stem if naming_base_path else "speedtree_export")
-    merged_name = settings.get("merged_name") or f"{name_stem}_Codex_MergedSkinned_WeightsFixed"
+    merged_name = settings.get("merged_name") or f"{name_stem}_Codex_Assembled"
     blend_dir = os.path.dirname(blend_path) if blend_path else out_dir
     json_dir = os.path.join(blend_dir, "JSON")
     # Only the MegaPlant JSON (and the optional FBX) are deliverables; all
@@ -11025,26 +8859,12 @@ def default_paths(settings):
         "reports_dir": reports_dir,
         "name_stem": name_stem,
         "merged_name": merged_name,
-        "fixed_blend": os.path.join(out_dir, f"{name_stem}_fixed_codex.blend"),
-        "leaf_blend": os.path.join(out_dir, f"{name_stem}_fixed_codex_skinned_leaves.blend"),
-        "weight_blend": os.path.join(out_dir, f"{name_stem}_fixed_codex_skinned_weights_fixed.blend"),
-        "export_blend": os.path.join(out_dir, f"{name_stem}_codex_merged_skinned_weights_fixed_export.blend"),
-        "fbx": os.path.join(out_dir, f"{name_stem}_codex_merged_skinned_weights_fixed.fbx"),
-        "reparent_report": os.path.join(reports_dir, f"{name_stem}_reparent_report_codex.json"),
-        "branch_plane_report": os.path.join(
-            reports_dir,
-            f"{name_stem}_branch_plane_skin_report_codex.json",
-        ),
-        "leaf_report": os.path.join(reports_dir, f"{name_stem}_leaf_skin_report_codex.json"),
-        "residual_geometry_report": os.path.join(
-            reports_dir,
-            f"{name_stem}_residual_geometry_skin_report_codex.json",
-        ),
-        "weight_report": os.path.join(reports_dir, f"{name_stem}_weight_repair_report_codex.json"),
-        "export_report": os.path.join(reports_dir, f"{name_stem}_codex_merged_skinned_weights_fixed_export_report.json"),
+        "export_blend": os.path.join(out_dir, f"{name_stem}_codex_assembled_export.blend"),
+        "fbx": os.path.join(out_dir, f"{name_stem}_codex_assembled.fbx"),
+        "export_report": os.path.join(reports_dir, f"{name_stem}_codex_assembled_export_report.json"),
         "unreal_json": os.path.join(json_dir, f"{name_stem}_megaplant_tree_groups.json"),
         "dynamic_wind_json": os.path.join(json_dir, f"{name_stem}_dynamic_wind_import_from_megaplant_groups.json"),
-        "pipeline_report": os.path.join(reports_dir, f"{name_stem}_speedtree_repair_pipeline_report_codex.json"),
+        "pipeline_report": os.path.join(reports_dir, f"{name_stem}_speedtree_assembly_pipeline_report_codex.json"),
     }
 
 
@@ -11053,7 +8873,7 @@ def save_blend(path):
     bpy.ops.wm.save_as_mainfile(filepath=path)
 
 
-def run_full_pipeline(
+def run_assembly_pipeline(
     settings,
     *,
     import_result=None,
@@ -11236,164 +9056,6 @@ def run_full_pipeline(
             save_blend(path)
             reports["saved_blends"].append(path)
 
-    reparent_started = perf_counter()
-    if settings.get("cluster_source_skin_contract", False):
-        cluster_armature = get_armature(
-            settings.get("armature_name", "Root")
-        )
-        cluster_roots = [
-            bone.name
-            for bone in cluster_armature.data.bones
-            if bone.parent is None
-        ]
-        if len(cluster_roots) != len(cluster_armature.data.bones):
-            raise RuntimeError(
-                "Cluster render-root axes must remain independent before "
-                "normalization; found parented axis bones."
-            )
-        reparent = {
-            "status": "skipped_cluster_independent_render_roots",
-            "spm": settings["spm_path"],
-            "armature": cluster_armature.name,
-            "bone_count": len(cluster_armature.data.bones),
-            "root_names_before": cluster_roots,
-            "root_names_after": cluster_roots,
-            "reason": (
-                "Cluster axes represent independent render components, not a "
-                "tree skeleton hierarchy"
-            ),
-        }
-        write_report(paths["reparent_report"], reparent)
-    else:
-        reparent = run_reparent_from_spm(
-            settings["spm_path"],
-            settings.get("armature_name", "Root"),
-            settings.get("true_root", "Bone_1_Start"),
-            settings.get("scale_value", "auto"),
-            settings.get("tolerance", 0.08),
-            apply=True,
-            strict=settings.get("strict_reparent", True),
-            report_path=paths["reparent_report"],
-        )
-    reports["steps"].append({"name": "reparent", "status": reparent.get("status"), "report": paths["reparent_report"]})
-    if reparent.get("status") == "blocked":
-        write_report(paths["pipeline_report"], reports)
-        raise RuntimeError(
-            (
-                reparent.get("error", "Reparent blocked.")
-                + f" Export structure was not built. Reparent report: {paths['reparent_report']}"
-            )
-        )
-    record_stage("reparent", reparent_started)
-    stage_save(paths["fixed_blend"])
-
-    # Material-grouped SpeedTree exports leave branch/frond plane geometry as
-    # an unskinned M_branch_* mesh.  Unlike loose leaves, it was never converted
-    # to an armature-driven replacement and was therefore silently omitted by
-    # run_merge_export(), which accepts skinned sources only.  Skin each
-    # disconnected plane component rigidly to the nearest already-skinned bark
-    # surface so the authored M_branch_* material/geometry pair survives the
-    # final Full SK merge.
-    branch_planes_started = perf_counter()
-    branch_planes = run_skin_loose_instances(
-        settings.get("armature_name", "Root"),
-        "branch",
-        "Branches_Skinned_Codex",
-        hide_originals=settings.get("hide_originals", True),
-        fallback_all_bones=settings.get("fallback_all_bones", False),
-        apply=True,
-        report_path=paths["branch_plane_report"],
-        spm_path="",
-        true_root=settings.get("true_root", "Bone_1_Start"),
-        scale_value=settings.get("scale_value", "auto"),
-        source_object_names=[obj.name for obj in source_import_meshes],
-    )
-    reports["steps"].append(
-        {
-            "name": "skin_branch_planes",
-            "status": branch_planes.get("status"),
-            "report": paths["branch_plane_report"],
-            "created_object": branch_planes.get("created_object", ""),
-            "created_faces": branch_planes.get("created_faces", 0),
-        }
-    )
-    represented_source_objects = set(branch_planes.get("source_objects", []))
-    record_stage("skin_branch_planes", branch_planes_started)
-
-    if settings.get("skip_leaf_skin", False):
-        reports["steps"].append({"name": "skin_loose_instances", "status": "skipped"})
-    else:
-        leaf_started = perf_counter()
-        leaf = run_skin_loose_instances(
-            settings.get("armature_name", "Root"),
-            settings.get("leaf_name_contains", "leaf"),
-            settings.get("leaf_out_name", "Leaves_Skinned_Codex"),
-            hide_originals=settings.get("hide_originals", True),
-            fallback_all_bones=settings.get("fallback_all_bones", False),
-            apply=True,
-            report_path=paths["leaf_report"],
-            spm_path=settings.get("spm_path", ""),
-            true_root=settings.get("true_root", "Bone_1_Start"),
-            scale_value=settings.get("scale_value", "auto"),
-            source_object_names=[obj.name for obj in source_import_meshes],
-        )
-        represented_source_objects.update(leaf.get("source_objects", []))
-        reports["steps"].append({"name": "skin_loose_instances", "status": leaf.get("status"), "report": paths["leaf_report"]})
-        stage_save(paths["leaf_blend"])
-        record_stage("skin_loose_instances", leaf_started)
-
-    # Preserve every remaining authored render mesh, regardless of naming.
-    # Scan-derived trunks and their stitch surfaces commonly use M_tree_* or
-    # M_bark_* names and therefore bypass the historical branch/leaf passes.
-    # Restrict the catch-all to this exact FBX import and exclude source meshes
-    # already represented by the semantic passes so each face is copied once.
-    residual_started = perf_counter()
-    residual_geometry = run_skin_loose_instances(
-        settings.get("armature_name", "Root"),
-        "",
-        "Residual_Geometry_Skinned_Codex",
-        hide_originals=settings.get("hide_originals", True),
-        fallback_all_bones=settings.get("fallback_all_bones", False),
-        apply=True,
-        report_path=paths["residual_geometry_report"],
-        spm_path="",
-        true_root=settings.get("true_root", "Bone_1_Start"),
-        scale_value=settings.get("scale_value", "auto"),
-        source_object_names=[obj.name for obj in source_import_meshes],
-        exclude_object_names=represented_source_objects,
-    )
-    reports["steps"].append(
-        {
-            "name": "skin_residual_render_geometry",
-            "status": residual_geometry.get("status"),
-            "report": paths["residual_geometry_report"],
-            "source_objects": residual_geometry.get("source_objects", []),
-            "created_object": residual_geometry.get("created_object", ""),
-            "created_faces": residual_geometry.get("created_faces", 0),
-        }
-    )
-    record_stage("skin_residual_geometry", residual_started)
-
-    weights_started = perf_counter()
-    weights = run_repair_invalid_weights(
-        settings.get("armature_name", "Root"),
-        mesh_regex=settings.get("mesh_regex", ""),
-        fill_zero_weight=settings.get("fill_zero_weight", True),
-        remove_empty_invalid_groups=settings.get("remove_empty_invalid_groups", True),
-        max_samples_per_object=settings.get("max_samples_per_object", 20),
-        report_path=paths["weight_report"],
-    )
-    record_stage("repair_invalid_weights", weights_started)
-    reports["steps"].append(
-        {
-            "name": "repair_invalid_weights",
-            "status": "applied",
-            "report": paths["weight_report"],
-            "remaining": weights.get("integrity_after_repair", {}),
-        }
-    )
-    stage_save(paths["weight_blend"])
-
     merge_export_started = perf_counter()
     export = run_merge_export(
         settings.get("armature_name", "Root"),
@@ -11413,7 +9075,7 @@ def run_full_pipeline(
             "status": "applied",
             "report": paths["export_report"],
             "zero_weight_vertices": export.get("zero_weight_vertices"),
-            "removed_invalid_groups": export.get("removed_invalid_groups"),
+            "native_skin_passthrough": export.get("native_skin_passthrough"),
             "placeholder_material_normalization": export.get(
                 "placeholder_material_normalization", {}
             ),
@@ -11440,7 +9102,7 @@ def run_full_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# One-shot SpeedTree -> import -> repair (idempotent re-run == update)
+# One-shot SpeedTree -> import -> assemble (idempotent re-run == update)
 # ---------------------------------------------------------------------------
 
 
@@ -11498,7 +9160,7 @@ def clear_previous_codex_build(settings):
             if cleanup_source_fbx_paths or source_identity_path
             else (
                 "codex_source_fbx" in obj
-                or is_codex_merged_output_name(obj.name)
+                or is_codex_assembled_output_name(obj.name)
             )
         )
         or obj.name == target_merged_name
@@ -11559,10 +9221,10 @@ def clear_previous_codex_build(settings):
     }
 
 
-def run_import_and_repair(settings):
+def run_import_and_assemble(settings):
     # settings must already carry source_fbx_path (and ideally xml_path) from the
     # SpeedTree export step. Wipes the previous build, re-imports, re-runs the
-    # full repair pipeline. Pressing the button again is a clean update.
+    # assembly pipeline. Pressing the button again is a clean update.
     total_started = perf_counter()
     if not settings.get("source_fbx_path"):
         raise RuntimeError("Source FBX path is required (run the SpeedTree export first).")
@@ -11578,25 +9240,37 @@ def run_import_and_repair(settings):
     imported = run_import_source_fbx(
         settings["source_fbx_path"],
         settings.get("source_collection_name", "SpeedTree_Source"),
-        rigid_fallback=True,
-        cluster_source_skin_contract=settings.get(
-            "cluster_source_skin_contract",
-            False,
-        ),
-        armature_name=settings.get("armature_name", "Root"),
-        true_root=settings.get("true_root", "Bone_1_Start"),
         spm_path=settings.get("spm_path", ""),
         texture_contract=texture_contract,
-        cluster_source_xml_path=settings.get("xml_path", ""),
         source_identity_path=settings.get("source_identity_path", ""),
     )
     import_duration = perf_counter() - import_started
+    imported_armatures = [
+        bpy.data.objects.get(name)
+        for name in imported.get("imported_armatures", [])
+    ]
+    imported_armatures = [
+        obj for obj in imported_armatures
+        if obj is not None and obj.type == "ARMATURE"
+    ]
+    requested_armature = bpy.data.objects.get(
+        settings.get("armature_name", "")
+    )
+    if requested_armature not in imported_armatures:
+        if len(imported_armatures) != 1:
+            raise RuntimeError(
+                "Native FBX assembly requires exactly one imported armature; "
+                f"found {[obj.name for obj in imported_armatures]}"
+            )
+        requested_armature = imported_armatures[0]
+    assembly_settings = dict(settings)
+    assembly_settings["armature_name"] = requested_armature.name
     source_collection = bpy.data.collections.get(settings.get("source_collection_name", "SpeedTree_Source"))
     if source_collection:
         source_collection.hide_viewport = False
     pipeline_started = perf_counter()
-    reports = run_full_pipeline(
-        settings,
+    reports = run_assembly_pipeline(
+        assembly_settings,
         import_result=imported,
         runtime_texture_contract=texture_contract,
         write_pipeline_report=False,
@@ -11613,16 +9287,14 @@ def run_import_and_repair(settings):
         "imported_object_count": imported.get("imported_object_count", 0),
         "imported_mesh_count": imported.get("imported_mesh_count", 0),
         "imported_armature_count": imported.get("imported_armature_count", 0),
+        "imported_armatures": imported.get("imported_armatures", []),
+        "selected_armature": requested_armature.name,
         "renamed_materials": imported.get("renamed_materials", []),
         "material_consolidation": imported.get("material_consolidation", {}),
         "speedtree_material_intents": imported.get(
             "speedtree_material_intents", {}
         ),
         "unreal_instance_profile": imported.get("unreal_instance_profile", {}),
-        "rigid_fallback": imported.get("rigid_fallback"),
-        "cluster_source_skin_contract": imported.get(
-            "cluster_source_skin_contract"
-        ),
         "unassigned_geometry_cleanup": imported.get(
             "unassigned_geometry_cleanup"
         ),
@@ -11645,7 +9317,7 @@ def run_import_and_repair(settings):
             perf_counter() - report_write_started,
             6,
         )
-    timings["total_import_and_repair"] = round(
+    timings["total_import_and_assemble"] = round(
         perf_counter() - total_started,
         6,
     )

@@ -1642,7 +1642,7 @@ def main():
                 "texture_normalization": normalization,
             }
         else:
-            result = run_import_source_fbx(str(source_path), rigid_fallback=False)
+            result = run_import_source_fbx(str(source_path))
         materials = sorted(
             {
                 material.name

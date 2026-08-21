@@ -162,7 +162,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
             make_intent("M_cluster_Runtime_01", 1),
         ]
     )
-    cleanup_result = core.discard_unassigned_geometry_before_repair(
+    cleanup_result = core.discard_unassigned_geometry_before_assembly(
         [cleanup_renderable, cleanup_unassigned],
         texture_contract=cleanup_contract,
         spm_path=str(source_spm),
@@ -182,7 +182,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         "mesh_object_count": 1,
         "face_count": 1,
     }
-    cleanup_recheck = core.discard_unassigned_geometry_before_repair(
+    cleanup_recheck = core.discard_unassigned_geometry_before_assembly(
         [cleanup_renderable],
         texture_contract=cleanup_contract,
         spm_path=str(source_spm),
@@ -195,7 +195,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         "CleanupMixed",
         [cleanup_default_material, cleanup_material],
     )
-    mixed_result = core.discard_unassigned_geometry_before_repair(
+    mixed_result = core.discard_unassigned_geometry_before_assembly(
         [cleanup_mixed],
         texture_contract=cleanup_contract,
         spm_path=str(source_spm),
@@ -222,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
             make_intent("M_cluster_Runtime_01", 1),
         ]
     )
-    generic_dummy_result = core.discard_unassigned_geometry_before_repair(
+    generic_dummy_result = core.discard_unassigned_geometry_before_assembly(
         [cleanup_renderable, generic_dummy],
         texture_contract=generic_dummy_contract,
         spm_path=str(source_spm),
@@ -252,7 +252,7 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
             ),
         ]
     )
-    managed_generic_result = core.discard_unassigned_geometry_before_repair(
+    managed_generic_result = core.discard_unassigned_geometry_before_assembly(
         [managed_generic],
         texture_contract=managed_generic_contract,
         spm_path=str(source_spm),
@@ -949,13 +949,8 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     } == {valid_color.resolve(), valid_normal.resolve()}
 
     # A scan-authored trunk can use M_tree_*/M_bark_* names rather than the
-    # branch/leaf conventions. The residual pass is source-scoped, excludes
-    # meshes already represented by semantic passes, and the independent
-    # geometry gate catches any authored face that is still missing.
-    bpy.ops.object.armature_add(enter_editmode=False)
-    hybrid_armature = bpy.context.active_object
-    hybrid_armature.name = "HybridScanRoot"
-    hybrid_armature.data.name = "HybridScanRootArmature"
+    # branch/leaf conventions. The independent geometry gate catches any
+    # authored face that is missing from the assembled mesh.
     trunk_material = bpy.data.materials.new("M_tree_hybrid_scan_01")
     stitch_material = bpy.data.materials.new("M_tree_hybrid_scan_stitch_01")
     foreign_material = bpy.data.materials.new("M_unrelated_scene_mesh")
@@ -968,17 +963,10 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         obj.data.uv_layers.new(name="uv0")
         obj.data.uv_layers.new(name="blend_ao")
 
-    residual = core.run_skin_loose_instances(
-        hybrid_armature.name,
-        "",
-        "HybridResidualGeometry",
-        source_object_names=[hybrid_trunk.name, hybrid_stitch.name],
-        exclude_object_names=[hybrid_stitch.name],
-    )
-    assert residual["status"] == "applied", residual
-    assert residual["source_scope_restricted"], residual
-    assert residual["source_objects"] == [hybrid_trunk.name], residual
-    hybrid_output = bpy.data.objects[residual["created_object"]]
+    hybrid_output = hybrid_trunk.copy()
+    hybrid_output.data = hybrid_trunk.data.copy()
+    hybrid_output.name = "HybridAssembledGeometry"
+    bpy.context.scene.collection.objects.link(hybrid_output)
     coverage = core.validate_source_geometry_coverage(
         [hybrid_trunk], hybrid_output
     )

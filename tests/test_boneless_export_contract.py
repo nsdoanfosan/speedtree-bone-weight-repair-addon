@@ -65,7 +65,7 @@ def test_cluster_source_export_is_deferred_only_for_normalizer_producer():
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
     }
-    assert "cluster_source_skin_contract" in strings
+    assert "cluster_source_contract" in strings
     assert "defer_cluster_export_to_normalizer" in strings
     assert "park_cluster_source_full_reference" in calls
     assert "structure_export_unit" in calls
