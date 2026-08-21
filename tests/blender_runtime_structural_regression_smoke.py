@@ -237,6 +237,54 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     }, generic_dummy_result
     assert bpy.data.objects.get("GenericMaterialDummy") is None
 
+    # The native collision exporter can put Material_Mat on a dummy FBX mesh
+    # without writing that generic slot to STMAT at all.  Delete it only when
+    # the validated current preflight envelope proves that exact omission.
+    omitted_generic_material = make_mesh_object(
+        "OmittedGenericMaterialDummy",
+        [generic_dummy_material],
+    )
+    omitted_generic_contract = strict_runtime_contract(
+        [make_intent("M_cluster_Runtime_01", 1)]
+    )
+    omitted_envelope = omitted_generic_contract["speedtree_pipeline_contract"]
+    omitted_envelope.update(
+        {
+            "kind": "speedtree_material_preflight",
+            "outcome": "ok",
+            "source": {"stmat": [{"canonical_path": str(source_fbx.with_suffix('.stmat'))}]},
+        }
+    )
+    omitted_generic_result = core.discard_unassigned_geometry_before_assembly(
+        [cleanup_renderable, omitted_generic_material],
+        texture_contract=omitted_generic_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert omitted_generic_result["status"] == "applied", omitted_generic_result
+    assert omitted_generic_result["removed_objects"] == [
+        "OmittedGenericMaterialDummy"
+    ], omitted_generic_result
+    assert bpy.data.objects.get("OmittedGenericMaterialDummy") is None
+
+    # The same generic name without exact current STMAT omission evidence must
+    # remain untouched.
+    unproven_generic_material = make_mesh_object(
+        "UnprovenGenericMaterial",
+        [generic_dummy_material],
+    )
+    unproven_generic_contract = strict_runtime_contract(
+        [make_intent("M_cluster_Runtime_01", 1)]
+    )
+    unproven_generic_result = core.discard_unassigned_geometry_before_assembly(
+        [unproven_generic_material],
+        texture_contract=unproven_generic_contract,
+        spm_path=str(source_spm),
+        source_fbx_path=str(source_fbx),
+    )
+    assert unproven_generic_result["status"] == "not_applicable"
+    assert bpy.data.objects.get("UnprovenGenericMaterial") is unproven_generic_material
+
     # The generic name is not deletion authority when the current intent owns
     # a managed texture source.
     managed_generic = make_mesh_object(

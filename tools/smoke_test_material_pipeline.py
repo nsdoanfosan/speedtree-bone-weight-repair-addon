@@ -5,7 +5,6 @@ Run with Blender:
       --fbx X.fbx --report result.json
 """
 import argparse
-import gzip
 import hashlib
 import json
 import sys
@@ -106,7 +105,6 @@ def run_contract_smoke(
     apply_speedtree_material_intents,
     handoff_contract,
     load_speedtree_texture_readiness_contract,
-    inspect_spm_unreal_instance_profile,
     apply_spm_unreal_instance_profile,
     merge_skinned_meshes,
     clear_previous_codex_build,
@@ -1284,25 +1282,10 @@ def run_contract_smoke(
         )
         spm_path = asset / "profile_contract.spm"
 
-        def write_profile_spm(value, compressed=False):
-            root = ET.Element("SpeedTree")
-            generator = ET.SubElement(root, "Generator", Type="Tree")
-            prop = ET.SubElement(generator, "Property")
-            ET.SubElement(prop, "Name").text = "SpeedTree SDK:User data"
-            ET.SubElement(prop, "Value").text = value
-            payload = ET.tostring(
-                root, encoding="utf-8", xml_declaration=True
-            )
-            if compressed:
-                with gzip.open(spm_path, "wb") as handle:
-                    handle.write(payload)
-            else:
-                spm_path.write_bytes(payload)
+        def write_profile_spm(value):
+            spm_path.write_bytes(f"source:{value}".encode("utf-8"))
 
-        write_profile_spm("Dead", compressed=True)
-        profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
-        if profile_inspection.get("profile") != "dead":
-            raise AssertionError(profile_inspection)
+        write_profile_spm("Dead")
 
         def source_identity(path):
             path = Path(path).resolve()
@@ -1387,31 +1370,8 @@ def run_contract_smoke(
         if not loaded_strict_contract.get("strict_speedtree_pipeline_contract"):
             raise AssertionError(loaded_strict_contract)
 
-        mismatch_report_path = asset / "mismatch_material_preflight.json"
-        mismatch_report_path.write_text(
-            json.dumps(
-                {
-                    "status": "ok",
-                    "speedtree_pipeline_contract": strict_profile_envelope(""),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        try:
-            load_speedtree_texture_readiness_contract(
-                mismatch_report_path,
-                spm_path=spm_path,
-                source_fbx_path=source_fbx,
-            )
-        except RuntimeError as exc:
-            if "instance_profile mismatch" not in str(exc):
-                raise
-            profile_mismatch_blocked = str(exc)
-        else:
-            raise AssertionError("profile mismatch contract was not blocked")
         profile_result = apply_spm_unreal_instance_profile(
-            [profile_object], spm_path
+            [profile_object], spm_path, verified_profile="dead"
         )
         if {
             material.get("unreal_instance_profile")
@@ -1419,7 +1379,7 @@ def run_contract_smoke(
         } != {"dead"}:
             raise AssertionError(profile_result)
         consolidated_profile_result = apply_spm_unreal_instance_profile(
-            [canonical_object], spm_path
+            [canonical_object], spm_path, verified_profile="dead"
         )
         if len(canonical_object.data.materials) != 1 or (
             canonical_object.data.materials[0].get("unreal_instance_profile")
@@ -1464,23 +1424,18 @@ def run_contract_smoke(
 
         write_profile_spm("")
         cleared_profile_result = apply_spm_unreal_instance_profile(
-            [stale_profile_object], spm_path
+            [stale_profile_object], spm_path, verified_profile=""
         )
         if "unreal_instance_profile" in stale_profile_material:
             raise AssertionError(cleared_profile_result)
         name_only_result = apply_spm_unreal_instance_profile(
-            [name_only_object], spm_path
+            [name_only_object], spm_path, verified_profile=""
         )
         if any(
             "unreal_instance_profile" in material
             for material in name_only_materials
         ):
             raise AssertionError(name_only_result)
-
-        write_profile_spm("../dead")
-        invalid_profile = inspect_spm_unreal_instance_profile(spm_path)
-        if invalid_profile.get("status") != "inspection_error":
-            raise AssertionError(invalid_profile)
 
         stable_source_identity = asset / "Cluster" / "SK_contract.spm"
         canonical_source_fbx = asset / "Cluster" / "fbx" / "SK_contract.fbx"
@@ -1567,7 +1522,6 @@ def run_contract_smoke(
                     loaded_strict_contract.get("bindings") or []
                 ),
             },
-            "profile_mismatch_blocked": profile_mismatch_blocked,
             "consolidated_instance_profile": consolidated_profile_result,
             "merged_instance_profile": {
                 "object": merged_profile_object.name,
@@ -1610,7 +1564,6 @@ def main():
             apply_speedtree_material_intents,
             apply_spm_unreal_instance_profile,
             consolidate_speedtree_group_materials,
-            inspect_spm_unreal_instance_profile,
             load_speedtree_texture_readiness_contract,
             merge_skinned_meshes,
             normalize_speedtree_material_textures,
@@ -1628,7 +1581,6 @@ def main():
                 apply_speedtree_material_intents,
                 handoff_contract,
                 load_speedtree_texture_readiness_contract,
-                inspect_spm_unreal_instance_profile,
                 apply_spm_unreal_instance_profile,
                 merge_skinned_meshes,
                 clear_previous_codex_build,

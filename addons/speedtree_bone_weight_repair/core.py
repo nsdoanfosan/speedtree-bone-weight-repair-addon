@@ -15,7 +15,7 @@ import bmesh
 import numpy as np
 from mathutils import Vector, kdtree
 
-from . import handoff_contract, speedtree_cli, spm_reader
+from . import handoff_contract, speedtree_cli
 from .preview_texture_contract import (
     PREVIEW_ONLY_USAGE,
     PREVIEW_RECEIPT_VERSION,
@@ -148,10 +148,19 @@ def load_speedtree_texture_readiness_contract(
         )
         live_source["historical_identity_fields_are_diagnostic"] = True
         tree_user_data = validated.get("tree_user_data") or {}
-        profile_inspection = inspect_spm_unreal_instance_profile(spm_path)
         reported_profile = handoff_contract.normalize_instance_profile(
             validated.get("instance_profile")
         )
+        # The batch preflight already parsed the exact content-bound SPM and
+        # validated this value. Parsing the same SPM again inside Blender adds
+        # latency without strengthening the contract.
+        profile_inspection = {
+            "status": "contract_verified",
+            "spm": str(spm_path or ""),
+            "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
+            "profile": reported_profile,
+            "source": "validated_speedtree_pipeline_contract",
+        }
 
         contract = {
             "status": "ok",
@@ -201,79 +210,8 @@ def utc_timestamp():
 
 BUNDLED_PRESET_DIR = Path(__file__).parent / "presets" / "speedtree_10_1"
 BUNDLED_FBX_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_MA_Fbx.ini"
-BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_MA_Fbx_NoBones.ini"
 BUNDLED_XML_EXPORT_OPTIONS = BUNDLED_PRESET_DIR / "Options_HI_Xml.ini"
 LEGACY_BUNDLED_EXPORT_OPTIONS = Path(__file__).parent / "presets" / "Options_Fbx.ini"
-
-
-def inspect_spm_bone_generators(spm_path):
-    try:
-        return spm_reader.get_derived(
-            spm_path,
-            "bone_generators_v1",
-            _inspect_spm_bone_generators_root,
-        )
-    except Exception as exc:
-        return {
-            "inspection_ok": False,
-            "inspection_error": str(exc),
-            "visible_branch_generators": 0,
-            "enabled_branch_generators": 1,
-            "disabled_generators": [],
-        }
-
-
-def _inspect_spm_bone_generators_root(root):
-    visible = []
-    enabled = []
-    disabled = []
-    for gen in root.findall(".//Generator"):
-        if gen.attrib.get("Type") != "Branch" or child_bool(gen, "Hidden", False):
-            continue
-        style = element_property_value(gen, "Physics:Bone style")
-        bones = element_property_value(gen, "Physics:Bones")
-        if style is None or bones is None:
-            continue
-        item = {
-            "generator": gen.findtext("Name") or "?",
-            "style": float(style),
-            "bones": float(bones),
-        }
-        visible.append(item)
-        if item["style"] == 0.0 and item["bones"] == 0.0:
-            disabled.append(item)
-        else:
-            enabled.append(item)
-    return {
-        "inspection_ok": True,
-        "visible_branch_generators": len(visible),
-        "enabled_branch_generators": len(enabled),
-        "disabled_generators": disabled,
-    }
-
-
-def spm_has_enabled_bone_generators(spm_path):
-    return inspect_spm_bone_generators(spm_path)["enabled_branch_generators"] > 0
-
-
-def require_spm_sk_ready(spm_path):
-    bone_status = inspect_spm_bone_generators(spm_path)
-    has_enabled_bones = bone_status["enabled_branch_generators"] > 0
-    if (
-        bone_status.get("inspection_ok")
-        and bone_status["visible_branch_generators"] > 0
-        and not has_enabled_bones
-    ):
-        settings = ", ".join(
-            f"{item['generator']}(style={item['style']:g}, bones={item['bones']:g})"
-            for item in bone_status["disabled_generators"]
-        )
-        raise RuntimeError(
-            "SPM is not SK-ready: every visible Branch bone generator is Absolute/0 "
-            f"(bones disabled): {settings}. Configure bones on at least one visible "
-            "Branch generator before running the SK batch."
-        )
-    return bone_status
 
 
 def default_speedtree_export_options(spm_path, kind="fbx"):
@@ -306,8 +244,6 @@ def run_speedtree_cli_export(
     export_fbx=True,
     export_xml=True,
     timeout_seconds=900,
-    allow_boneless=False,
-    allow_manual_bones=False,
 ):
     spm = Path(spm_path)
     if not spm.exists():
@@ -319,21 +255,9 @@ def run_speedtree_cli_export(
 
     root = Path(output_root) if output_root else spm.parent
     stem = name_stem or spm.stem
-    bone_status = (
-        inspect_spm_bone_generators(spm)
-        if allow_boneless or allow_manual_bones
-        else require_spm_sk_ready(spm)
-    )
-    has_enabled_bones = bone_status["enabled_branch_generators"] > 0
     targets = []
     if export_fbx:
         options = Path(fbx_export_options_path or export_options_path or default_speedtree_export_options(spm_path, "fbx"))
-        if (
-            allow_boneless
-            and not has_enabled_bones
-            and BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS.exists()
-        ):
-            options = BUNDLED_FBX_NO_BONES_EXPORT_OPTIONS
         targets.append(("fbx", root / "fbx" / f"{stem}.fbx", options))
     if export_xml:
         options = Path(xml_export_options_path or export_options_path or default_speedtree_export_options(spm_path, "xml"))
@@ -386,9 +310,6 @@ def run_speedtree_cli_export(
         "export_options": export_options,
         "output_root": str(root),
         "name_stem": stem,
-        "spm_has_enabled_bones": has_enabled_bones,
-        "manual_bones_preserved": bool(allow_manual_bones),
-        "spm_bone_generators": bone_status,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
@@ -6296,6 +6217,22 @@ def _cleanup_placeholder_material_key(material, texture_contract):
     if material_key not in UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS:
         return ""
     matches = _strict_material_intents_for_name(material_base, envelope)
+    if not matches:
+        source = envelope.get("source")
+        stmat_sources = source.get("stmat") if isinstance(source, dict) else None
+        exact_current_stmat_omission = (
+            envelope.get("kind") == "speedtree_material_preflight"
+            and envelope.get("outcome") == "ok"
+            and isinstance(envelope.get("material_intents"), list)
+            and isinstance(stmat_sources, list)
+            and bool(stmat_sources)
+        )
+        # The native FBX exporter gives collision/unused geometry a generic
+        # Material_Mat slot while omitting that slot from the matching STMAT.
+        # A validated current preflight envelope makes that omission exact
+        # evidence; without it, the generic name alone is never deletion
+        # authority.
+        return material_key if exact_current_stmat_omission else ""
     if len(matches) != 1:
         return ""
     intent = matches[0]
@@ -6613,8 +6550,17 @@ def run_import_source_fbx(
     material_intents = apply_speedtree_material_intents(
         imported, texture_contract=texture_contract
     )
+    verified_profile = None
+    if isinstance(texture_contract, dict) and texture_contract.get(
+        "strict_speedtree_pipeline_contract"
+    ):
+        verified_profile = texture_contract.get("instance_profile", "")
     instance_profile = (
-        apply_spm_unreal_instance_profile(imported, spm_path)
+        apply_spm_unreal_instance_profile(
+            imported,
+            spm_path,
+            verified_profile=verified_profile,
+        )
         if spm_path
         else {"status": "not_requested", "profile": ""}
     )
@@ -7519,42 +7465,6 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
     return result
 
 
-# ---------------------------------------------------------------------------
-# SPM metadata parsing
-# ---------------------------------------------------------------------------
-
-
-def read_spm_xml(path):
-    """Compatibility wrapper for callers that consume decoded SPM XML bytes."""
-    return spm_reader.read_spm_xml(path)
-
-
-def child_text(element, name, default=None):
-    if element is None:
-        return default
-    child = element.find(name)
-    if child is None or child.text is None:
-        return default
-    return child.text
-
-
-def child_bool(element, name, default=False):
-    value = child_text(element, name)
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "yes"}
-
-
-def element_property_value(element, property_name):
-    # SpeedTree uses several property container tags (Property,
-    # SplineProperty, CurveProperty, ...). Match by their Name/Value children
-    # instead of assuming one tag name.
-    for prop in element.iter():
-        if child_text(prop, "Name") == property_name:
-            return child_text(prop, "Value")
-    return None
-
-
 def normalize_unreal_instance_profile(value):
     """Validate the opaque profile key authored in SpeedTree model User Data."""
     try:
@@ -7573,57 +7483,24 @@ def normalize_unreal_instance_profile(value):
     return profile.casefold()
 
 
-def inspect_spm_unreal_instance_profile(spm_path):
-    """Read Tree Generator > SpeedTree SDK > User data directly from an SPM."""
-    try:
-        return spm_reader.get_derived(
-            spm_path,
-            "unreal_instance_profile_v1",
-            lambda root: _inspect_spm_unreal_instance_profile_root(
-                root,
-                spm_path,
-            ),
+def apply_spm_unreal_instance_profile(
+    objects,
+    spm_path,
+    *,
+    verified_profile=None,
+):
+    """Attach the exact model profile from the validated preflight contract."""
+    if verified_profile is None:
+        raise RuntimeError(
+            "Validated SpeedTree pipeline contract is required for model User Data"
         )
-    except Exception as exc:
-        return {
-            "status": "inspection_error",
-            "spm": str(spm_path or ""),
-            "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
-            "profile": "",
-            "error": str(exc),
-        }
-
-
-def _inspect_spm_unreal_instance_profile_root(root, spm_path):
-    tree_generators = [
-        generator
-        for generator in root.findall(".//Generator")
-        if generator.attrib.get("Type") == "Tree"
-    ]
-    if not tree_generators:
-        raise ValueError("SPM has no Tree Generator.")
-    raw_value = element_property_value(
-        tree_generators[0], SPEEDTREE_MODEL_USER_DATA_PROPERTY
-    )
-    profile = normalize_unreal_instance_profile(raw_value)
-    return {
-        "status": "ok" if profile else "empty",
+    inspection = {
+        "status": "contract_verified",
         "spm": str(spm_path or ""),
         "property": SPEEDTREE_MODEL_USER_DATA_PROPERTY,
-        "profile": profile,
-        "raw_value": str(raw_value or ""),
-        "tree_generator_count": len(tree_generators),
+        "profile": normalize_unreal_instance_profile(verified_profile),
+        "source": "validated_speedtree_pipeline_contract",
     }
-
-
-def apply_spm_unreal_instance_profile(objects, spm_path):
-    """Attach the model-wide profile to final Blender materials without renaming."""
-    inspection = inspect_spm_unreal_instance_profile(spm_path)
-    if inspection["status"] == "inspection_error":
-        raise RuntimeError(
-            "SpeedTree model User Data inspection failed: "
-            + inspection.get("error", "unknown error")
-        )
 
     profile = inspection.get("profile", "")
     materials = collect_object_materials(objects)
@@ -8250,14 +8127,6 @@ def validate_face_assigned_material_slots(mesh_obj):
     }
 
 
-def count_zero_weight_vertices(obj):
-    zero = 0
-    for vertex in obj.data.vertices:
-        if not any(group.weight > EPSILON for group in vertex.groups):
-            zero += 1
-    return zero
-
-
 MERGED_SUFFIX = "_Codex_Assembled"
 
 
@@ -8702,7 +8571,6 @@ def run_merge_export(
     )
     if merged_source_identity:
         merged_obj["codex_source_identity"] = merged_source_identity
-    zero_weight_vertices = count_zero_weight_vertices(merged_obj)
     roots = [bone.name for bone in armature.data.bones if bone.parent is None]
 
     report = {
@@ -8717,7 +8585,6 @@ def run_merge_export(
         "merged_vertices": len(merged_obj.data.vertices),
         "merged_faces": len(merged_obj.data.polygons),
         "merged_vertex_groups": len(merged_obj.vertex_groups),
-        "zero_weight_vertices": zero_weight_vertices,
         "native_skin_passthrough": True,
         "material_count": len(merged_obj.data.materials),
         "placeholder_material_normalization": (
@@ -8992,8 +8859,15 @@ def run_assembly_pipeline(
     )
 
     if import_result is None:
+        verified_profile = None
+        if isinstance(texture_contract, dict) and texture_contract.get(
+            "strict_speedtree_pipeline_contract"
+        ):
+            verified_profile = texture_contract.get("instance_profile", "")
         instance_profile = apply_spm_unreal_instance_profile(
-            source_import_meshes, settings["spm_path"]
+            source_import_meshes,
+            settings["spm_path"],
+            verified_profile=verified_profile,
         )
     else:
         instance_profile = import_result.get("unreal_instance_profile", {})
@@ -9074,7 +8948,6 @@ def run_assembly_pipeline(
             "name": "merge_export",
             "status": "applied",
             "report": paths["export_report"],
-            "zero_weight_vertices": export.get("zero_weight_vertices"),
             "native_skin_passthrough": export.get("native_skin_passthrough"),
             "placeholder_material_normalization": export.get(
                 "placeholder_material_normalization", {}
@@ -9091,7 +8964,6 @@ def run_assembly_pipeline(
     )
     stage_save(paths["export_blend"])
     reports["status"] = "done"
-    reports["spm_read_cache"] = spm_reader.cache_info()
     reports["grouping_health"] = export.get("grouping_health", {})
     reports["warnings"] = export.get("unreal_json_warnings", [])
     if write_pipeline_report:
