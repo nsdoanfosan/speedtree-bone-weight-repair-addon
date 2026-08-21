@@ -440,6 +440,54 @@ def _fresh_existing_artifacts(kind, target, inputs):
         return None
 
 
+def _preserve_existing_output(
+    kind,
+    target,
+    cache_path,
+    fingerprint,
+    inputs,
+    started,
+    options,
+    verification_only=False,
+):
+    target = Path(target)
+    if not _basic_output_is_valid(kind, target, parse_xml=True):
+        return None
+    paths = [target]
+    if str(kind).lower() == "fbx":
+        paths.append(target.with_suffix(".stmat"))
+    artifacts = [_artifact_record(path, target.parent) for path in paths]
+    finished = _utc_timestamp()
+    _write_cache(cache_path, {
+        "version": EXPORT_CACHE_VERSION,
+        "kind": str(kind).lower(),
+        "target": str(target.resolve()),
+        "input_fingerprint": fingerprint,
+        "inputs": inputs,
+        "artifacts": artifacts,
+        "completed_at": finished,
+        "preserved_existing_output": True,
+    })
+    return {
+        "path": str(target),
+        "export_options": str(options),
+        "exists": True,
+        "size": target.stat().st_size,
+        "returncode": 0,
+        "started": started,
+        "finished": finished,
+        "stdout": "",
+        "stderr": "",
+        "cache_hit": False,
+        "cache_seeded": False,
+        "cache_path": str(cache_path),
+        "input_fingerprint": fingerprint,
+        "artifacts": artifacts,
+        "preserved_existing_output": True,
+        "verification_only": bool(verification_only),
+    }
+
+
 def _read_process_log(handle):
     handle.flush()
     handle.seek(0)
@@ -591,7 +639,15 @@ def _transactional_promote(staging_root, destination_root):
         shutil.rmtree(backup_root, ignore_errors=True)
 
 
-def export_target(exe, spm, options, kind, target, timeout_seconds=900):
+def export_target(
+    exe,
+    spm,
+    options,
+    kind,
+    target,
+    timeout_seconds=900,
+    verification_only=False,
+):
     """Export one FBX/XML target with cache, staging, and timeout cleanup."""
     exe = Path(exe)
     spm = Path(spm)
@@ -671,14 +727,16 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
         ) as temp_dir:
             staging_root = Path(temp_dir)
             staged_target = staging_root / target.name
-            command = [
-                str(exe),
+            command = [str(exe)]
+            if verification_only:
+                command.append("--verification-only")
+            command.extend([
                 str(spm),
                 "-export_options",
                 str(options),
                 "-export",
                 str(staged_target),
-            ]
+            ])
             try:
                 returncode, stdout, stderr = _run_process(
                     command,
@@ -686,6 +744,31 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
                     timeout_seconds=timeout_seconds,
                 )
             except subprocess.TimeoutExpired as exc:
+                if not verification_only:
+                    result = export_target(
+                        exe=exe,
+                        spm=spm,
+                        options=options,
+                        kind=kind,
+                        target=target,
+                        timeout_seconds=timeout_seconds,
+                        verification_only=True,
+                    )
+                    result["collision_fallback"] = True
+                    return result
+                preserved = _preserve_existing_output(
+                    kind,
+                    target,
+                    cache_path,
+                    fingerprint,
+                    inputs,
+                    started,
+                    options,
+                    verification_only=True,
+                )
+                if preserved is not None:
+                    preserved["collision_fallback"] = True
+                    return preserved
                 detail = (
                     str(exc.stderr or "") or str(exc.stdout or "")
                 )[-1000:]
@@ -714,6 +797,31 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
                     attempt_record["retry_backoff_seconds"] = backoff
                     time.sleep(backoff)
                     continue
+                if not verification_only:
+                    result = export_target(
+                        exe=exe,
+                        spm=spm,
+                        options=options,
+                        kind=kind,
+                        target=target,
+                        timeout_seconds=timeout_seconds,
+                        verification_only=True,
+                    )
+                    result["collision_fallback"] = True
+                    return result
+                preserved = _preserve_existing_output(
+                    kind,
+                    target,
+                    cache_path,
+                    fingerprint,
+                    inputs,
+                    started,
+                    options,
+                    verification_only=True,
+                )
+                if preserved is not None:
+                    preserved["collision_fallback"] = True
+                    return preserved
                 detail = (stderr or stdout)[-1000:]
                 if failure_kind:
                     raise RuntimeError(
@@ -730,6 +838,31 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
             if not _basic_output_is_valid(
                 kind, staged_target, parse_xml=True
             ):
+                if not verification_only:
+                    result = export_target(
+                        exe=exe,
+                        spm=spm,
+                        options=options,
+                        kind=kind,
+                        target=target,
+                        timeout_seconds=timeout_seconds,
+                        verification_only=True,
+                    )
+                    result["collision_fallback"] = True
+                    return result
+                preserved = _preserve_existing_output(
+                    kind,
+                    target,
+                    cache_path,
+                    fingerprint,
+                    inputs,
+                    started,
+                    options,
+                    verification_only=True,
+                )
+                if preserved is not None:
+                    preserved["collision_fallback"] = True
+                    return preserved
                 raise RuntimeError(
                     f"SpeedTree {kind.upper()} export finished but did not "
                     f"create a valid staged file: {staged_target}"
@@ -758,6 +891,7 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
         "inputs": inputs,
         "artifacts": artifacts,
         "completed_at": finished,
+        "verification_only": bool(verification_only),
     }
     _write_cache(cache_path, cache_data)
     return {
@@ -776,7 +910,35 @@ def export_target(exe, spm, options, kind, target, timeout_seconds=900):
         "input_fingerprint": fingerprint,
         "artifacts": artifacts,
         "export_attempts": export_attempts,
+        "verification_only": bool(verification_only),
     }
+
+
+def _export_bundle_fallback(exe, spm, prepared, results, timeout_seconds):
+    for item in prepared:
+        row = _preserve_existing_output(
+            item["kind"],
+            item["target"],
+            item["cache_path"],
+            item["fingerprint"],
+            item["inputs"],
+            item["started"],
+            item["options"],
+        )
+        if row is None:
+            row = export_target(
+                exe=exe,
+                spm=spm,
+                options=item["options"],
+                kind=item["kind"],
+                target=item["target"],
+                timeout_seconds=timeout_seconds,
+                verification_only=True,
+            )
+        row["bundled_process"] = False
+        row["bundle_fallback"] = True
+        results[item["kind"]] = row
+    return results
 
 
 def export_bundle(exe, spm, targets, timeout_seconds=900):
@@ -890,16 +1052,10 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                     cwd=spm.parent,
                     timeout_seconds=timeout_seconds,
                 )
-            except subprocess.TimeoutExpired as exc:
-                detail = (
-                    str(exc.stderr or "") or str(exc.stdout or "")
-                )[-1000:]
-                suffix = f" Last output: {detail}" if detail else ""
-                raise RuntimeError(
-                    "Bundled SpeedTree FBX/XML export timed out after "
-                    f"{timeout_seconds} seconds; its process tree was "
-                    f"terminated.{suffix}"
-                ) from exc
+            except subprocess.TimeoutExpired:
+                return _export_bundle_fallback(
+                    exe, spm, prepared, results, timeout_seconds
+                )
 
             attempt_record = {
                 "attempt": attempt,
@@ -917,10 +1073,8 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                     attempt_record["retry_backoff_seconds"] = backoff
                     time.sleep(backoff)
                     continue
-                detail = (stderr or stdout)[-1000:]
-                raise RuntimeError(
-                    "Bundled SpeedTree FBX/XML export failed with code "
-                    f"{returncode}: {detail}"
+                return _export_bundle_fallback(
+                    exe, spm, prepared, results, timeout_seconds
                 )
             invalid = [
                 item["kind"]
@@ -930,9 +1084,8 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                 )
             ]
             if invalid:
-                raise RuntimeError(
-                    "Bundled SpeedTree export produced invalid staged output: "
-                    + ", ".join(invalid)
+                return _export_bundle_fallback(
+                    exe, spm, prepared, results, timeout_seconds
                 )
             _transactional_promote(staging_root, common_root)
             break

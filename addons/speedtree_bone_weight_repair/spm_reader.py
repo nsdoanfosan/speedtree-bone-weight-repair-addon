@@ -1,6 +1,6 @@
 """Process-local, change-aware access to SpeedTree SPM XML data.
 
-Blender repair consumes the same SPM in several independent stages.  SpeedTree
+Blender assembly consumes the same SPM in several independent stages.  SpeedTree
 10 SPM files are gzip-compressed XML, so repeatedly opening, decompressing, and
 parsing one unchanged file adds avoidable work.  This module keeps a small LRU
 snapshot per process and invalidates it whenever the file stat identity changes.
@@ -104,7 +104,7 @@ def get_derived(path, namespace, builder):
 
 
 def cache_info():
-    """Return serializable diagnostics for repair reports and tests."""
+    """Return serializable diagnostics for assembly reports and tests."""
     with _lock:
         return {
             **_stats,

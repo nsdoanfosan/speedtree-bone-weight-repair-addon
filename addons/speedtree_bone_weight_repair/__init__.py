@@ -1,52 +1,30 @@
 bl_info = {
-    "name": "SpeedTree Bone/Weight Repair",
+    "name": "SpeedTree Assembly",
     "author": "OpenAI Codex",
-    "version": (0, 3, 1),
+    "version": (0, 4, 0),
     "blender": (5, 1, 0),
-    "location": "View3D > Sidebar > SpeedTree > Bone/Weight Repair",
-    "description": "Repair SpeedTree orphan branch root bones, loose leaf/cap instances, invalid weights, and export a merged skeletal FBX.",
+    "location": "View3D > Sidebar > SpeedTree > Assembly",
+    "description": "Import native SpeedTree skeletal FBX data unchanged, assemble materials and geometry, and prepare Unreal handoff artifacts.",
     "category": "Import-Export",
 }
 
 # MegaPlant conversion roadmap
 #
-# This add-on is becoming a staged SpeedTree-to-MegaPlant conversion tool, not
-# just a one-off bone repair utility. Keep new work aligned to these stages:
+# Native SpeedTree export owns the skeleton hierarchy and every skin weight.
+# Blender treats that data as immutable input. The add-on owns deterministic
+# assembly and handoff stages:
 #
-# 1. Repair skeleton hierarchy from the original SPM.
-#    SpeedTree exports can leave branch root bones with no usable parent
-#    relationship. Rebuild only relationships proven by Base/BaseRef links;
-#    independent roots with no such evidence must remain sibling stems. All
-#    later generated 3D geometry binds to this repaired armature.
-#
-# 2. Parked note: convert branch/frond cards into 3D branch clusters.
-#    This direction is currently not part of the active add-on UI/operator set.
-#    Keep the idea as a reference only unless the workflow returns to it later.
-#    The previous prototype matched SpeedTree XML Frond names/material IDs to
-#    pre-grouped clusters such as branch_elm_01_A/B/C, but it is not registered.
-#
-# 3. Convert leaf cards/instances into 3D leaf geometry.
-#    Leaf data may be stored as instances rather than the same branch-card
-#    structure, so this should be a separate stage with its own matching and
-#    weight-transfer rules.
-#
-# 4. Merge/export using the repaired skeleton and generated 3D meshes.
-#    Any active generated replacements must be skinned to the existing repaired
-#    bones before merge/export.
-#
-# 5. Emit Unreal/MegaPlant grouping data.
+# 1. Import the native FBX/XML outputs and prepare material/texture metadata.
+# 2. Merge the already-skinned source meshes without altering vertex groups.
+# 3. Build the Export collection hierarchy.
+# 4. Emit Unreal/MegaPlant grouping data.
 #    The Unreal-side process needs JSON grouping metadata so generated branch
 #    and leaf geometry can be interpreted as MegaPlant-style data. This JSON
 #    should be deterministic conversion metadata: provenance, generated object
-#    records, repaired skeleton summary, binding summaries, and validation
+#    records, native skeleton summary, binding summaries, and validation
 #    results. It should not become a live Unreal wind-tuning scratchpad.
 #
-# 6. Validate Unreal import/runtime behavior.
-#    Import the exported skeletal FBX and JSON into a separate Unreal test path
-#    first. Verify that the repaired hierarchy imports cleanly, generated
-#    geometry remains skinned, JSON groups resolve to imported geometry, and
-#    TreeWind/DynamicWind runtime control is owned by Unreal actor/controller
-#    code without preview-wind conflicts or hard sine-like stepping.
+# 5. Validate Unreal import/runtime behavior.
 
 import importlib
 import traceback
@@ -57,7 +35,6 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     FloatProperty,
-    IntProperty,
     PointerProperty,
     StringProperty,
 )
@@ -108,13 +85,13 @@ def get_core():
 class STBWR_Settings(PropertyGroup):
     source_fbx_path: StringProperty(
         name="Source FBX",
-        description="Source SpeedTree FBX to import into Blender before repair",
+        description="Native SpeedTree FBX to import into Blender before assembly",
         subtype="FILE_PATH",
         default="",
     )
     spm_path: StringProperty(
         name="SPM",
-        description="Original SpeedTree .spm file used to recover Base/BaseRef branch parent links",
+        description="Original SpeedTree .spm file used for export and handoff metadata",
         subtype="FILE_PATH",
         default="",
     )
@@ -156,12 +133,12 @@ class STBWR_Settings(PropertyGroup):
     )
     speedtree_export_fbx: BoolProperty(
         name="FBX",
-        description="Export FBX from SpeedTree before Blender repair",
+        description="Export FBX from SpeedTree before Blender assembly",
         default=True,
     )
     speedtree_export_xml: BoolProperty(
         name="XML",
-        description="Export SpeedTree Raw XML from SpeedTree before Blender repair",
+        description="Export SpeedTree Raw XML from SpeedTree before Blender assembly",
         default=True,
     )
     xml_path: StringProperty(
@@ -180,53 +157,6 @@ class STBWR_Settings(PropertyGroup):
         description="Armature object name",
         default="Root",
     )
-    true_root: StringProperty(
-        name="True Root",
-        description="Only this _Start bone is treated as the real skeleton root",
-        default="Bone_1_Start",
-    )
-    scale_value: StringProperty(
-        name="SPM Scale",
-        description="Use auto unless SPM coordinates need an explicit conversion scale",
-        default="auto",
-    )
-    tolerance: FloatProperty(
-        name="Tolerance",
-        description="Maximum distance for matching SPM branch roots to Blender start bones",
-        default=0.08,
-        min=0.0,
-        precision=4,
-    )
-    strict_reparent: BoolProperty(
-        name="Strict Reparent",
-        description="Block the step when SPM-to-bone parent mapping has unresolved entries",
-        default=True,
-    )
-    leaf_name_contains: StringProperty(
-        name="Loose Mesh Filter",
-        description="Substring used to find loose leaf/cap instance meshes with no usable skinning",
-        default="leaf",
-    )
-    leaf_out_name: StringProperty(
-        name="Skinned Loose Mesh",
-        description="Output object name for reconstructed loose instance skinning",
-        default="Leaves_Skinned_Codex",
-    )
-    hide_originals: BoolProperty(
-        name="Hide Originals",
-        description="Hide original loose instance objects after creating the skinned replacement mesh",
-        default=True,
-    )
-    skip_leaf_skin: BoolProperty(
-        name="Skip Loose Mesh Skin",
-        description="Skip reconstruction of disconnected loose leaf/cap instance skinning",
-        default=False,
-    )
-    fallback_all_bones: BoolProperty(
-        name="Fallback All Bones",
-        description="When parent mesh groups are insufficient, allow nearest-bone assignment across the armature",
-        default=False,
-    )
     # Parked 3D Branch Cluster settings.
     # These were part of an experimental Frond_* card replacement direction and
     # are intentionally not exposed/registering as active add-on controls now.
@@ -239,18 +169,8 @@ class STBWR_Settings(PropertyGroup):
     # hide_original_branch_cards
     mesh_regex: StringProperty(
         name="Mesh Regex",
-        description="Optional regular expression limiting weight repair and merge/export source meshes",
+        description="Optional regular expression limiting assembly source meshes",
         default="",
-    )
-    fill_zero_weight: BoolProperty(
-        name="Fill Zero Weights",
-        description="Assign nearest valid bone to vertices with no usable bone weight",
-        default=True,
-    )
-    remove_empty_invalid_groups: BoolProperty(
-        name="Remove Empty Invalid Groups",
-        description="Remove empty vertex groups that do not correspond to armature bones",
-        default=True,
     )
     include_hidden: BoolProperty(
         name="Include Hidden In Merge",
@@ -259,7 +179,7 @@ class STBWR_Settings(PropertyGroup):
     )
     export_fbx: BoolProperty(
         name="Export FBX",
-        description="Export merged skeletal FBX after repair",
+        description="Export the assembled skeletal FBX without changing native bone data",
         default=False,
     )
     save_intermediate_blends: BoolProperty(
@@ -343,13 +263,6 @@ class STBWR_Settings(PropertyGroup):
         description="Show asset id, Unreal content path, and explicit JSON output path",
         default=False,
     )
-    max_samples_per_object: IntProperty(
-        name="Report Samples",
-        description="Maximum invalid/zero-weight sample vertices recorded per object",
-        default=20,
-        min=0,
-        max=1000,
-    )
     out_dir: StringProperty(
         name="Output Directory",
         description="Output directory. Empty uses the current .blend directory",
@@ -387,18 +300,7 @@ class STBWR_Settings(PropertyGroup):
             "xml_path": bpy.path.abspath(self.xml_path) if self.xml_path else "",
             "xml_trunk_generator_regex": self.xml_trunk_generator_regex,
             "armature_name": self.armature_name,
-            "true_root": self.true_root,
-            "scale_value": self.scale_value,
-            "tolerance": self.tolerance,
-            "strict_reparent": self.strict_reparent,
-            "leaf_name_contains": self.leaf_name_contains,
-            "leaf_out_name": self.leaf_out_name,
-            "hide_originals": self.hide_originals,
-            "skip_leaf_skin": self.skip_leaf_skin,
-            "fallback_all_bones": self.fallback_all_bones,
             "mesh_regex": self.mesh_regex,
-            "fill_zero_weight": self.fill_zero_weight,
-            "remove_empty_invalid_groups": self.remove_empty_invalid_groups,
             "include_hidden": self.include_hidden,
             "export_fbx": self.export_fbx,
             "save_intermediate_blends": self.save_intermediate_blends,
@@ -415,7 +317,6 @@ class STBWR_Settings(PropertyGroup):
             "json_output_path": bpy.path.abspath(self.json_output_path) if self.json_output_path else "",
             "json_asset_id": self.json_asset_id,
             "json_unreal_content_path": self.json_unreal_content_path,
-            "max_samples_per_object": self.max_samples_per_object,
             "out_dir": bpy.path.abspath(self.out_dir) if self.out_dir else "",
             "name_stem": self.name_stem,
             "merged_name": self.merged_name,
@@ -487,10 +388,10 @@ class STBWR_OT_ImportSourceFBX(STBWR_OT_Base):
 
 class STBWR_OT_ExportFromSpeedTree(STBWR_OT_Base):
     bl_idname = "speedtree_bwr.export_from_speedtree"
-    bl_label = "SpeedTree -> Import -> Repair"
+    bl_label = "SpeedTree -> Import -> Assemble"
     bl_description = (
         "One button from the SPM: export FBX/XML from SpeedTree, import them, and "
-        "run the full repair pipeline. Press again to update — the previous "
+        "run the assembly pipeline. Press again to update — the previous "
         "import/merge/export result is wiped first, so nothing stacks up"
     )
 
@@ -526,10 +427,11 @@ class STBWR_OT_ExportFromSpeedTree(STBWR_OT_Base):
         if not scene_settings.source_fbx_path:
             return self.fail("SpeedTree export produced no FBX to import.")
 
-        # 2) Wipe the previous build, re-import, and run the full pipeline.
+        # 2) Wipe the previous build, re-import native skin data unchanged, and
+        # run material/geometry/handoff assembly.
         settings = scene_settings.as_dict()
         try:
-            result = core.run_import_and_repair(settings)
+            result = core.run_import_and_assemble(settings)
         except Exception as exc:
             return self.fail(str(exc))
 
@@ -539,106 +441,28 @@ class STBWR_OT_ExportFromSpeedTree(STBWR_OT_Base):
         if warnings:
             self.report({"WARNING"}, f"Done (cleared {cleared} old). JSON hollow: " + "; ".join(warnings))
         elif settings.get("make_export_structure", True) and not export_structure:
-            self.report({"WARNING"}, f"Repair done, but Export structure was not built (cleared {cleared} old).")
+            self.report({"WARNING"}, f"Assembly done, but Export structure was not built (cleared {cleared} old).")
         else:
             hierarchy = " > ".join(export_structure.get("hierarchy", []))
             suffix = f" Export: {hierarchy}" if hierarchy else ""
-            self.report({"INFO"}, f"SpeedTree -> import -> repair done (cleared {cleared} old).{suffix}")
+            self.report({"INFO"}, f"SpeedTree -> import -> assembly done (cleared {cleared} old).{suffix}")
         return {"FINISHED"}
 
 
-class STBWR_OT_RunFullPipeline(STBWR_OT_Base):
-    bl_idname = "speedtree_bwr.run_full_pipeline"
-    bl_label = "Run Full Repair Pipeline"
-    bl_description = "Run SPM reparent, loose mesh skinning, invalid weight repair, merge, and optional FBX export"
+class STBWR_OT_RunAssemblyPipeline(STBWR_OT_Base):
+    bl_idname = "speedtree_bwr.run_assembly_pipeline"
+    bl_label = "Run Assembly Pipeline"
+    bl_description = "Assemble imported native skin data, materials, Export structure, JSON, and optional FBX"
 
     def execute(self, context):
         settings = self.settings().as_dict()
         if not settings["spm_path"]:
             return self.fail("SPM path is required.")
         try:
-            result = get_core().run_full_pipeline(settings)
+            result = get_core().run_assembly_pipeline(settings)
         except Exception as exc:
             return self.fail(str(exc))
-        self.report({"INFO"}, "SpeedTree repair pipeline done: " + result["paths"]["pipeline_report"])
-        return {"FINISHED"}
-
-
-class STBWR_OT_ReparentFromSPM(STBWR_OT_Base):
-    bl_idname = "speedtree_bwr.reparent_from_spm"
-    bl_label = "Repair Bone Parents From SPM"
-    bl_description = "Use SPM Base/BaseRef relationships to reconnect orphan _Start branch roots"
-
-    def execute(self, context):
-        settings = self.settings().as_dict()
-        if not settings["spm_path"]:
-            return self.fail("SPM path is required.")
-        try:
-            paths = get_core().default_paths(settings)
-            result = get_core().run_reparent_from_spm(
-                settings["spm_path"],
-                settings["armature_name"],
-                settings["true_root"],
-                settings["scale_value"],
-                settings["tolerance"],
-                apply=True,
-                strict=settings["strict_reparent"],
-                report_path=paths["reparent_report"],
-            )
-        except Exception as exc:
-            return self.fail(str(exc))
-        self.report({"INFO"}, f"Reparent status: {result.get('status')}, mapped {result.get('mapping_count', 0)} bones")
-        return {"FINISHED"}
-
-
-class STBWR_OT_SkinLooseInstances(STBWR_OT_Base):
-    bl_idname = "speedtree_bwr.skin_loose_instances"
-    bl_label = "Skin Loose Mesh Instances"
-    bl_description = "Convert disconnected loose leaf/cap meshes into one skinned mesh using SPM leaf-node parent branches when available"
-
-    def execute(self, context):
-        settings = self.settings().as_dict()
-        try:
-            paths = get_core().default_paths(settings)
-            result = get_core().run_skin_loose_instances(
-                settings["armature_name"],
-                settings["leaf_name_contains"],
-                settings["leaf_out_name"],
-                hide_originals=settings["hide_originals"],
-                fallback_all_bones=settings["fallback_all_bones"],
-                apply=True,
-                report_path=paths["leaf_report"],
-                spm_path=settings["spm_path"],
-                true_root=settings["true_root"],
-                scale_value=settings["scale_value"],
-            )
-        except Exception as exc:
-            return self.fail(str(exc))
-        self.report({"INFO"}, f"Loose skin status: {result.get('status')}, instances {result.get('instance_count', 0)}")
-        return {"FINISHED"}
-
-
-class STBWR_OT_RepairInvalidWeights(STBWR_OT_Base):
-    bl_idname = "speedtree_bwr.repair_invalid_weights"
-    bl_label = "Repair Invalid Weights"
-    bl_description = "Remove invalid non-bone influences and fill unweighted vertices with nearest valid bones"
-
-    def execute(self, context):
-        settings = self.settings().as_dict()
-        try:
-            paths = get_core().default_paths(settings)
-            result = get_core().run_repair_invalid_weights(
-                settings["armature_name"],
-                mesh_regex=settings["mesh_regex"],
-                fill_zero_weight=settings["fill_zero_weight"],
-                remove_empty_invalid_groups=settings["remove_empty_invalid_groups"],
-                max_samples_per_object=settings["max_samples_per_object"],
-                report_path=paths["weight_report"],
-            )
-        except Exception as exc:
-            return self.fail(str(exc))
-        remaining = result.get("integrity_after_repair", {})
-        self.report({"INFO"}, f"Weight repair done. Remaining invalid vertices: {remaining.get('invalid_weight_vertices', 0)}")
+        self.report({"INFO"}, "SpeedTree assembly pipeline done: " + result["paths"]["pipeline_report"])
         return {"FINISHED"}
 
 
@@ -700,8 +524,8 @@ class STBWR_OT_WriteUnrealJson(STBWR_OT_Base):
 
 # Parked 3D Branch Cluster operator.
 # This operator is intentionally not registered. The direction is preserved as
-# a note only because the active workflow is focused on repaired skeleton,
-# skinned geometry, FBX export, and Unreal-side runtime validation.
+# a note only because the active workflow is focused on native skinned geometry,
+# FBX export, and Unreal-side runtime validation.
 #
 # class STBWR_OT_ReplaceBranchClusters(STBWR_OT_Base):
 #     bl_idname = "speedtree_bwr.replace_branch_clusters"
@@ -712,7 +536,7 @@ class STBWR_OT_WriteUnrealJson(STBWR_OT_Base):
 class STBWR_OT_MergeExport(STBWR_OT_Base):
     bl_idname = "speedtree_bwr.merge_export"
     bl_label = "Merge And Export FBX"
-    bl_description = "Merge skinned meshes and export a skeletal FBX with valid bone weights only"
+    bl_description = "Merge native skinned meshes without changing weights and optionally export a skeletal FBX"
 
     def execute(self, context):
         settings = self.settings().as_dict()
@@ -730,13 +554,13 @@ class STBWR_OT_MergeExport(STBWR_OT_Base):
             )
         except Exception as exc:
             return self.fail(str(exc))
-        self.report({"INFO"}, f"Merge/export done. Zero-weight vertices: {result.get('zero_weight_vertices', 0)}")
+        self.report({"INFO"}, "Native-skin merge/export done.")
         return {"FINISHED"}
 
 
 class STBWR_PT_Main(Panel):
     bl_idname = "STBWR_PT_main"
-    bl_label = "Bone/Weight Repair"
+    bl_label = "Assembly"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "SpeedTree"
@@ -758,8 +582,7 @@ class STBWR_PT_Main(Panel):
         row.prop(settings, "speedtree_export_fbx")
         row.prop(settings, "speedtree_export_xml")
 
-        # One-button flow: export from SpeedTree, import, and run the full repair
-        # pipeline. Pressing it again wipes the previous build and re-runs (update).
+        # One-button flow: native export/import followed by non-bone assembly.
         run_row = box.row()
         run_row.scale_y = 1.5
         run_row.operator("speedtree_bwr.export_from_speedtree", icon="PLAY")
@@ -769,11 +592,6 @@ class STBWR_PT_Main(Panel):
         row.prop(settings, "xml_trunk_generator_regex", text="Trunk Gen")
         row = box.row(align=True)
         row.prop(settings, "armature_name")
-        row.prop(settings, "true_root")
-        row = box.row(align=True)
-        row.prop(settings, "scale_value")
-        row.prop(settings, "tolerance")
-        box.prop(settings, "strict_reparent")
 
         man = box.box()
         man.label(text="Manual re-import / debug", icon="TOOL_SETTINGS")
@@ -781,26 +599,11 @@ class STBWR_PT_Main(Panel):
         man.operator("speedtree_bwr.import_source_fbx", icon="IMPORT")
 
         box = layout.box()
-        box.label(text="Loose Mesh Skinning")
-        box.prop(settings, "skip_leaf_skin")
-        col = box.column()
-        col.enabled = not settings.skip_leaf_skin
-        col.prop(settings, "leaf_name_contains")
-        col.prop(settings, "leaf_out_name")
-        row = col.row(align=True)
-        row.prop(settings, "hide_originals")
-        row.prop(settings, "fallback_all_bones")
-
-        box = layout.box()
-        box.label(text="Weight Repair / Export")
+        box.label(text="Assembly / Export")
         box.prop(settings, "mesh_regex")
-        row = box.row(align=True)
-        row.prop(settings, "fill_zero_weight")
-        row.prop(settings, "remove_empty_invalid_groups")
         row = box.row(align=True)
         row.prop(settings, "include_hidden")
         row.prop(settings, "export_fbx")
-        box.prop(settings, "max_samples_per_object")
 
         box = layout.box()
         box.label(text="Send to Unreal Structure")
@@ -847,12 +650,9 @@ class STBWR_PT_Main(Panel):
 
         box = layout.box()
         box.label(text="Manual steps (debug)")
-        box.operator("speedtree_bwr.run_full_pipeline", icon="MOD_ARMATURE")
+        box.operator("speedtree_bwr.run_assembly_pipeline", icon="MOD_ARMATURE")
         row = box.row(align=True)
-        row.operator("speedtree_bwr.reparent_from_spm", text="Reparent")
-        row.operator("speedtree_bwr.skin_loose_instances", text="Skin Loose")
-        row = box.row(align=True)
-        row.operator("speedtree_bwr.repair_invalid_weights", text="Weights")
+        row.operator("speedtree_bwr.import_source_fbx", text="Import")
         row.operator("speedtree_bwr.merge_export", text="Merge/FBX")
 
 
@@ -860,10 +660,7 @@ classes = (
     STBWR_Settings,
     STBWR_OT_ImportSourceFBX,
     STBWR_OT_ExportFromSpeedTree,
-    STBWR_OT_RunFullPipeline,
-    STBWR_OT_ReparentFromSPM,
-    STBWR_OT_SkinLooseInstances,
-    STBWR_OT_RepairInvalidWeights,
+    STBWR_OT_RunAssemblyPipeline,
     STBWR_OT_PreviewJsonGroups,
     STBWR_OT_WriteUnrealJson,
     STBWR_OT_MergeExport,

@@ -1,4 +1,4 @@
-"""Blender smoke test for Cluster-only Export pivots after BWR merge repair."""
+"""Blender smoke test for Cluster-only Export pivots after assembly."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ root_data = bpy.data.armatures.new("RootData")
 root = bpy.data.objects.new("Root", root_data)
 merged_data = bpy.data.meshes.new("SK_branch_elm_01_MergedData")
 merged = bpy.data.objects.new(
-    "SK_branch_elm_01_Codex_MergedSkinned_WeightsFixed",
+    "SK_branch_elm_01_Codex_Assembled",
     merged_data,
 )
 full_pivot = bpy.data.objects.new("SK_branch_elm_01", None)
