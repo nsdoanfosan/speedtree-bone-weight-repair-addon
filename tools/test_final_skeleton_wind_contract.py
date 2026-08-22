@@ -48,21 +48,20 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
         )
 
         self.assertEqual(data["SkeletonContract"]["SchemaVersion"], 2)
-        self.assertEqual(data["SkeletonContract"]["BoneCount"], 4)
+        self.assertEqual(data["SkeletonContract"]["BoneCount"], 3)
         self.assertEqual(
             [(row["BoneName"], row["BoneIndex"], row["ParentIndex"])
              for row in data["SkeletonContract"]["Bones"]],
             [
-                ("Root", 0, -1),
-                ("Trunk", 1, 0),
-                ("Branch", 2, 1),
-                ("Leaf", 3, 2),
+                ("Trunk", 0, -1),
+                ("Branch", 1, 0),
+                ("Leaf", 2, 1),
             ],
         )
         self.assertEqual(
             [(row["JointName"], row["BoneIndex"], row["ParentIndex"])
              for row in data["Joints"]],
-            [("Trunk", 1, 0), ("Branch", 2, 1), ("Leaf", 3, 2)],
+            [("Trunk", 0, -1), ("Branch", 1, 0), ("Leaf", 2, 1)],
         )
         self.assertEqual(
             len(data["SkeletonContract"]["BoneNameIndexParentSha1"]), 40
@@ -99,17 +98,29 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
             import_root_name="ArmatureRoot",
         )
 
-        self.assertEqual(data["SkeletonContract"]["BoneCount"], 4)
+        self.assertEqual(data["SkeletonContract"]["BoneCount"], 3)
         self.assertEqual(
             [row["JointName"] for row in data["Joints"]],
             ["Trunk", "Leaf"],
         )
 
-    def test_armature_object_root_name_must_not_duplicate_a_bone(self):
-        with self.assertRaisesRegex(RuntimeError, "duplicates a Blender bone name"):
-            core.build_dynamic_wind_data(records(), [], import_root_name="Trunk")
+    def test_armature_object_name_is_not_part_of_exported_skeleton(self):
+        data = core.build_dynamic_wind_data(
+            records(), [], import_root_name="Trunk"
+        )
 
-    def test_elm_pilot_shape_adds_one_import_root_without_wind_joint(self):
+        self.assertEqual(
+            data["SkeletonContract"]["ImportRoot"],
+            {
+                "BoneName": "Trunk",
+                "BoneIndex": 0,
+                "ParentIndex": -1,
+                "Source": "blender_armature_bone",
+                "ExportContract": "send2ue_fbx_authored_bone_root",
+            },
+        )
+
+    def test_elm_pilot_shape_preserves_authored_root_indices(self):
         blender_bones = [
             {
                 "name": f"Bone_{index}",
@@ -126,15 +137,15 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
             import_root_name="Root",
         )
 
-        self.assertEqual(data["SkeletonContract"]["BoneCount"], 1688)
-        self.assertEqual(len(data["SkeletonContract"]["Bones"]), 1688)
+        self.assertEqual(data["SkeletonContract"]["BoneCount"], 1687)
+        self.assertEqual(len(data["SkeletonContract"]["Bones"]), 1687)
         self.assertEqual(len(data["Joints"]), 1687)
         self.assertEqual(
             data["SkeletonContract"]["Bones"][0],
-            {"BoneName": "Root", "BoneIndex": 0, "ParentIndex": -1},
+            {"BoneName": "Bone_0", "BoneIndex": 0, "ParentIndex": -1},
         )
-        self.assertEqual(data["Joints"][0]["BoneIndex"], 1)
-        self.assertEqual(data["Joints"][0]["ParentIndex"], 0)
+        self.assertEqual(data["Joints"][0]["BoneIndex"], 0)
+        self.assertEqual(data["Joints"][0]["ParentIndex"], -1)
 
     def test_negative_simulation_group_is_rejected(self):
         broken = records()
@@ -147,7 +158,7 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
                 import_root_name="ArmatureRoot",
             )
 
-    def test_loaded_isolated_blend_uses_actual_armature_object_root(self):
+    def test_loaded_isolated_blend_uses_authored_bone_root(self):
         armatures = [obj for obj in bpy.data.objects if obj.type == "ARMATURE"]
         if not bpy.data.filepath or not armatures:
             self.skipTest("no isolated Blender armature loaded")
@@ -175,13 +186,13 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            data["SkeletonContract"]["BoneCount"], len(bones) + 1
+            data["SkeletonContract"]["BoneCount"], len(bones)
         )
         self.assertEqual(
-            data["SkeletonContract"]["Bones"][0]["BoneName"], armature.name
+            data["SkeletonContract"]["Bones"][0]["BoneName"], bones[0].name
         )
         if len(bones) == 1687 and armature.name == "Root":
-            self.assertEqual(data["SkeletonContract"]["BoneCount"], 1688)
+            self.assertEqual(data["SkeletonContract"]["BoneCount"], 1687)
             self.assertEqual(len(data["Joints"]), 1687)
 
 

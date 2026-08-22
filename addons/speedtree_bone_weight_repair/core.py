@@ -7293,15 +7293,20 @@ def build_dynamic_wind_group_bases(simulation_groups):
     return bases
 
 
-def build_final_skeleton_wind_contract(bone_records, import_root_name):
-    """Build the UE FBX identity, including the armature-object root bone.
+def build_final_skeleton_wind_contract(bone_records, import_root_name=None):
+    """Build the UE FBX identity from the authored armature bones.
 
-    Send2UE exports the Blender armature object as the UE reference skeleton's
-    index-0 root. The isolated Elm pilot proves the concrete mapping used by
-    this pipeline: armature object ``Root`` followed by all Blender bones with
-    indices shifted by one. The live armature object name is used here rather
-    than guessing a constant.
+    The Send2UE handoff suppresses Blender's armature-object FBX node so Unreal
+    imports the authored top-level bone as reference-skeleton index 0.  Adding
+    another object root is unsafe for SpeedTree armatures whose real first bone
+    is already named ``Root``: Send2UE's historical ``root`` rename collides
+    case-insensitively and Unreal renames the authored bone to ``Root1``.
+
+    ``import_root_name`` remains accepted for API compatibility with callers
+    that also pass the Blender armature object's name; it is deliberately not
+    part of the exported Skeleton identity.
     """
+    del import_root_name
     blender_bones = []
     for bone in bone_records or []:
         name = str(bone.get("name") or "")
@@ -7326,17 +7331,7 @@ def build_final_skeleton_wind_contract(bone_records, import_root_name):
             "Cannot build DynamicWind skeleton contract: final bone indices "
             "must be unique and contiguous from zero."
         )
-    root_name = str(import_root_name or "").strip()
-    if not root_name:
-        raise RuntimeError(
-            "Cannot build DynamicWind skeleton contract: armature object root name missing."
-        )
     names = [item["name"] for item in blender_bones]
-    if root_name in names:
-        raise RuntimeError(
-            "Cannot build DynamicWind skeleton contract: armature object root "
-            f"duplicates a Blender bone name ({root_name})."
-        )
     if len(set(names)) != len(names):
         raise RuntimeError(
             "Cannot build DynamicWind skeleton contract: duplicate final bone names."
@@ -7353,30 +7348,21 @@ def build_final_skeleton_wind_contract(bone_records, import_root_name):
                 "Cannot build DynamicWind skeleton contract: bone cannot parent itself "
                 f"({item['name']})."
             )
+    roots = [item for item in blender_bones if item["parent_index"] == -1]
+    if len(roots) != 1 or roots[0]["bone_index"] != 0:
+        raise RuntimeError(
+            "Cannot build DynamicWind skeleton contract: authored bones must "
+            "have exactly one index-0 root."
+        )
 
     final_bones = [
         {
-            "name": root_name,
-            "bone_index": 0,
-            "parent_index": -1,
-            "group": None,
-            "identity_source": "blender_armature_object",
+            **item,
+            "identity_source": "blender_armature_bone",
         }
+        for item in blender_bones
     ]
-    for item in blender_bones:
-        final_bones.append(
-            {
-                "name": item["name"],
-                "bone_index": item["bone_index"] + 1,
-                "parent_index": (
-                    item["parent_index"] + 1
-                    if item["parent_index"] >= 0
-                    else 0
-                ),
-                "group": item["group"],
-                "identity_source": "blender_armature_bone",
-            }
-        )
+    root_name = final_bones[0]["name"]
 
     digest = hashlib.sha1()
     identity_rows = []
@@ -7403,8 +7389,8 @@ def build_final_skeleton_wind_contract(bone_records, import_root_name):
             "BoneName": root_name,
             "BoneIndex": 0,
             "ParentIndex": -1,
-            "Source": "blender_armature_object",
-            "ExportContract": "send2ue_fbx_armature_object_root",
+            "Source": "blender_armature_bone",
+            "ExportContract": "send2ue_fbx_authored_bone_root",
         },
     }
 
