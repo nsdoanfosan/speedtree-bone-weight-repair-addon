@@ -49,7 +49,7 @@ except ImportError:
     )
 
 
-EXPORT_CACHE_VERSION = 1
+EXPORT_CACHE_VERSION = 2
 _HASH_CHUNK_SIZE = 1024 * 1024
 _WINDOWS_ACCESS_VIOLATION = 0xC0000005
 _WINDOWS_STACK_BUFFER_OVERRUN = 0xC0000409
@@ -180,7 +180,15 @@ def _file_identity(path, include_hash=True):
 def _input_fingerprint(exe, spm, options, kind, target):
     # Hash authored inputs so a timestamp-preserving copy cannot accidentally
     # reuse stale geometry.  The executable is large; its path/stat identity is
-    # sufficient to invalidate the cache on a SpeedTree install/update.
+    # sufficient to invalidate the cache on a SpeedTree install/update.  The
+    # adjacent hook is smaller and owns the injected serializer behavior, so
+    # include its content hash as part of the producer identity.
+    hook = Path(exe).with_name("speedtree_collision_hook.dll")
+    if not hook.is_file():
+        raise RuntimeError(
+            "SpeedTree collision hook is missing beside the launcher: "
+            + str(hook)
+        )
     payload = {
         "version": EXPORT_CACHE_VERSION,
         "kind": str(kind).lower(),
@@ -188,6 +196,7 @@ def _input_fingerprint(exe, spm, options, kind, target):
         "spm": _file_identity(spm),
         "options": _file_identity(options),
         "speedtree_exe": _file_identity(exe, include_hash=False),
+        "speedtree_hook": _file_identity(hook),
     }
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
@@ -314,11 +323,18 @@ def _same_executable_identity(recorded, current):
     if not isinstance(recorded, dict) or not isinstance(current, dict):
         return False
     try:
+        same_hash = (
+            str(recorded.get("sha256") or "").casefold()
+            == str(current.get("sha256") or "").casefold()
+            if current.get("sha256")
+            else True
+        )
         return bool(
             _normalized_path(recorded.get("path"))
             == _normalized_path(current.get("path"))
             and int(recorded.get("size")) == int(current.get("size"))
             and int(recorded.get("mtime_ns")) == int(current.get("mtime_ns"))
+            and same_hash
         )
     except (TypeError, ValueError):
         return False
@@ -349,6 +365,9 @@ def _semantically_equivalent_inputs(cache, inputs, kind, target):
         )
         and _same_executable_identity(
             recorded.get("speedtree_exe"), inputs.get("speedtree_exe")
+        )
+        and _same_executable_identity(
+            recorded.get("speedtree_hook"), inputs.get("speedtree_hook")
         )
     )
 
@@ -431,7 +450,7 @@ def _fresh_existing_artifacts(kind, target, inputs):
     try:
         input_mtime = max(
             int(inputs[key]["mtime_ns"])
-            for key in ("spm", "options", "speedtree_exe")
+            for key in ("spm", "options", "speedtree_exe", "speedtree_hook")
         )
         if any(path.stat().st_mtime_ns < input_mtime for path in paths):
             return None
@@ -509,7 +528,11 @@ def _native_receipt_is_valid(path, spm):
             and int(source.get("size") or -1) == source_stat.st_size
             and int(source.get("last_write_time_100ns") or -1)
             == windows_write_time
-            and int(payload.get("geometry_count") or -1) == len(geometries)
+            and int(
+                payload.get("geometry_count")
+                if payload.get("geometry_count") is not None
+                else -1
+            ) == len(geometries)
             and all(int(row.get("vertex_count") or 0) >= 0 for row in geometries)
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
