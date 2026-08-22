@@ -67,6 +67,47 @@ class FinalSkeletonWindContractTests(unittest.TestCase):
             len(data["SkeletonContract"]["BoneNameIndexParentSha1"]), 40
         )
 
+    def test_missing_native_id_zero_cluster_restores_exact_root_remainder(self):
+        armature_data = bpy.data.armatures.new("ReceiptArmatureData")
+        armature = bpy.data.objects.new("ReceiptArmature", armature_data)
+        bpy.context.scene.collection.objects.link(armature)
+        bpy.context.view_layer.objects.active = armature
+        armature.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        root = armature_data.edit_bones.new("Root")
+        root.head = (0.0, 0.0, 0.0)
+        root.tail = (0.0, 0.0, 1.0)
+        child = armature_data.edit_bones.new("Bone_1_Start")
+        child.head = (0.0, 0.0, 1.0)
+        child.tail = (0.0, 0.0, 2.0)
+        child.parent = root
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        mesh_data = bpy.data.meshes.new("ReceiptMeshData")
+        mesh_data.from_pydata(
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            [],
+            [(0, 1, 2)],
+        )
+        mesh = bpy.data.objects.new("ReceiptMesh", mesh_data)
+        bpy.context.scene.collection.objects.link(mesh)
+        child_group = mesh.vertex_groups.new(name="Bone_1_Start")
+        child_group.add([0], 0.75, "REPLACE")
+        child_group.add([1], 1.0, "REPLACE")
+
+        result = core.restore_omitted_native_root_weights(
+            [armature, mesh],
+            {"id_zero_cluster_write": "omitted_no_exact_bone_record"},
+        )
+
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(result["changed_vertex_count"], 2)
+        root_group = mesh.vertex_groups["Root"]
+        self.assertAlmostEqual(root_group.weight(0), 0.25, places=6)
+        self.assertAlmostEqual(root_group.weight(2), 1.0, places=6)
+        with self.assertRaises(RuntimeError):
+            root_group.weight(1)
+
     def test_index_gap_is_rejected(self):
         broken = records()
         broken[2]["bone_index"] = 3

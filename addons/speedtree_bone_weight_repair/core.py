@@ -6528,6 +6528,89 @@ NATIVE_GEOMETRY_ORDINAL_ATTRIBUTE = "speedtree_native_geometry_ordinal"
 NATIVE_VERTEX_INDEX_ATTRIBUTE = "speedtree_native_vertex_index"
 
 
+def restore_omitted_native_root_weights(imported, receipt):
+    """Restore only the Root weights the native FBX serializer could not write.
+
+    SpeedTree 10.1 can expose an authored ``Root`` wrapper node while having no
+    exact ID-0 export-bone record.  Calling its stock weight serializer for that
+    missing record crashes inside Modeler.  The native receipt marks that exact
+    condition; only then do we add each vertex's missing deform-weight remainder
+    to the authored top-level Root bone after Blender imports the FBX.
+    """
+    write_contract = str((receipt or {}).get("id_zero_cluster_write") or "")
+    if write_contract != "omitted_no_exact_bone_record":
+        return {
+            "status": "not_required",
+            "id_zero_cluster_write": write_contract or "legacy_unreported",
+            "changed_vertex_count": 0,
+        }
+
+    armatures = [obj for obj in imported if obj.type == "ARMATURE"]
+    if len(armatures) != 1:
+        raise RuntimeError(
+            "Native ID-0 Root weight repair requires exactly one imported armature; "
+            f"found {[obj.name for obj in armatures]}"
+        )
+    armature = armatures[0]
+    roots = [bone for bone in armature.data.bones if bone.parent is None]
+    if len(roots) != 1 or roots[0].name != "Root":
+        raise RuntimeError(
+            "Native ID-0 Root weight repair requires the sole authored top-level "
+            f"bone to be Root; found {[bone.name for bone in roots]}"
+        )
+    root_name = roots[0].name
+    bone_names = {bone.name for bone in armature.data.bones}
+    changed_vertices = []
+    total_restored_weight = 0.0
+    tolerance = 2.0e-6
+    for obj in imported:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        group_names = {
+            group.index: str(group.name) for group in obj.vertex_groups
+        }
+        root_group = obj.vertex_groups.get(root_name)
+        for vertex in obj.data.vertices:
+            total = 0.0
+            for assignment in vertex.groups:
+                weight = float(assignment.weight)
+                if weight <= 0.0:
+                    continue
+                group_name = group_names.get(int(assignment.group), "")
+                if group_name not in bone_names:
+                    raise RuntimeError(
+                        "Native ID-0 Root weight repair found a weighted group "
+                        f"outside the imported armature: {obj.name}:{group_name}"
+                    )
+                total += weight
+            if total > 1.0 + tolerance:
+                raise RuntimeError(
+                    "Native ID-0 Root weight repair found overweight skin data: "
+                    f"{obj.name}:vertex={vertex.index}:total={total:.9f}"
+                )
+            missing = 1.0 - total
+            if missing <= tolerance:
+                continue
+            if root_group is None:
+                root_group = obj.vertex_groups.new(name=root_name)
+                group_names[root_group.index] = root_name
+            root_group.add([int(vertex.index)], missing, "ADD")
+            changed_vertices.append({
+                "object": obj.name,
+                "vertex_index": int(vertex.index),
+                "restored_weight": missing,
+            })
+            total_restored_weight += missing
+    return {
+        "status": "applied",
+        "id_zero_cluster_write": write_contract,
+        "root_bone": root_name,
+        "changed_vertex_count": len(changed_vertices),
+        "total_restored_weight": total_restored_weight,
+        "changed_vertices_sample": changed_vertices[:100],
+    }
+
+
 def tag_native_export_geometry(imported, source_fbx_path, spm_path):
     """Preserve exact serializer geometry/local-vertex identity through join."""
     source_fbx = Path(source_fbx_path).resolve()
@@ -6541,6 +6624,10 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
             "tagged_meshes": [],
         }
     receipt = speedtree_cli.load_native_receipt(receipt_path, spm_path)
+    native_root_weight_repair = restore_omitted_native_root_weights(
+        imported,
+        receipt,
+    )
     by_vertex_count = {}
     for row in receipt.get("geometries") or []:
         by_vertex_count.setdefault(int(row["vertex_count"]), []).append(
@@ -6587,6 +6674,7 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
     return {
         "status": "ready" if not unresolved else "partial",
         "receipt": str(receipt_path),
+        "native_root_weight_repair": native_root_weight_repair,
         "tagged_meshes": tagged,
         "unresolved_meshes": unresolved,
     }
@@ -6674,6 +6762,9 @@ def run_import_source_fbx(
         "source_identity": str(spm_path or ""),
         "source_collection": source_collection.name,
         "native_geometry_identity": native_geometry_identity,
+        "native_root_weight_repair": native_geometry_identity.get(
+            "native_root_weight_repair", {}
+        ),
         "imported_object_count": len(imported),
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
         "imported_armatures": [
@@ -9302,6 +9393,9 @@ def run_import_and_assemble(settings):
     reports["import"] = {
         "source_fbx": imported.get("source_fbx", ""),
         "source_identity": imported.get("source_identity", ""),
+        "native_root_weight_repair": imported.get(
+            "native_root_weight_repair", {}
+        ),
         "imported_object_count": imported.get("imported_object_count", 0),
         "imported_mesh_count": imported.get("imported_mesh_count", 0),
         "imported_armature_count": imported.get("imported_armature_count", 0),
