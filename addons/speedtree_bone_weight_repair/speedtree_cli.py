@@ -488,6 +488,45 @@ def _preserve_existing_output(
     }
 
 
+def _native_receipt_is_valid(path, spm):
+    """Validate exact Modeler-runtime evidence for the current source SPM."""
+    path = Path(path)
+    spm = Path(spm).resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        source = payload.get("source") or {}
+        source_path = Path(str(source.get("path") or "")).resolve()
+        source_stat = spm.stat()
+        windows_write_time = (
+            source_stat.st_mtime_ns // 100 + 116444736000000000
+        )
+        geometries = list(payload.get("geometries") or [])
+        return bool(
+            payload.get("kind") == "speedtree_native_export_receipt"
+            and payload.get("status") == "ready"
+            and int(payload.get("schema_version") or 0) >= 2
+            and str(source_path).casefold() == str(spm).casefold()
+            and int(source.get("size") or -1) == source_stat.st_size
+            and int(source.get("last_write_time_100ns") or -1)
+            == windows_write_time
+            and int(payload.get("geometry_count") or -1) == len(geometries)
+            and all(int(row.get("vertex_count") or 0) >= 0 for row in geometries)
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def load_native_receipt(path, spm):
+    """Return current Modeler-runtime evidence or reject the stale sidecar."""
+    path = Path(path)
+    if not _native_receipt_is_valid(path, spm):
+        raise RuntimeError(
+            "Native SpeedTree export receipt is missing, stale, or invalid: "
+            + str(path)
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _read_process_log(handle):
     handle.flush()
     handle.seek(0)
@@ -647,12 +686,20 @@ def export_target(
     target,
     timeout_seconds=900,
     verification_only=False,
+    native_receipt=None,
 ):
     """Export one FBX/XML target with cache, staging, and timeout cleanup."""
     exe = Path(exe)
     spm = Path(spm)
     options = Path(options)
     target = Path(target)
+    native_receipt = Path(native_receipt) if native_receipt else None
+    if native_receipt is not None:
+        native_receipt.parent.mkdir(parents=True, exist_ok=True)
+        if native_receipt.parent.resolve() != target.parent.resolve():
+            raise ValueError(
+                "Native receipt and FBX target must share one transaction directory."
+            )
     kind = str(kind).lower()
     require_texture_skip_writing(
         options, purpose=f"SpeedTree {kind.upper()} export"
@@ -663,7 +710,14 @@ def export_target(
     cache_path = _cache_path(target)
     started = _utc_timestamp()
     cache = _load_cache(cache_path)
-    if _cache_hit(cache, fingerprint, kind, target, inputs):
+    receipt_ready = bool(
+        native_receipt is None
+        or (
+            kind == "fbx"
+            and _native_receipt_is_valid(native_receipt, spm)
+        )
+    )
+    if _cache_hit(cache, fingerprint, kind, target, inputs) and receipt_ready:
         finished = _utc_timestamp()
         return {
             "path": str(target),
@@ -680,12 +734,13 @@ def export_target(
             "cache_path": str(cache_path),
             "input_fingerprint": fingerprint,
             "artifacts": cache.get("artifacts", []),
+            "native_receipt": str(native_receipt) if native_receipt else "",
         }
 
     # Migration for valid outputs written by the former no-cache exporter.
     # Do not use it for a corrupt/stale/mismatched existing receipt: those
     # cases need a real export so the known provenance is restored.
-    if not cache_path.exists():
+    if not cache_path.exists() and native_receipt is None:
         seed_artifacts = _fresh_existing_artifacts(kind, target, inputs)
         if seed_artifacts:
             finished = _utc_timestamp()
@@ -730,6 +785,10 @@ def export_target(
             command = [str(exe)]
             if verification_only:
                 command.append("--verification-only")
+            staged_receipt = None
+            if native_receipt is not None:
+                staged_receipt = staging_root / native_receipt.name
+                command.extend(["--native-receipt", str(staged_receipt)])
             command.extend([
                 str(spm),
                 "-export_options",
@@ -753,6 +812,7 @@ def export_target(
                         target=target,
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
+                        native_receipt=native_receipt,
                     )
                     result["collision_fallback"] = True
                     return result
@@ -766,7 +826,7 @@ def export_target(
                     options,
                     verification_only=True,
                 )
-                if preserved is not None:
+                if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
                 detail = (
@@ -806,6 +866,7 @@ def export_target(
                         target=target,
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
+                        native_receipt=native_receipt,
                     )
                     result["collision_fallback"] = True
                     return result
@@ -819,7 +880,7 @@ def export_target(
                     options,
                     verification_only=True,
                 )
-                if preserved is not None:
+                if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
                 detail = (stderr or stdout)[-1000:]
@@ -847,6 +908,7 @@ def export_target(
                         target=target,
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
+                        native_receipt=native_receipt,
                     )
                     result["collision_fallback"] = True
                     return result
@@ -860,12 +922,20 @@ def export_target(
                     options,
                     verification_only=True,
                 )
-                if preserved is not None:
+                if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
                 raise RuntimeError(
                     f"SpeedTree {kind.upper()} export finished but did not "
                     f"create a valid staged file: {staged_target}"
+                )
+            if (
+                staged_receipt is not None
+                and not _native_receipt_is_valid(staged_receipt, spm)
+            ):
+                raise RuntimeError(
+                    "SpeedTree FBX export finished without a valid native receipt: "
+                    + str(staged_receipt)
                 )
             promoted = _transactional_promote(
                 staging_root, target.parent
@@ -911,20 +981,30 @@ def export_target(
         "artifacts": artifacts,
         "export_attempts": export_attempts,
         "verification_only": bool(verification_only),
+        "native_receipt": str(native_receipt) if native_receipt else "",
     }
 
 
-def _export_bundle_fallback(exe, spm, prepared, results, timeout_seconds):
+def _export_bundle_fallback(
+    exe,
+    spm,
+    prepared,
+    results,
+    timeout_seconds,
+    native_receipt=None,
+):
     for item in prepared:
-        row = _preserve_existing_output(
-            item["kind"],
-            item["target"],
-            item["cache_path"],
-            item["fingerprint"],
-            item["inputs"],
-            item["started"],
-            item["options"],
-        )
+        row = None
+        if not (native_receipt is not None and item["kind"] == "fbx"):
+            row = _preserve_existing_output(
+                item["kind"],
+                item["target"],
+                item["cache_path"],
+                item["fingerprint"],
+                item["inputs"],
+                item["started"],
+                item["options"],
+            )
         if row is None:
             row = export_target(
                 exe=exe,
@@ -934,6 +1014,9 @@ def _export_bundle_fallback(exe, spm, prepared, results, timeout_seconds):
                 target=item["target"],
                 timeout_seconds=timeout_seconds,
                 verification_only=True,
+                native_receipt=(
+                    native_receipt if item["kind"] == "fbx" else None
+                ),
             )
         row["bundled_process"] = False
         row["bundle_fallback"] = True
@@ -941,7 +1024,13 @@ def _export_bundle_fallback(exe, spm, prepared, results, timeout_seconds):
     return results
 
 
-def export_bundle(exe, spm, targets, timeout_seconds=900):
+def export_bundle(
+    exe,
+    spm,
+    targets,
+    timeout_seconds=900,
+    native_receipt=None,
+):
     """Export FBX and XML through one collision-CLI/Modeler process.
 
     Each target keeps its independent content cache. A one-target miss still
@@ -950,7 +1039,9 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
     """
     exe = Path(exe)
     spm = Path(spm)
+    native_receipt = Path(native_receipt) if native_receipt else None
     prepared = []
+    all_items = []
     results = {}
     for kind, target, options in targets:
         kind = str(kind).lower()
@@ -966,6 +1057,16 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
         cache_path = _cache_path(target)
         started = _utc_timestamp()
         cache = _load_cache(cache_path)
+        item = {
+            "kind": kind,
+            "target": target,
+            "options": options,
+            "fingerprint": fingerprint,
+            "inputs": inputs,
+            "cache_path": cache_path,
+            "started": started,
+        }
+        all_items.append(item)
         if _cache_hit(cache, fingerprint, kind, target, inputs):
             results[kind] = {
                 "path": str(target),
@@ -983,19 +1084,30 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                 "input_fingerprint": fingerprint,
                 "artifacts": cache.get("artifacts", []),
                 "bundled_process": False,
+                "native_receipt": (
+                    str(native_receipt)
+                    if native_receipt is not None and kind == "fbx"
+                    else ""
+                ),
             }
             continue
-        prepared.append(
-            {
-                "kind": kind,
-                "target": target,
-                "options": options,
-                "fingerprint": fingerprint,
-                "inputs": inputs,
-                "cache_path": cache_path,
-                "started": started,
-            }
-        )
+        prepared.append(item)
+
+    if native_receipt is not None:
+        fbx_items = [item for item in all_items if item["kind"] == "fbx"]
+        if len(fbx_items) != 1:
+            raise RuntimeError(
+                "Native receipt export requires exactly one FBX target."
+            )
+        if native_receipt.parent.resolve() != fbx_items[0]["target"].parent.resolve():
+            raise ValueError(
+                "Native receipt and FBX target must share one transaction directory."
+            )
+        receipt_ready = _native_receipt_is_valid(native_receipt, spm)
+        fbx_will_export = any(item["kind"] == "fbx" for item in prepared)
+        if not receipt_ready or fbx_will_export:
+            prepared = list(all_items)
+            results.clear()
 
     if not prepared:
         return results
@@ -1008,6 +1120,9 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
             kind=item["kind"],
             target=item["target"],
             timeout_seconds=timeout_seconds,
+            native_receipt=(
+                native_receipt if item["kind"] == "fbx" else None
+            ),
         )
         results[item["kind"]]["bundled_process"] = False
         return results
@@ -1034,8 +1149,14 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                 relative = item["target"].resolve().relative_to(common_root)
                 staged[item["kind"]] = staging_root / relative
                 staged[item["kind"]].parent.mkdir(parents=True, exist_ok=True)
-            command = [
-                str(exe),
+            staged_receipt = None
+            command = [str(exe)]
+            if native_receipt is not None:
+                relative_receipt = native_receipt.resolve().relative_to(common_root)
+                staged_receipt = staging_root / relative_receipt
+                staged_receipt.parent.mkdir(parents=True, exist_ok=True)
+                command.extend(["--native-receipt", str(staged_receipt)])
+            command.extend([
                 "--secondary-export-options",
                 str(secondary["options"]),
                 "--secondary-export",
@@ -1045,7 +1166,7 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                 str(primary["options"]),
                 "-export",
                 str(staged[primary["kind"]]),
-            ]
+            ])
             try:
                 returncode, stdout, stderr = _run_process(
                     command,
@@ -1054,7 +1175,7 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                 )
             except subprocess.TimeoutExpired:
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds
+                    exe, spm, prepared, results, timeout_seconds, native_receipt
                 )
 
             attempt_record = {
@@ -1074,7 +1195,7 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
                     time.sleep(backoff)
                     continue
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds
+                    exe, spm, prepared, results, timeout_seconds, native_receipt
                 )
             invalid = [
                 item["kind"]
@@ -1085,7 +1206,14 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
             ]
             if invalid:
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds
+                    exe, spm, prepared, results, timeout_seconds, native_receipt
+                )
+            if (
+                staged_receipt is not None
+                and not _native_receipt_is_valid(staged_receipt, spm)
+            ):
+                return _export_bundle_fallback(
+                    exe, spm, prepared, results, timeout_seconds, native_receipt
                 )
             _transactional_promote(staging_root, common_root)
             break
@@ -1095,6 +1223,8 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
         artifact_paths = [item["target"]]
         if item["kind"] == "fbx":
             artifact_paths.append(item["target"].with_suffix(".stmat"))
+            if native_receipt is not None:
+                artifact_paths.append(native_receipt)
         artifacts = [
             _artifact_record(path, item["target"].parent)
             for path in artifact_paths
@@ -1108,6 +1238,11 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
             "artifacts": artifacts,
             "completed_at": finished,
             "bundled_process": True,
+            "native_receipt": (
+                str(native_receipt)
+                if native_receipt is not None and item["kind"] == "fbx"
+                else ""
+            ),
         }
         _write_cache(item["cache_path"], cache_data)
         results[item["kind"]] = {
@@ -1127,5 +1262,10 @@ def export_bundle(exe, spm, targets, timeout_seconds=900):
             "artifacts": artifacts,
             "export_attempts": export_attempts,
             "bundled_process": True,
+            "native_receipt": (
+                str(native_receipt)
+                if native_receipt is not None and item["kind"] == "fbx"
+                else ""
+            ),
         }
     return results

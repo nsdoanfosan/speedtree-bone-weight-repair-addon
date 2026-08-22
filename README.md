@@ -20,8 +20,10 @@ boundary. Blender does not synthesize or replace skeletal data.
 
 The one-button path is `SpeedTree -> Import -> Assemble`:
 
-1. Export FBX and Raw XML through the configured SpeedTree CLI.
-2. Import the FBX native skin data.
+1. Export FBX, Raw XML, and the native runtime receipt through the configured
+   SpeedTree CLI as one transactional cache bundle.
+2. Import the FBX native skin data and preserve serializer geometry/local
+   vertex identity for downstream Assembly binding.
 3. Apply material, texture, instance-profile, and dummy-geometry contracts.
 4. Join the already-skinned source meshes.
 5. Build the `Export` collection hierarchy used by Send to Unreal.

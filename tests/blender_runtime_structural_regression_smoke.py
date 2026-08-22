@@ -182,6 +182,28 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         "mesh_object_count": 1,
         "face_count": 1,
     }
+    assert core.authorized_dummy_cleanup_left_no_renderable_geometry({
+        "unassigned_geometry_cleanup": {
+            "cleanup_authorized": True,
+            "removed_face_count": 6,
+        },
+        "renderable_geometry": {
+            "status": "empty",
+            "mesh_object_count": 0,
+            "face_count": 0,
+        },
+    })
+    assert not core.authorized_dummy_cleanup_left_no_renderable_geometry({
+        "unassigned_geometry_cleanup": {
+            "cleanup_authorized": True,
+            "removed_face_count": 0,
+        },
+        "renderable_geometry": {
+            "status": "empty",
+            "mesh_object_count": 0,
+            "face_count": 0,
+        },
+    })
     cleanup_recheck = core.discard_unassigned_geometry_before_assembly(
         [cleanup_renderable],
         texture_contract=cleanup_contract,
