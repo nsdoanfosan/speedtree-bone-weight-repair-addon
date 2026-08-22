@@ -264,6 +264,12 @@ def run_speedtree_cli_export(
         targets.append(("xml", root / "xml" / f"{stem}.xml", options))
     if not targets:
         raise RuntimeError("Enable at least one SpeedTree export target.")
+    native_receipt = (
+        root / "fbx" / f"{stem}.speedtree_native_receipt.json"
+        if export_fbx
+        and exe.name.casefold() == "speedtree_collision_cli.exe"
+        else None
+    )
 
     results = {}
     export_options = {}
@@ -281,6 +287,7 @@ def run_speedtree_cli_export(
             spm=spm,
             targets=targets,
             timeout_seconds=timeout_seconds,
+            native_receipt=native_receipt,
         )
     else:
         for kind, target, options in targets:
@@ -291,6 +298,9 @@ def run_speedtree_cli_export(
                 kind=kind,
                 target=target,
                 timeout_seconds=timeout_seconds,
+                native_receipt=(
+                    native_receipt if kind == "fbx" else None
+                ),
             )
 
     bundle_mtime_sync = None
@@ -313,6 +323,9 @@ def run_speedtree_cli_export(
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
+        "native_receipt": (
+            str(native_receipt) if native_receipt is not None else ""
+        ),
     }
 
 
@@ -6294,6 +6307,21 @@ def renderable_geometry_evidence(objects):
     }
 
 
+def authorized_dummy_cleanup_left_no_renderable_geometry(import_result):
+    """Return true only when exact cleanup evidence explains an empty import."""
+
+    if not isinstance(import_result, dict):
+        return False
+    cleanup = import_result.get("unassigned_geometry_cleanup") or {}
+    geometry = import_result.get("renderable_geometry") or {}
+    return bool(
+        cleanup.get("cleanup_authorized") is True
+        and int(cleanup.get("removed_face_count") or 0) > 0
+        and geometry.get("status") == "empty"
+        and int(geometry.get("face_count") or 0) == 0
+    )
+
+
 def _cleanup_record_base(
     *, texture_contract, spm_path, source_fbx_path, objects
 ):
@@ -6496,6 +6524,74 @@ def discard_unassigned_geometry_before_assembly(
     return record
 
 
+NATIVE_GEOMETRY_ORDINAL_ATTRIBUTE = "speedtree_native_geometry_ordinal"
+NATIVE_VERTEX_INDEX_ATTRIBUTE = "speedtree_native_vertex_index"
+
+
+def tag_native_export_geometry(imported, source_fbx_path, spm_path):
+    """Preserve exact serializer geometry/local-vertex identity through join."""
+    source_fbx = Path(source_fbx_path).resolve()
+    receipt_path = source_fbx.with_name(
+        f"{source_fbx.stem}.speedtree_native_receipt.json"
+    )
+    if not receipt_path.is_file():
+        return {
+            "status": "not_available",
+            "receipt": str(receipt_path),
+            "tagged_meshes": [],
+        }
+    receipt = speedtree_cli.load_native_receipt(receipt_path, spm_path)
+    by_vertex_count = {}
+    for row in receipt.get("geometries") or []:
+        by_vertex_count.setdefault(int(row["vertex_count"]), []).append(
+            int(row["ordinal"])
+        )
+    tagged = []
+    unresolved = []
+    for obj in imported:
+        if obj.type != "MESH" or obj.data is None or not obj.data.vertices:
+            continue
+        count = len(obj.data.vertices)
+        matches = by_vertex_count.get(count) or []
+        if len(matches) != 1:
+            unresolved.append({
+                "object": obj.name,
+                "vertex_count": count,
+                "matching_geometry_ordinals": matches,
+            })
+            continue
+        ordinal = matches[0]
+        ordinal_attribute = obj.data.attributes.get(
+            NATIVE_GEOMETRY_ORDINAL_ATTRIBUTE
+        ) or obj.data.attributes.new(
+            NATIVE_GEOMETRY_ORDINAL_ATTRIBUTE,
+            "INT",
+            "POINT",
+        )
+        vertex_attribute = obj.data.attributes.get(
+            NATIVE_VERTEX_INDEX_ATTRIBUTE
+        ) or obj.data.attributes.new(
+            NATIVE_VERTEX_INDEX_ATTRIBUTE,
+            "INT",
+            "POINT",
+        )
+        ordinal_attribute.data.foreach_set("value", [ordinal] * count)
+        vertex_attribute.data.foreach_set("value", range(count))
+        obj["speedtree_native_receipt"] = str(receipt_path)
+        obj["speedtree_native_geometry_ordinal"] = ordinal
+        tagged.append({
+            "object": obj.name,
+            "geometry_ordinal": ordinal,
+            "vertex_count": count,
+        })
+    return {
+        "status": "ready" if not unresolved else "partial",
+        "receipt": str(receipt_path),
+        "tagged_meshes": tagged,
+        "unresolved_meshes": unresolved,
+    }
+
+
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
@@ -6512,6 +6608,11 @@ def run_import_source_fbx(
     before = {obj.name for obj in bpy.data.objects}
     bpy.ops.import_scene.fbx(filepath=str(path))
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
+    native_geometry_identity = tag_native_export_geometry(
+        imported,
+        path,
+        spm_path,
+    )
     # Keep raw imports out of the Export collection (the FBX importer links to
     # the active collection) — send2ue exports every unit found in Export, so
     # stray source objects there would split the asset into multiple FBX files.
@@ -6572,6 +6673,7 @@ def run_import_source_fbx(
         "source_fbx": str(path),
         "source_identity": str(spm_path or ""),
         "source_collection": source_collection.name,
+        "native_geometry_identity": native_geometry_identity,
         "imported_object_count": len(imported),
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
         "imported_armatures": [
@@ -9117,6 +9219,64 @@ def run_import_and_assemble(settings):
         source_identity_path=settings.get("source_identity_path", ""),
     )
     import_duration = perf_counter() - import_started
+    if authorized_dummy_cleanup_left_no_renderable_geometry(imported):
+        paths = default_paths(settings)
+        reports = {
+            "status": "empty_after_dummy_cleanup",
+            "paths": paths,
+            "steps": [
+                {
+                    "name": "merge_export",
+                    "status": "skipped_empty_after_dummy_cleanup",
+                    "native_skin_passthrough": False,
+                }
+            ],
+            "saved_blends": [],
+            "stage_timings_seconds": {
+                "cleanup_previous_build": round(cleanup_duration, 6),
+                "import_source_fbx": round(import_duration, 6),
+            },
+            "cleanup": cleanup,
+            "unassigned_geometry_cleanup": imported[
+                "unassigned_geometry_cleanup"
+            ],
+            "renderable_geometry_after_cleanup": imported[
+                "renderable_geometry"
+            ],
+            "empty_asset_disposition": {
+                "status": "skipped",
+                "reason": "all_renderable_geometry_removed_as_authorized_dummy",
+            },
+            "import": {
+                "source_fbx": imported.get("source_fbx", ""),
+                "source_identity": imported.get("source_identity", ""),
+                "imported_object_count": imported.get(
+                    "imported_object_count", 0
+                ),
+                "imported_mesh_count": imported.get("imported_mesh_count", 0),
+                "imported_armature_count": imported.get(
+                    "imported_armature_count", 0
+                ),
+                "imported_armatures": imported.get("imported_armatures", []),
+                "unassigned_geometry_cleanup": imported[
+                    "unassigned_geometry_cleanup"
+                ],
+                "renderable_geometry": imported["renderable_geometry"],
+            },
+        }
+        reports["stage_timings_seconds"][
+            "total_import_and_assemble"
+        ] = round(perf_counter() - total_started, 6)
+        pipeline_path = paths.get("pipeline_report", "")
+        if pipeline_path and not settings.get(
+            "defer_pipeline_report_write", False
+        ):
+            report_write_started = perf_counter()
+            write_report(pipeline_path, reports)
+            reports["stage_timings_seconds"][
+                "pipeline_report_write"
+            ] = round(perf_counter() - report_write_started, 6)
+        return reports
     imported_armatures = [
         bpy.data.objects.get(name)
         for name in imported.get("imported_armatures", [])

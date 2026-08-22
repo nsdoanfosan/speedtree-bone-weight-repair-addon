@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,80 @@ SPEC.loader.exec_module(speedtree_cli)
 
 
 class SpeedTreeExportBundleTests(unittest.TestCase):
+    @staticmethod
+    def _write_native_receipt(path, spm):
+        stat = spm.stat()
+        Path(path).write_text(json.dumps({
+            "schema_version": 2,
+            "kind": "speedtree_native_export_receipt",
+            "status": "ready",
+            "source": {
+                "path": str(spm.resolve()),
+                "size": stat.st_size,
+                "last_write_time_100ns": (
+                    stat.st_mtime_ns // 100 + 116444736000000000
+                ),
+            },
+            "geometry_count": 1,
+            "geometries": [{"ordinal": 0, "vertex_count": 3}],
+        }), encoding="utf-8")
+
+    def test_native_receipt_is_promoted_and_required_by_fbx_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            spm = root / "tree.spm"
+            fbx_options = root / "fbx.ini"
+            xml_options = root / "xml.ini"
+            exe.write_bytes(b"exe")
+            spm.write_bytes(b"spm")
+            preset = "[Options]\nTextureSkipWriting=true\n"
+            fbx_options.write_text(preset, encoding="utf-8")
+            xml_options.write_text(preset, encoding="utf-8")
+            fbx = root / "out" / "fbx" / "tree.fbx"
+            xml = root / "out" / "xml" / "tree.xml"
+            receipt = fbx.with_name("tree.speedtree_native_receipt.json")
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(command[command.index("--secondary-export") + 1])
+                staged_receipt = Path(
+                    command[command.index("--native-receipt") + 1]
+                )
+                primary.write_bytes(b"fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />", encoding="utf-8"
+                )
+                secondary.write_text("<SpeedTreeRaw />", encoding="utf-8")
+                self._write_native_receipt(staged_receipt, spm)
+                return 0, "ok", ""
+
+            speedtree_cli._run_process = fake_run
+            try:
+                first = speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [("fbx", fbx, fbx_options), ("xml", xml, xml_options)],
+                    native_receipt=receipt,
+                )
+                second = speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [("fbx", fbx, fbx_options), ("xml", xml, xml_options)],
+                    native_receipt=receipt,
+                )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(receipt.is_file())
+            self.assertEqual(first["fbx"]["native_receipt"], str(receipt))
+            self.assertTrue(second["fbx"]["cache_hit"])
+            self.assertTrue(second["xml"]["cache_hit"])
+
     def test_two_misses_share_one_process_then_hit_independent_caches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
