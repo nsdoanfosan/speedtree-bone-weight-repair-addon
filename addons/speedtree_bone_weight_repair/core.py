@@ -6528,6 +6528,109 @@ NATIVE_GEOMETRY_ORDINAL_ATTRIBUTE = "speedtree_native_geometry_ordinal"
 NATIVE_VERTEX_INDEX_ATTRIBUTE = "speedtree_native_vertex_index"
 
 
+def build_native_boneless_rigid_armature(
+    imported,
+    receipt,
+    armature_name="Root",
+    bone_name="Bone_1_Start",
+):
+    """Author the canonical rigid skeleton for a native bone-less FBX.
+
+    SpeedTree intentionally emits some generated plants as geometry-only FBX
+    even though this pipeline hands them to Unreal as skeletal wind assets.
+    The native receipt identifies that exact serializer outcome.  Recreate the
+    long-standing one-axis contract (Root object + Bone_1_Start deform bone)
+    from the imported render bounds and rigid-bind every imported mesh.
+    """
+    write_contract = str((receipt or {}).get("id_zero_cluster_write") or "")
+    if write_contract != "not_applicable_boneless_export":
+        return {
+            "status": "not_required",
+            "id_zero_cluster_write": write_contract or "legacy_unreported",
+        }
+
+    armatures = [obj for obj in imported if obj.type == "ARMATURE"]
+    if armatures:
+        raise RuntimeError(
+            "Native bone-less FBX contract unexpectedly imported armatures: "
+            f"{[obj.name for obj in armatures]}"
+        )
+    if list((receipt or {}).get("bones") or []):
+        raise RuntimeError(
+            "Native bone-less FBX contract unexpectedly contains bone records."
+        )
+
+    meshes = [
+        obj
+        for obj in imported
+        if obj.type == "MESH" and obj.data and len(obj.data.vertices) > 0
+    ]
+    if not meshes:
+        raise RuntimeError(
+            "Native bone-less FBX contract found no imported mesh geometry."
+        )
+    world_points = [
+        obj.matrix_world @ Vector(corner)
+        for obj in meshes
+        for corner in obj.bound_box
+    ]
+    low = Vector((
+        min(point.x for point in world_points),
+        min(point.y for point in world_points),
+        min(point.z for point in world_points),
+    ))
+    high = Vector((
+        max(point.x for point in world_points),
+        max(point.y for point in world_points),
+        max(point.z for point in world_points),
+    ))
+    center = (low + high) * 0.5
+    height = max(high.z - low.z, 0.1)
+
+    armature_data = bpy.data.armatures.new(armature_name)
+    armature = bpy.data.objects.new(armature_name, armature_data)
+    armature["speedtree_native_boneless_binding"] = (
+        "native_boneless_rigid_axis_v1"
+    )
+    bpy.context.scene.collection.objects.link(armature)
+    ensure_object_mode()
+    deselect_all()
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_bone = armature.data.edit_bones.new(bone_name)
+    edit_bone.head = (center.x, center.y, low.z)
+    edit_bone.tail = (center.x, center.y, low.z + height)
+    edit_bone.use_deform = True
+    bpy.ops.object.mode_set(mode="OBJECT")
+    armature.select_set(False)
+
+    for obj in meshes:
+        group = obj.vertex_groups.get(bone_name)
+        if group is None:
+            group = obj.vertex_groups.new(name=bone_name)
+        group.add(list(range(len(obj.data.vertices))), 1.0, "REPLACE")
+        parent_keep_world(obj, armature)
+        modifier = next(
+            (item for item in obj.modifiers if item.type == "ARMATURE"),
+            None,
+        )
+        if modifier is None:
+            modifier = obj.modifiers.new(name=armature_name, type="ARMATURE")
+        modifier.object = armature
+
+    imported.append(armature)
+    return {
+        "status": "applied",
+        "id_zero_cluster_write": write_contract,
+        "binding_policy": "native_boneless_rigid_axis_v1",
+        "armature": armature.name,
+        "bone": bone_name,
+        "meshes": [obj.name for obj in meshes],
+        "vertex_count": sum(len(obj.data.vertices) for obj in meshes),
+    }
+
+
 def restore_omitted_native_root_weights(imported, receipt):
     """Restore only the Root weights the native FBX serializer could not write.
 
@@ -6624,6 +6727,10 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
             "tagged_meshes": [],
         }
     receipt = speedtree_cli.load_native_receipt(receipt_path, spm_path)
+    native_boneless_rigid_binding = build_native_boneless_rigid_armature(
+        imported,
+        receipt,
+    )
     native_root_weight_repair = restore_omitted_native_root_weights(
         imported,
         receipt,
@@ -6674,6 +6781,7 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
     return {
         "status": "ready" if not unresolved else "partial",
         "receipt": str(receipt_path),
+        "native_boneless_rigid_binding": native_boneless_rigid_binding,
         "native_root_weight_repair": native_root_weight_repair,
         "tagged_meshes": tagged,
         "unresolved_meshes": unresolved,
@@ -6764,6 +6872,9 @@ def run_import_source_fbx(
         "native_geometry_identity": native_geometry_identity,
         "native_root_weight_repair": native_geometry_identity.get(
             "native_root_weight_repair", {}
+        ),
+        "native_boneless_rigid_binding": native_geometry_identity.get(
+            "native_boneless_rigid_binding", {}
         ),
         "imported_object_count": len(imported),
         "imported_armature_count": sum(1 for obj in imported if obj.type == "ARMATURE"),
@@ -7568,11 +7679,24 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
     warnings = []
     xml_path = settings.get("xml_path", "")
     if xml_path:
-        xml_bones, xml_info = build_xml_bone_metadata(
-            xml_path,
-            armature,
-            settings.get("xml_trunk_generator_regex", "trunk"),
-        )
+        try:
+            xml_bones, xml_info = build_xml_bone_metadata(
+                xml_path,
+                armature,
+                settings.get("xml_trunk_generator_regex", "trunk"),
+            )
+        except RuntimeError as exc:
+            if "No <Bone> entries" not in str(exc):
+                raise
+            xml_bones, xml_info = build_boneless_rigid_metadata(
+                xml_path,
+                armature,
+                str(exc),
+            )
+            warnings.append(
+                "SpeedTree XML has no bones; emitted the exact native "
+                "bone-less rigid-axis wind mapping"
+            )
 
     # Health check: MegaPlant consumes the per-bone simulation groups, so the
     # JSON is only meaningful ("not hollow") when there is XML and the bones
@@ -7779,6 +7903,59 @@ def parse_speedtree_xml_bones(xml_path):
     if not bones:
         raise RuntimeError(f"No <Bone> entries found in SpeedTree XML: {xml_path}")
     return bones
+
+
+def build_boneless_rigid_metadata(xml_path, armature, reason):
+    binding = str(
+        armature.get("speedtree_native_boneless_binding", "")
+    )
+    bones = list(armature.data.bones)
+    if (
+        binding != "native_boneless_rigid_axis_v1"
+        or len(bones) != 1
+        or bones[0].name != "Bone_1_Start"
+        or bones[0].parent is not None
+    ):
+        raise RuntimeError(
+            "Bone-less SpeedTree XML requires the exact native rigid-axis "
+            "armature contract; found binding="
+            f"{binding!r}, bones={[bone.name for bone in bones]}"
+        )
+    records = [{
+        "name": "Bone_1_Start",
+        "bone_index": 0,
+        "parent_index": -1,
+        "xml_id": None,
+        "generator": "NativeBonelessRigid",
+        "mass": 0.0,
+        "radius": 0.0,
+        "group": 0,
+        "native_role": "boneless_rigid_axis",
+    }]
+    simulation_group = {
+        "index": 0,
+        "generators": ["NativeBonelessRigid"],
+        "is_trunk_group": True,
+        "bone_count": 1,
+        "mean_mass": 0.0,
+        "mean_radius": 0.0,
+    }
+    info = {
+        "source": str(xml_path),
+        "xml_bone_count": 0,
+        "armature_bone_count": 1,
+        "mapping_contract": "native_boneless_rigid_axis_v1",
+        "synthetic": True,
+        "fallback_reason": reason,
+        "generators": {"NativeBonelessRigid": 0},
+        "simulation_groups": [simulation_group],
+        "coordinate_validation": {
+            "tolerance": None,
+            "median_error": None,
+            "max_error": None,
+        },
+    }
+    return records, info
 
 
 def build_simulation_groups(xml_bones, trunk_generator_regex="trunk"):
@@ -9393,6 +9570,9 @@ def run_import_and_assemble(settings):
     reports["import"] = {
         "source_fbx": imported.get("source_fbx", ""),
         "source_identity": imported.get("source_identity", ""),
+        "native_boneless_rigid_binding": imported.get(
+            "native_boneless_rigid_binding", {}
+        ),
         "native_root_weight_repair": imported.get(
             "native_root_weight_repair", {}
         ),

@@ -36,6 +36,66 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             "geometries": [{"ordinal": 0, "vertex_count": 3}],
         }), encoding="utf-8")
 
+    def test_export_fingerprint_changes_with_the_loaded_hook_binary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            hook = root / "speedtree_collision_hook.dll"
+            spm = root / "tree.spm"
+            options = root / "fbx.ini"
+            target = root / "tree.fbx"
+            exe.write_bytes(b"exe")
+            hook.write_bytes(b"hook-v1")
+            spm.write_bytes(b"spm")
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+
+            first, first_inputs = speedtree_cli._input_fingerprint(
+                exe, spm, options, "fbx", target
+            )
+            hook.write_bytes(b"hook-v2")
+            second, second_inputs = speedtree_cli._input_fingerprint(
+                exe, spm, options, "fbx", target
+            )
+
+            self.assertNotEqual(first, second)
+            self.assertNotEqual(
+                first_inputs["speedtree_hook"]["sha256"],
+                second_inputs["speedtree_hook"]["sha256"],
+            )
+
+    def test_zero_geometry_native_receipt_is_valid(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spm = root / "tree.spm"
+            spm.write_bytes(b"spm")
+            stat = spm.stat()
+            receipt = root / "tree.speedtree_native_receipt.json"
+            receipt.write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "kind": "speedtree_native_export_receipt",
+                    "status": "ready",
+                    "source": {
+                        "path": str(spm.resolve()),
+                        "size": stat.st_size,
+                        "last_write_time_100ns": (
+                            stat.st_mtime_ns // 100
+                            + 116444736000000000
+                        ),
+                    },
+                    "geometry_count": 0,
+                    "geometries": [],
+                }),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                speedtree_cli._native_receipt_is_valid(receipt, spm)
+            )
+
     def test_native_receipt_is_promoted_and_required_by_fbx_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -44,6 +104,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             fbx_options = root / "fbx.ini"
             xml_options = root / "xml.ini"
             exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
             spm.write_bytes(b"spm")
             preset = "[Options]\nTextureSkipWriting=true\n"
             fbx_options.write_text(preset, encoding="utf-8")
@@ -100,6 +161,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             fbx_options = root / "fbx.ini"
             xml_options = root / "xml.ini"
             exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
             spm.write_bytes(b"spm")
             preset = "[Options]\nTextureSkipWriting=true\n"
             fbx_options.write_text(preset, encoding="utf-8")
@@ -161,6 +223,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             fbx_options = root / "fbx.ini"
             xml_options = root / "xml.ini"
             exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
             spm.write_bytes(b"spm")
             preset = "[Options]\nTextureSkipWriting=true\n"
             fbx_options.write_text(preset, encoding="utf-8")
@@ -218,6 +281,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             options = root / "fbx.ini"
             target = root / "out" / "tree.fbx"
             exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
             spm.write_bytes(b"spm")
             options.write_text(
                 "[Options]\nTextureSkipWriting=true\n", encoding="utf-8"
@@ -259,6 +323,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             fbx = root / "out" / "fbx" / "tree.fbx"
             xml = root / "out" / "xml" / "tree.xml"
             exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
             spm.write_bytes(b"spm")
             preset = "[Options]\nTextureSkipWriting=true\n"
             fbx_options.write_text(preset, encoding="utf-8")

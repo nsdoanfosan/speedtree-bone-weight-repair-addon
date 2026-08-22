@@ -137,6 +137,53 @@ def material_names(obj):
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
+boneless_material = bpy.data.materials.new("M_NativeBoneless")
+boneless_mesh = make_mesh_object("NativeBoneless", [boneless_material])
+boneless_imported = [boneless_mesh]
+boneless_result = core.build_native_boneless_rigid_armature(
+    boneless_imported,
+    {
+        "id_zero_cluster_write": "not_applicable_boneless_export",
+        "bones": [],
+    },
+)
+assert boneless_result["status"] == "applied", boneless_result
+assert boneless_result["binding_policy"] == "native_boneless_rigid_axis_v1"
+boneless_armature = bpy.data.objects[boneless_result["armature"]]
+assert [bone.name for bone in boneless_armature.data.bones] == [
+    "Bone_1_Start"
+]
+boneless_group = boneless_mesh.vertex_groups["Bone_1_Start"]
+assert all(
+    boneless_group.weight(vertex.index) == 1.0
+    for vertex in boneless_mesh.data.vertices
+)
+assert boneless_mesh.parent == boneless_armature
+assert [
+    modifier.object
+    for modifier in boneless_mesh.modifiers
+    if modifier.type == "ARMATURE"
+] == [boneless_armature]
+boneless_records, boneless_info = core.build_boneless_rigid_metadata(
+    "boneless.xml",
+    boneless_armature,
+    "No <Bone> entries found",
+)
+assert boneless_records == [{
+    "name": "Bone_1_Start",
+    "bone_index": 0,
+    "parent_index": -1,
+    "xml_id": None,
+    "generator": "NativeBonelessRigid",
+    "mass": 0.0,
+    "radius": 0.0,
+    "group": 0,
+    "native_role": "boneless_rigid_axis",
+}]
+assert boneless_info["mapping_contract"] == "native_boneless_rigid_axis_v1"
+
+bpy.ops.wm.read_factory_settings(use_empty=True)
+
 with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     root = Path(temporary)
     source_fbx = root / "shared" / "fbx" / "SK_Runtime.fbx"
