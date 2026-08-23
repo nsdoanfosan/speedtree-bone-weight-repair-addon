@@ -117,129 +117,45 @@ with tempfile.TemporaryDirectory(
     shared = bpy.data.objects.new("SharedBeforeCopy", merged.data)
     bpy.context.scene.collection.objects.link(shared)
 
+    try:
+        core.normalize_merged_speedtree_placeholder_material(
+            merged, contract([default_intent, bark_intent])
+        )
+    except RuntimeError as exc:
+        assert "faces assigned" in str(exc), exc
+    else:
+        raise AssertionError("face-assigned Default material was auto-remapped")
+    assert merged.data is shared.data
+    assert list(merged.data.materials) == [default_material, bark_material]
+    assert [poly.material_index for poly in merged.data.polygons] == [0, 1]
+
+    unused_default = mesh_object(
+        "UnusedDefault", [default_material, bark_material]
+    )
+    for polygon in unused_default.data.polygons:
+        polygon.material_index = 1
     result = core.normalize_merged_speedtree_placeholder_material(
-        merged, contract([default_intent, bark_intent])
+        unused_default, contract([default_intent, bark_intent])
     )
     assert result["status"] == "applied", result
-    assert result["changed_face_count"] == 1, result
-    assert merged.data is not shared.data
-    assert list(merged.data.materials) == [bark_material]
-    assert [poly.material_index for poly in merged.data.polygons] == [0, 0]
+    assert result["changed_face_count"] == 0, result
+    assert result["proof"] == "unused_strict_stmat_default_slot_removed"
+    assert list(unused_default.data.materials) == [bark_material]
+    assert [poly.material_index for poly in unused_default.data.polygons] == [0, 0]
     assert list(shared.data.materials) == [default_material, bark_material]
     assert core.normalize_merged_speedtree_placeholder_material(
-        merged, contract([default_intent, bark_intent])
+        unused_default, contract([default_intent, bark_intent])
     )["status"] == "not_applicable"
 
     none_merged = mesh_object("NoneMerged", [None, bark_material])
-    none_result = core.normalize_merged_speedtree_placeholder_material(
-        none_merged, contract([default_intent, bark_intent])
-    )
-    assert none_result["status"] == "applied", none_result
-    assert list(none_merged.data.materials) == [bark_material]
-
-    missing_candidate = mesh_object("MissingCandidate", [default_material])
-    missing_before = list(missing_candidate.data.materials)
-    missing_result = core.normalize_merged_speedtree_placeholder_material(
-        missing_candidate, contract([default_intent])
-    )
-    assert missing_result["status"] == "not_applicable", missing_result
-    assert missing_result["candidate_count"] == 0, missing_result
-    assert missing_result["reason"] == (
-        "no_semantic_bark_candidate_preserved_default"
-    ), missing_result
-    assert list(missing_candidate.data.materials) == missing_before
-
-    second_binding = ready_binding(texture_dir, "T_bark_other")
-    second_material = bpy.data.materials.new("M_bark_other")
-    second_material[core.UNREAL_TREE_PART_PROPERTY] = "bark"
-    second_intent = intent(
-        api,
-        2,
-        "M_bark_other_Mat",
-        tree_part="bark",
-        mode="managed_texture_set",
-        binding=second_binding,
-    )
-    ambiguous = mesh_object(
-        "AmbiguousCandidate",
-        [default_material, bark_material, second_material],
-    )
-    ambiguous_result = core.normalize_merged_speedtree_placeholder_material(
-        ambiguous,
-        contract([default_intent, bark_intent, second_intent]),
-    )
-    assert ambiguous_result["status"] == "applied", ambiguous_result
-    assert ambiguous_result["candidate_count"] == 2, ambiguous_result
-    assert ambiguous_result["target_material"] == bark_material.name
-    assert ambiguous_result["candidate_material_slots"] == [1, 2]
-    assert ambiguous_result["selection_policy"] == (
-        "first_semantic_bark_in_material_slot_order"
-    )
-    assert list(ambiguous.data.materials) == [bark_material, second_material]
-    assert [poly.material_index for poly in ambiguous.data.polygons] == [0, 0]
-
-    runtime_missing = mesh_object("RuntimeMissingCandidate", [default_material])
-    runtime_missing_before = list(runtime_missing.data.materials)
-    runtime_missing_result = (
+    try:
         core.normalize_merged_speedtree_placeholder_material(
-            runtime_missing,
-            contract([default_intent], runtime_tolerant=True),
+            none_merged, contract([default_intent, bark_intent])
         )
-    )
-    assert runtime_missing_result["status"] == "not_applicable"
-    assert runtime_missing_result["candidate_count"] == 0
-    assert list(runtime_missing.data.materials) == runtime_missing_before
-
-    runtime_ambiguous = mesh_object(
-        "RuntimeAmbiguousCandidate",
-        [default_material, bark_material, second_material],
-    )
-    runtime_ambiguous_result = (
-        core.normalize_merged_speedtree_placeholder_material(
-            runtime_ambiguous,
-            contract(
-                [default_intent, bark_intent, second_intent],
-                runtime_tolerant=True,
-            ),
-        )
-    )
-    assert runtime_ambiguous_result["status"] == "applied"
-    assert runtime_ambiguous_result["candidate_count"] == 2
-    assert runtime_ambiguous_result["target_material"] == bark_material.name
-    assert runtime_ambiguous_result["proof"] == (
-        "runtime_stmat_default_to_first_semantic_bark"
-    )
-    assert list(runtime_ambiguous.data.materials) == [
-        bark_material,
-        second_material,
-    ]
-
-    unassigned_bark_intent = intent(
-        api,
-        1,
-        "M_bark_safe_Mat",
-        tree_part="bark",
-        mode="unresolved",
-        binding={"status": "unassigned", "files": {}},
-    )
-    runtime_unique = mesh_object(
-        "RuntimeUniqueSemanticBark",
-        [default_material, bark_material],
-    )
-    runtime_unique_result = (
-        core.normalize_merged_speedtree_placeholder_material(
-            runtime_unique,
-            contract(
-                [default_intent, unassigned_bark_intent],
-                runtime_tolerant=True,
-            ),
-        )
-    )
-    assert runtime_unique_result["status"] == "applied", runtime_unique_result
-    assert list(runtime_unique.data.materials) == [bark_material]
-    assert runtime_unique_result["proof"] == (
-        "runtime_stmat_default_to_unique_semantic_bark"
-    )
+    except RuntimeError as exc:
+        assert "faces assigned" in str(exc), exc
+    else:
+        raise AssertionError("face-assigned None placeholder was auto-remapped")
 
     unknown_none = mesh_object("UnknownNone", [bark_material, None])
     unknown_before = list(unknown_none.data.materials)

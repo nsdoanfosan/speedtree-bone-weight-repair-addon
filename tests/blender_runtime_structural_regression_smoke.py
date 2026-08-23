@@ -195,9 +195,8 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     source_spm = root / "shared" / "SK_Runtime.spm"
     source_spm.write_bytes(b"current-spm-fixture")
 
-    # SpeedTree can export collision/unused geometry as a no-slot Default
-    # object. It must be discarded before Blender join can silently assign its
-    # faces to the first production material (including a cluster material).
+    # A no-slot native FBX mesh can be the complete authored skinned plant.
+    # Slot absence alone must never delete geometry.
     cleanup_material = bpy.data.materials.new("M_cluster_Runtime_01")
     cleanup_renderable = make_mesh_object(
         "CleanupRenderable", [cleanup_material]
@@ -215,14 +214,14 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         spm_path=str(source_spm),
         source_fbx_path=str(source_fbx),
     )
-    assert cleanup_result["status"] == "applied", cleanup_result
-    assert cleanup_result["cleanup_contract_version"] == 3, cleanup_result
+    assert cleanup_result["status"] == "not_applicable", cleanup_result
+    assert cleanup_result["cleanup_contract_version"] == 4, cleanup_result
     assert cleanup_result["inspected_mesh_object_count"] == 2, cleanup_result
-    assert cleanup_result["changed_object_count"] == 1, cleanup_result
-    assert cleanup_result["removed_object_count"] == 1, cleanup_result
-    assert cleanup_result["removed_face_count"] == 1, cleanup_result
-    assert cleanup_result["removed_objects"] == ["Default"], cleanup_result
-    assert bpy.data.objects.get("Default") is None
+    assert cleanup_result["changed_object_count"] == 0, cleanup_result
+    assert cleanup_result["removed_object_count"] == 0, cleanup_result
+    assert cleanup_result["removed_face_count"] == 0, cleanup_result
+    assert cleanup_result["removed_objects"] == [], cleanup_result
+    assert bpy.data.objects.get("Default") is cleanup_unassigned
     assert len(cleanup_renderable.data.polygons) == 1
     assert core.renderable_geometry_evidence([cleanup_renderable]) == {
         "status": "ok",
