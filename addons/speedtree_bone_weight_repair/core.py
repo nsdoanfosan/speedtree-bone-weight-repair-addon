@@ -6205,7 +6205,7 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
     "discard_unassigned_geometry_before_assembly"
 )
-UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 3
+UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 4
 UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS = frozenset({
     "default",
     "material",
@@ -6276,10 +6276,15 @@ def _cleanup_live_identity(texture_contract, spm_path, source_fbx_path):
 def _cleanup_face_reason(polygon, materials, texture_contract):
     slot_index = int(polygon.material_index)
     if slot_index < 0 or slot_index >= len(materials):
-        return "material_slot_out_of_range"
+        # A native FBX with no exported material slots can still contain the
+        # complete authored skinned plant.  Slot absence says nothing about
+        # whether the geometry is a collision/dummy mesh, so it is never
+        # deletion authority.  Only an explicit, current STMAT-backed generic
+        # placeholder below may be discarded.
+        return ""
     material = materials[slot_index]
     if material is None:
-        return "empty_material_slot"
+        return ""
     placeholder_key = _cleanup_placeholder_material_key(
         material,
         texture_contract,
@@ -6368,11 +6373,9 @@ def discard_unassigned_geometry_before_assembly(
 ):
     """Discard only Full-FBX faces with a proven generic dummy material.
 
-    This runs before Blender joins material-grouped imports. Otherwise a
-    no-slot object is silently mapped to the first valid join material, which
-    can make collision/unused geometry masquerade as cluster planes.  Exact
-    current STMAT evidence admits source-empty ``Default`` and ``Material``;
-    a name by itself never authorizes deletion.
+    This runs before Blender joins material-grouped imports. Exact current
+    STMAT evidence admits source-empty ``Default`` and ``Material``; a generic
+    name, an empty slot, or no slots at all never authorizes deletion.
     """
     mesh_objects = [
         obj
@@ -8252,13 +8255,15 @@ def _is_semantic_bark_intent(intent):
 def normalize_merged_speedtree_placeholder_material(
     merged_obj, texture_contract=None
 ):
-    """Replace a proven Default/None slot with a deterministic bark slot.
+    """Remove an unused proven Default/None slot without inventing semantics.
 
     This is deliberately a post-merge operation.  The final mesh's real
     material slots are the mutation boundary, while the strict preflight
     envelope supplies the only accepted semantic evidence.  No material name
     other than the central exact ``default`` key is treated as a placeholder,
     and a ``None`` slot is accepted only at the one STMAT Default ordinal.
+    A face assigned to that slot is an authored/exported defect and is rejected;
+    it is never reassigned to bark or any other guessed material.
     """
     if not isinstance(texture_contract, dict) or not texture_contract.get(
         "strict_speedtree_pipeline_contract"
@@ -8339,61 +8344,34 @@ def normalize_merged_speedtree_placeholder_material(
         )
         raise RuntimeError(message)
 
-    candidate_materials = []
-    seen_candidates = set()
-    for slot_index, material in enumerate(old_materials):
-        if material is None or material.as_pointer() in seen_candidates:
-            continue
-        if str(material.get(UNREAL_TREE_PART_PROPERTY) or "") != "bark":
-            continue
-        matching = _strict_material_intents_for_name(material.name, envelope)
-        if len(matching) != 1 or not (
-            _is_semantic_bark_intent(matching[0])
-            if runtime_tolerant
-            else _is_ready_managed_bark_intent(matching[0])
-        ):
-            continue
-        seen_candidates.add(material.as_pointer())
-        candidate_materials.append((slot_index, material))
-    if not candidate_materials:
-        return {
-            "status": "not_applicable",
-            "reason": "no_semantic_bark_candidate_preserved_default",
-            "placeholder_slots": placeholder_slots,
-            "candidate_count": 0,
-            "selection_policy": "preserve_default_without_semantic_bark",
-        }
-    target_slot_index, target_material = candidate_materials[0]
-    candidate_count = len(candidate_materials)
+    mesh = merged_obj.data
+    placeholder_set = set(placeholder_slots)
+    material_indices = mesh_polygon_material_indices(mesh)
+    assigned_placeholder_faces = int(
+        np.count_nonzero(
+            np.isin(material_indices, tuple(placeholder_set))
+        )
+    )
+    if assigned_placeholder_faces:
+        raise RuntimeError(
+            "SpeedTree source defect: final mesh contains faces assigned to "
+            "a generic Default material slot; repair the SPM material "
+            "assignment instead of remapping it during Assembly"
+        )
 
     if merged_obj.data.users > 1:
         merged_obj.data = merged_obj.data.copy()
-    mesh = merged_obj.data
+        mesh = merged_obj.data
+        material_indices = mesh_polygon_material_indices(mesh)
     old_materials = list(mesh.materials)
-    placeholder_set = set(placeholder_slots)
     new_materials = []
     slot_map = {}
-    target_new_index = None
     for old_index, material in enumerate(old_materials):
         if old_index in placeholder_set:
             continue
         new_index = len(new_materials)
         new_materials.append(material)
         slot_map[old_index] = new_index
-        if material is target_material and target_new_index is None:
-            target_new_index = new_index
-    if target_new_index is None:
-        raise RuntimeError(
-            "Managed bark candidate disappeared before placeholder remap"
-        )
-    for slot_index in placeholder_slots:
-        slot_map[slot_index] = target_new_index
-    material_indices = mesh_polygon_material_indices(mesh)
-    changed_faces = int(
-        np.count_nonzero(
-            np.isin(material_indices, tuple(placeholder_set))
-        )
-    )
     remap_mesh_materials(
         mesh,
         slot_map,
@@ -8402,31 +8380,10 @@ def normalize_merged_speedtree_placeholder_material(
     )
     return {
         "status": "applied",
-        "proof": (
-            (
-                "runtime_stmat_default_to_unique_semantic_bark"
-                if candidate_count == 1
-                else "runtime_stmat_default_to_first_semantic_bark"
-            )
-            if runtime_tolerant
-            else (
-                "strict_stmat_default_to_unique_managed_bark"
-                if candidate_count == 1
-                else "strict_stmat_default_to_first_managed_bark"
-            )
-        ),
+        "proof": "unused_strict_stmat_default_slot_removed",
         "placeholder_slots": placeholder_slots,
-        "target_material": target_material.name,
-        "target_material_slot": target_slot_index,
-        "candidate_count": candidate_count,
-        "candidate_material_slots": [
-            slot_index for slot_index, _material in candidate_materials
-        ],
-        "candidate_materials": [
-            material.name for _slot_index, material in candidate_materials
-        ],
-        "selection_policy": "first_semantic_bark_in_material_slot_order",
-        "changed_face_count": changed_faces,
+        "selection_policy": "remove_only_when_no_faces_use_placeholder",
+        "changed_face_count": 0,
         "material_count_before": len(old_materials),
         "material_count_after": len(mesh.materials),
     }
