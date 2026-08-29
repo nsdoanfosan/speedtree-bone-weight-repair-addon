@@ -6839,12 +6839,69 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
     }
 
 
+RAW_IMPORT_OBSERVER_DATA_COLLECTIONS = (
+    "meshes",
+    "armatures",
+    "materials",
+    "images",
+    "actions",
+)
+
+
+def snapshot_raw_import_observer_data():
+    """Capture only the datablocks an FBX import may orphan on rollback."""
+    return {
+        name: {value.as_pointer() for value in getattr(bpy.data, name)}
+        for name in RAW_IMPORT_OBSERVER_DATA_COLLECTIONS
+    }
+
+
+def rollback_raw_import_observer(imported_objects, data_snapshot):
+    """Remove a raw import after a pre-mutation observer rejects it."""
+    for obj in list(imported_objects):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except ReferenceError:
+            continue
+    for name in RAW_IMPORT_OBSERVER_DATA_COLLECTIONS:
+        collection = getattr(bpy.data, name)
+        previous = data_snapshot.get(name, set())
+        for value in list(collection):
+            try:
+                is_new = value.as_pointer() not in previous
+                has_no_users = value.users == 0
+            except ReferenceError:
+                continue
+            if is_new and has_no_users:
+                collection.remove(value)
+
+
+def observe_raw_import_before_mutation(
+    raw_import_observer,
+    imported_objects,
+    source_fbx_path,
+    data_snapshot,
+):
+    """Expose an exact raw FBX import and fail closed if inspection rejects it."""
+    if raw_import_observer is None:
+        return None
+    try:
+        return raw_import_observer(
+            imported_objects,
+            Path(source_fbx_path).resolve(),
+        )
+    except Exception:
+        rollback_raw_import_observer(imported_objects, data_snapshot)
+        raise
+
+
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
     spm_path="",
     texture_contract=None,
     source_identity_path="",
+    raw_import_observer=None,
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -6853,8 +6910,29 @@ def run_import_source_fbx(
         texture_contract = _bat_runtime_texture_contract(None)
 
     before = {obj.name for obj in bpy.data.objects}
-    bpy.ops.import_scene.fbx(filepath=str(path))
+    observer_data_snapshot = (
+        snapshot_raw_import_observer_data()
+        if raw_import_observer is not None
+        else None
+    )
+    import_operator_result = bpy.ops.import_scene.fbx(filepath=str(path))
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
+    if (
+        raw_import_observer is not None
+        and "FINISHED" not in import_operator_result
+    ):
+        rollback_raw_import_observer(imported, observer_data_snapshot)
+        raise RuntimeError(
+            f"Raw FBX observer import returned {import_operator_result}"
+        )
+    for obj in imported:
+        obj["codex_source_fbx"] = str(path)
+    observe_raw_import_before_mutation(
+        raw_import_observer,
+        imported,
+        path,
+        observer_data_snapshot,
+    )
     native_geometry_identity = tag_native_export_geometry(
         imported,
         path,
@@ -6865,7 +6943,6 @@ def run_import_source_fbx(
     # stray source objects there would split the asset into multiple FBX files.
     source_collection = ensure_scene_collection(source_collection_name)
     for obj in imported:
-        obj["codex_source_fbx"] = str(path)
         if source_identity_path:
             obj["codex_source_identity"] = str(source_identity_path)
         ensure_only_collection(obj, source_collection)
@@ -9440,7 +9517,7 @@ def clear_previous_codex_build(settings):
     }
 
 
-def run_import_and_assemble(settings):
+def run_import_and_assemble(settings, raw_import_observer=None):
     # settings must already carry source_fbx_path (and ideally xml_path) from the
     # SpeedTree export step. Wipes the previous build, re-imports, re-runs the
     # assembly pipeline. Pressing the button again is a clean update.
@@ -9462,6 +9539,7 @@ def run_import_and_assemble(settings):
         spm_path=settings.get("spm_path", ""),
         texture_contract=texture_contract,
         source_identity_path=settings.get("source_identity_path", ""),
+        raw_import_observer=raw_import_observer,
     )
     import_duration = perf_counter() - import_started
     if authorized_dummy_cleanup_left_no_renderable_geometry(imported):
