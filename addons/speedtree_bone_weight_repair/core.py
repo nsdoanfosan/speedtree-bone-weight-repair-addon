@@ -279,6 +279,7 @@ def run_speedtree_cli_export(
             raise RuntimeError(f"SpeedTree {kind.upper()} export options INI does not exist: {options}")
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
+    spm_bone_policy = speedtree_cli.ensure_minimum_absolute_branch_bones(spm)
     if (
         len(targets) == 2
         and exe.name.casefold() == "speedtree_collision_cli.exe"
@@ -323,6 +324,7 @@ def run_speedtree_cli_export(
         "export_options": export_options,
         "output_root": str(root),
         "name_stem": stem,
+        "spm_bone_policy": spm_bone_policy,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "force_reexport_requested": bool(force_reexport),
         "export_bundle_mtime_sync": bundle_mtime_sync,

@@ -9,9 +9,11 @@ waits only for the process handle.
 
 import ctypes
 import codecs
+import gzip
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -21,6 +23,7 @@ import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +73,255 @@ _NATIVE_SYNTHETIC_BONE_ID_START = 10000
 _NATIVE_TO_XML_COORDINATE_SCALE = 30.48
 _NATIVE_TO_XML_COORDINATE_SCALE_TOLERANCE = 1.0e-9
 _XML_SYNTHETIC_COORDINATE_TOLERANCE = 0.1
+_SPM_MINIMUM_BONE_GENERATOR_TYPES = {
+    "branch",
+    "spline branch",
+    "splinebranch",
+}
+
+
+def _root_direct_element_byte_spans(xml_bytes, element_name):
+    """Return exact UTF-8 byte spans for one root-direct XML element type."""
+    parser = expat.ParserCreate()
+    depth = 0
+    open_starts = []
+    spans = []
+
+    def start(name, _attributes):
+        nonlocal depth
+        if depth == 1 and name == element_name:
+            open_starts.append(parser.CurrentByteIndex)
+        depth += 1
+
+    def end(name):
+        nonlocal depth
+        depth -= 1
+        if depth == 1 and name == element_name:
+            if not open_starts:
+                raise RuntimeError(
+                    f"SpeedTree XML closed {element_name} without a root-direct start"
+                )
+            closing_start = parser.CurrentByteIndex
+            closing_end = xml_bytes.find(b">", closing_start)
+            if closing_end < 0:
+                raise RuntimeError(
+                    f"SpeedTree XML has an incomplete {element_name} closing tag"
+                )
+            spans.append((open_starts.pop(), closing_end + 1))
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.Parse(xml_bytes, True)
+    if open_starts:
+        raise RuntimeError(
+            f"SpeedTree XML has an unclosed root-direct {element_name} section"
+        )
+    return spans
+
+
+def _spm_property_value_element(generator, property_name):
+    for element in generator.iter():
+        name = element.find("Name")
+        if name is None or str(name.text or "") != property_name:
+            continue
+        value = element.find("Value")
+        if value is None:
+            raise RuntimeError(
+                f"SpeedTree property has no Value element: {property_name}"
+            )
+        return value
+    return None
+
+
+def _is_cluster_source_spm(spm):
+    spm = Path(spm)
+    return (
+        spm.parent.name.casefold() == "cluster"
+        or spm.stem.casefold().startswith("sk_cluster_")
+    )
+
+
+def ensure_minimum_absolute_branch_bones(spm):
+    """Persist the non-Cluster Branch/Spline-Branch minimum-bone policy.
+
+    Every parsed zero-bone Branch generator is authored as Absolute/1 before
+    Modeler sees it.  This is an SPM data repair, not a post-export Blender
+    approximation.  Cluster providers deliberately retain their historical
+    single reference-axis policy and are never modified here.
+    """
+    spm = Path(spm).resolve()
+    if _is_cluster_source_spm(spm):
+        return {
+            "status": "excluded_cluster_source",
+            "spm": str(spm),
+            "changed": False,
+            "changed_generator_count": 0,
+            "changed_generators": [],
+            "backup": "",
+        }
+
+    original = spm.read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    compressed = original.startswith(b"\x1f\x8b")
+    try:
+        xml_bytes = gzip.decompress(original) if compressed else original
+        text = xml_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"SpeedTree SPM is not readable UTF-8 XML: {spm}") from exc
+
+    try:
+        section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Generators"
+        )
+    except (expat.ExpatError, RuntimeError) as exc:
+        raise RuntimeError(
+            "SpeedTree SPM document is not valid writable XML: " + str(spm)
+        ) from exc
+    if len(section_spans) != 1:
+        raise RuntimeError(
+            "SpeedTree SPM requires exactly one root Generators section: "
+            + str(spm)
+        )
+    section_start, section_end = section_spans[0]
+    try:
+        generators = ET.fromstring(xml_bytes[section_start:section_end])
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "SpeedTree SPM root Generators section is not valid XML: "
+            + str(spm)
+        ) from exc
+
+    changed_generators = []
+    for generator in generators.findall("Generator"):
+        generator_type = str(generator.attrib.get("Type") or "").strip()
+        if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        bones_value = _spm_property_value_element(
+            generator, "Physics:Bones"
+        )
+        if bones_value is None:
+            continue
+        try:
+            bones_before = float(str(bones_value.text or "").strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                "SpeedTree Branch generator has an invalid Physics:Bones value: "
+                + str(generator.findtext("Name") or "?")
+            ) from exc
+        if not math.isfinite(bones_before):
+            raise RuntimeError(
+                "SpeedTree Branch generator has a non-finite Physics:Bones value: "
+                + str(generator.findtext("Name") or "?")
+            )
+        if not (bones_before <= 0.0):
+            continue
+        style_value = _spm_property_value_element(
+            generator, "Physics:Bone style"
+        )
+        if style_value is None:
+            raise RuntimeError(
+                "Zero-bone SpeedTree Branch generator has no Physics:Bone style: "
+                + str(generator.findtext("Name") or "?")
+            )
+        style_before = str(style_value.text or "").strip()
+        style_value.text = "0"
+        bones_value.text = "1"
+        changed_generators.append({
+            "guid": str(generator.findtext("GUID") or ""),
+            "name": str(generator.findtext("Name") or "?"),
+            "type": generator_type,
+            "hidden": str(generator.findtext("Hidden") or "").casefold()
+            == "true",
+            "before": {
+                "bone_style": style_before,
+                "bones": bones_before,
+            },
+            "after": {
+                "bone_style": 0,
+                "bones": 1,
+            },
+        })
+
+    if not changed_generators:
+        return {
+            "status": "already_compliant",
+            "spm": str(spm),
+            "changed": False,
+            "changed_generator_count": 0,
+            "changed_generators": [],
+            "backup": "",
+            "source_sha256": original_sha256,
+        }
+
+    rendered_generators = ET.tostring(
+        generators, encoding="utf-8", short_empty_elements=True
+    )
+    updated_xml = (
+        xml_bytes[:section_start]
+        + rendered_generators
+        + xml_bytes[section_end:]
+    )
+    try:
+        ET.fromstring(updated_xml)
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "Minimum-bone SPM candidate failed full XML validation: " + str(spm)
+        ) from exc
+    updated = (
+        gzip.compress(updated_xml, compresslevel=9, mtime=0)
+        if compressed
+        else updated_xml
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_root = (
+        spm.parent
+        / "_spm_backups"
+        / f"minimum_absolute_branch_bones_{timestamp}_{original_sha256[:8]}"
+    )
+    backup_root.mkdir(parents=True, exist_ok=False)
+    backup = backup_root / spm.name
+    backup.write_bytes(original)
+    if hashlib.sha256(backup.read_bytes()).hexdigest() != original_sha256:
+        raise RuntimeError("Minimum-bone SPM backup hash verification failed")
+
+    if spm.read_bytes() != original:
+        raise RuntimeError(
+            "SpeedTree SPM changed while minimum-bone repair was computed: "
+            + str(spm)
+        )
+    temporary = spm.with_name(
+        f".{spm.name}.minimum-bones-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary.write_bytes(updated)
+        check_raw = temporary.read_bytes()
+        check_xml = (
+            gzip.decompress(check_raw) if compressed else check_raw
+        ).decode("utf-8")
+        ET.fromstring(check_xml)
+        os.replace(temporary, spm)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    persisted = spm.read_bytes()
+    if persisted != updated:
+        raise RuntimeError("Minimum-bone SPM persisted bytes did not verify")
+    return {
+        "status": "updated",
+        "spm": str(spm),
+        "changed": True,
+        "changed_generator_count": len(changed_generators),
+        "changed_generators": changed_generators,
+        "backup": str(backup),
+        "source_sha256": original_sha256,
+        "updated_sha256": hashlib.sha256(persisted).hexdigest(),
+        "compressed": compressed,
+        "policy": "non_cluster_zero_bone_branch_to_absolute_one_v1",
+    }
 
 
 @contextmanager
@@ -659,13 +911,31 @@ def _synthetic_generator(receipt, bone, xml_root, xml_bones):
     return next(iter(names)), {"proof": proof, "generator_guid": guid}
 
 
+def _parse_speedtree_xml_float(value):
+    """Parse Modeler XML numbers independently of the Windows UI locale."""
+    text = str(value).strip()
+    if "," in text:
+        if "." in text or text.count(",") != 1:
+            raise ValueError(f"ambiguous SpeedTree XML number: {text}")
+        text = text.replace(",", ".")
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite SpeedTree XML number: {text}")
+    return number
+
+
 def _validate_synthetic_xml_bone(element, bone, scale):
     bone_id = int(bone["id"])
     try:
         if int(element.attrib.get("ParentID", "-1")) != int(bone["parent_id"]) - 1:
             raise ValueError("parent mismatch")
         for prefix, key in (("Start", "start_native"), ("End", "end_native")):
-            actual = [float(element.attrib[f"{prefix}{axis}"]) for axis in "XYZ"]
+            actual = [
+                _parse_speedtree_xml_float(
+                    element.attrib[f"{prefix}{axis}"]
+                )
+                for axis in "XYZ"
+            ]
             expected = [float(value) * scale for value in bone[key]]
             if max(abs(a - b) for a, b in zip(actual, expected)) > (
                 _XML_SYNTHETIC_COORDINATE_TOLERANCE

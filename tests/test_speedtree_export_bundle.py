@@ -152,6 +152,29 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertEqual(second["status"], "already_reconciled")
             self.assertEqual(xml.read_bytes(), first_bytes)
 
+    def test_reconcile_accepts_modeler_decimal_comma_coordinates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spm = root / "tree.spm"
+            xml = root / "tree.xml"
+            receipt = root / "tree.speedtree_native_receipt.json"
+            spm.write_bytes(b"spm")
+            xml.write_bytes(self._root_like_xml_bytes())
+            self._write_synthetic_native_receipt(receipt, spm)
+            speedtree_cli.reconcile_xml_with_native_receipt(
+                xml, receipt, spm, create_backup=False
+            )
+            xml.write_bytes(
+                xml.read_bytes().replace(b'EndZ="30.48"', b'EndZ="30,48"')
+            )
+
+            result = speedtree_cli.reconcile_xml_with_native_receipt(
+                xml, receipt, spm, create_backup=False
+            )
+
+            self.assertEqual(result["status"], "already_reconciled")
+            self.assertFalse(result["changed"])
+
     def test_reconcile_fails_closed_for_an_ordinary_missing_bone(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
