@@ -6205,7 +6205,7 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
     "discard_unassigned_geometry_before_assembly"
 )
-UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 4
+UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 5
 UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS = frozenset({
     "default",
     "material",
@@ -6296,6 +6296,34 @@ def _cleanup_face_reason(polygon, materials, texture_contract):
     return ""
 
 
+def _cleanup_materialless_object_key(obj, texture_contract):
+    """Prove an exact material-less Default/Material FBX dummy from STMAT."""
+    if obj is None or not isinstance(texture_contract, dict):
+        return ""
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        return ""
+    api = handoff_contract.central_contract_api()
+    object_base = api.production_group_base_name(obj.name)
+    object_key = api.normalize_material_key(object_base)
+    if object_key not in UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS:
+        return ""
+    matches = _strict_material_intents_for_name(object_base, envelope)
+    if len(matches) != 1:
+        return ""
+    intent = matches[0]
+    binding = intent.get("texture_binding")
+    files = binding.get("files") if isinstance(binding, dict) else None
+    if (
+        api.normalize_material_key(intent.get("material_key")) != object_key
+        or str(intent.get("texture_source_mode") or "")
+        == "managed_texture_set"
+        or files
+    ):
+        return ""
+    return object_key
+
+
 def renderable_geometry_evidence(objects):
     meshes = [
         obj
@@ -6375,7 +6403,9 @@ def discard_unassigned_geometry_before_assembly(
 
     This runs before Blender joins material-grouped imports. Exact current
     STMAT evidence admits source-empty ``Default`` and ``Material``; a generic
-    name, an empty slot, or no slots at all never authorizes deletion.
+    name or an empty slot never authorizes deletion.  A material-less object is
+    deleted only when its exact Default/Material object identity is backed by
+    one current unmanaged, source-empty STMAT intent.
     """
     mesh_objects = [
         obj
@@ -6392,15 +6422,29 @@ def discard_unassigned_geometry_before_assembly(
     candidates = []
     for obj in mesh_objects:
         materials = list(obj.data.materials)
-        invalid = [
-            (int(polygon.index), reason)
-            for polygon in obj.data.polygons
-            if (
-                reason := _cleanup_face_reason(
-                    polygon, materials, texture_contract
+        materialless_key = (
+            _cleanup_materialless_object_key(obj, texture_contract)
+            if not materials
+            else ""
+        )
+        if materialless_key:
+            invalid = [
+                (
+                    int(polygon.index),
+                    f"canonical_unmanaged_{materialless_key}_object_without_slots",
                 )
-            )
-        ]
+                for polygon in obj.data.polygons
+            ]
+        else:
+            invalid = [
+                (int(polygon.index), reason)
+                for polygon in obj.data.polygons
+                if (
+                    reason := _cleanup_face_reason(
+                        polygon, materials, texture_contract
+                    )
+                )
+            ]
         if invalid:
             candidates.append((obj, materials, invalid))
 
@@ -8237,64 +8281,8 @@ def _is_unmanaged_empty_default_intent(intent):
     )
 
 
-def _is_ready_managed_bark_intent(intent):
-    binding = intent.get("texture_binding")
-    if not isinstance(binding, dict):
-        return False
-    if (
-        str(intent.get("tree_part") or "") != "bark"
-        or str(intent.get("texture_source_mode") or "")
-        != "managed_texture_set"
-        or str(binding.get("status") or "") != "ok"
-    ):
-        return False
-    files = binding.get("files")
-    if not isinstance(files, dict):
-        return False
-    for role in SPEEDTREE_TEXTURE_ROLES:
-        path = Path(str(files.get(role) or ""))
-        try:
-            if not path.is_file() or path.stat().st_size <= 0:
-                return False
-        except OSError:
-            return False
-    return True
-
-
-def _is_semantic_bark_intent(intent):
-    return bool(
-        isinstance(intent, dict)
-        and str(intent.get("tree_part") or "") == "bark"
-    )
-
-
-def _placeholder_bone_group_evidence(source_objects):
-    """Snapshot pre-merge skin ownership for material-less Default geometry."""
-    api = handoff_contract.central_contract_api()
-    placeholder_groups = set()
-    groups_by_material = defaultdict(set)
-    for obj in source_objects or []:
-        if obj is None or obj.type != "MESH" or obj.data is None:
-            continue
-        group_names = {group.name for group in obj.vertex_groups}
-        materials = [material for material in obj.data.materials if material]
-        object_key = api.normalize_material_key(
-            api.production_group_base_name(obj.name)
-        )
-        if not materials and object_key == "default":
-            placeholder_groups.update(group_names)
-        for material in materials:
-            groups_by_material[material.name].update(group_names)
-    return {
-        "placeholder_groups": sorted(placeholder_groups),
-        "groups_by_material": {
-            name: sorted(groups) for name, groups in groups_by_material.items()
-        },
-    }
-
-
 def normalize_merged_speedtree_placeholder_material(
-    merged_obj, texture_contract=None, bone_group_evidence=None
+    merged_obj, texture_contract=None
 ):
     """Remove an unused proven Default/None slot without inventing semantics.
 
@@ -8303,9 +8291,9 @@ def normalize_merged_speedtree_placeholder_material(
     envelope supplies the only accepted semantic evidence.  No material name
     other than the central exact ``default`` key is treated as a placeholder,
     and a ``None`` slot is accepted only at the one STMAT Default ordinal.
-    A face assigned to that slot is repaired only when the strict STMAT
-    contract proves exactly one semantic bark material.  Zero or multiple
-    candidates remain an authored/exported defect instead of being guessed.
+    A face assigned to that slot remains an authored/exported defect. Dummy
+    geometry must be deleted before weighting and merge, never relabeled as a
+    nearby bark material after the topology and skin data have been combined.
     """
     if not isinstance(texture_contract, dict) or not texture_contract.get(
         "strict_speedtree_pipeline_contract"
@@ -8325,9 +8313,6 @@ def normalize_merged_speedtree_placeholder_material(
         )
 
     api = handoff_contract.central_contract_api()
-    runtime_tolerant = _runtime_tolerant_texture_contract(
-        texture_contract
-    )
     intents = list(envelope.get("material_intents") or [])
     default_intents = [
         row for row in intents if _is_unmanaged_empty_default_intent(row)
@@ -8394,52 +8379,13 @@ def normalize_merged_speedtree_placeholder_material(
             np.isin(material_indices, tuple(placeholder_set))
         )
     )
-    assigned_target_material = None
-    assigned_target_slot = None
     if assigned_placeholder_faces:
-        candidates = []
-        seen_candidates = set()
-        for slot_index, material in enumerate(old_materials):
-            if material is None or material.as_pointer() in seen_candidates:
-                continue
-            if str(material.get(UNREAL_TREE_PART_PROPERTY) or "") != "bark":
-                continue
-            matching = _strict_material_intents_for_name(material.name, envelope)
-            if len(matching) != 1 or not (
-                _is_semantic_bark_intent(matching[0])
-                if runtime_tolerant
-                else _is_ready_managed_bark_intent(matching[0])
-            ):
-                continue
-            seen_candidates.add(material.as_pointer())
-            candidates.append((slot_index, material))
-        selection_policy = "unique_semantic_bark_only"
-        if len(candidates) > 1 and isinstance(bone_group_evidence, dict):
-            placeholder_groups = set(
-                bone_group_evidence.get("placeholder_groups") or []
-            )
-            groups_by_material = bone_group_evidence.get("groups_by_material") or {}
-            exact_owners = [
-                candidate
-                for candidate in candidates
-                if placeholder_groups
-                and placeholder_groups.issubset(
-                    set(groups_by_material.get(candidate[1].name) or [])
-                )
-            ]
-            if len(exact_owners) == 1:
-                candidates = exact_owners
-                selection_policy = (
-                    "unique_premerge_bone_group_superset_semantic_bark"
-                )
-        if len(candidates) != 1:
-            raise RuntimeError(
-                "SpeedTree source defect: final mesh contains faces assigned "
-                "to a generic Default material slot and the strict STMAT "
-                "contract does not prove exactly one semantic bark target; "
-                f"candidate count: {len(candidates)}"
-            )
-        assigned_target_slot, assigned_target_material = candidates[0]
+        raise RuntimeError(
+            "SpeedTree source defect: final mesh still contains faces assigned "
+            "to a generic Default material slot. Delete the proven dummy "
+            "geometry before weighting/merge or repair the source SPM; "
+            f"assigned face count: {assigned_placeholder_faces}"
+        )
 
     if merged_obj.data.users > 1:
         merged_obj.data = merged_obj.data.copy()
@@ -8448,22 +8394,12 @@ def normalize_merged_speedtree_placeholder_material(
     old_materials = list(mesh.materials)
     new_materials = []
     slot_map = {}
-    assigned_target_new_index = None
     for old_index, material in enumerate(old_materials):
         if old_index in placeholder_set:
             continue
         new_index = len(new_materials)
         new_materials.append(material)
         slot_map[old_index] = new_index
-        if material is assigned_target_material:
-            assigned_target_new_index = new_index
-    if assigned_target_material is not None:
-        if assigned_target_new_index is None:
-            raise RuntimeError(
-                "Proven semantic bark target disappeared before Default remap"
-            )
-        for old_index in placeholder_slots:
-            slot_map[old_index] = assigned_target_new_index
     remap_mesh_materials(
         mesh,
         slot_map,
@@ -8472,23 +8408,11 @@ def normalize_merged_speedtree_placeholder_material(
     )
     return {
         "status": "applied",
-        "proof": (
-            "strict_stmat_default_to_unique_semantic_bark"
-            if assigned_target_material is not None
-            else "unused_strict_stmat_default_slot_removed"
-        ),
+        "proof": "unused_strict_stmat_default_slot_removed",
         "placeholder_slots": placeholder_slots,
-        "selection_policy": (
-            selection_policy
-            if assigned_target_material is not None
-            else "remove_only_when_no_faces_use_placeholder"
-        ),
-        "target_material": (
-            assigned_target_material.name
-            if assigned_target_material is not None
-            else None
-        ),
-        "target_material_slot": assigned_target_slot,
+        "selection_policy": "remove_only_when_no_faces_use_placeholder",
+        "target_material": None,
+        "target_material_slot": None,
         "changed_face_count": assigned_placeholder_faces,
         "material_count_before": len(old_materials),
         "material_count_after": len(mesh.materials),
@@ -8914,10 +8838,6 @@ def run_merge_export(
         raise RuntimeError("No skinned source meshes found.")
 
     source_object_names = [obj.name for obj in source_objects]
-    placeholder_bone_group_evidence = _placeholder_bone_group_evidence(
-        source_objects
-    )
-
     merged_obj, ranges, _material_count, uv_names = merge_skinned_meshes(
         armature, source_objects, merged_name
     )
@@ -8925,7 +8845,6 @@ def run_merge_export(
         normalize_merged_speedtree_placeholder_material(
             merged_obj,
             texture_contract=texture_contract,
-            bone_group_evidence=placeholder_bone_group_evidence,
         )
     )
     material_slot_validation = validate_face_assigned_material_slots(
