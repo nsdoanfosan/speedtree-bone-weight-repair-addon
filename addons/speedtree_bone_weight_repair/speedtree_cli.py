@@ -8,10 +8,12 @@ waits only for the process handle.
 """
 
 import ctypes
+import codecs
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -49,7 +51,7 @@ except ImportError:
     )
 
 
-EXPORT_CACHE_VERSION = 2
+EXPORT_CACHE_VERSION = 3
 _HASH_CHUNK_SIZE = 1024 * 1024
 _WINDOWS_ACCESS_VIOLATION = 0xC0000005
 _WINDOWS_STACK_BUFFER_OVERRUN = 0xC0000409
@@ -64,6 +66,10 @@ SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
 )
+_NATIVE_SYNTHETIC_BONE_ID_START = 10000
+_NATIVE_TO_XML_COORDINATE_SCALE = 30.48
+_NATIVE_TO_XML_COORDINATE_SCALE_TOLERANCE = 1.0e-9
+_XML_SYNTHETIC_COORDINATE_TOLERANCE = 0.1
 
 
 @contextmanager
@@ -548,6 +554,352 @@ def load_native_receipt(path, spm):
             + str(path)
         )
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _verified_xml_backup(xml_path):
+    xml_path = Path(xml_path)
+    source_hash = _sha256_file(xml_path)
+    backup_root = xml_path.parent / ".speedtree_xml_reconcile_backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / (
+        f"{xml_path.stem}.before-native-reconcile-{source_hash[:16]}"
+        f"{xml_path.suffix}"
+    )
+    if not backup.exists():
+        temporary = backup.with_name(f".{backup.name}.tmp-{uuid.uuid4().hex}")
+        try:
+            shutil.copy2(xml_path, temporary)
+            if _sha256_file(temporary) != source_hash:
+                raise RuntimeError(
+                    "SpeedTree XML reconciliation backup hash verification failed: "
+                    + str(temporary)
+                )
+            os.replace(temporary, backup)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+    if _sha256_file(backup) != source_hash:
+        raise RuntimeError(
+            "Existing SpeedTree XML reconciliation backup has unexpected bytes: "
+            + str(backup)
+        )
+    return backup
+
+
+def _synthetic_generator(receipt, bone, xml_root, xml_bones):
+    """Resolve one receipt-backed generator; never invent a group name."""
+    bone_id = int(bone["id"])
+    source_rtti = str(bone.get("source_rtti") or "")
+    instances = list(receipt.get("generated_instances") or [])
+    matching = []
+    for row in instances:
+        try:
+            if (
+                int(row.get("source_bone_id")) == bone_id
+                and str(row.get("source_rtti") or "") == source_rtti
+            ):
+                matching.append(row)
+        except (TypeError, ValueError):
+            continue
+    guids = {
+        str(row.get("generator_guid") or "").strip()
+        for row in matching
+        if str(row.get("generator_guid") or "").strip()
+    }
+    if len(guids) != 1:
+        raise RuntimeError(
+            f"Synthetic native bone {bone_id} does not have one exact "
+            "receipt generator GUID"
+        )
+    guid = next(iter(guids))
+
+    names = set()
+    for row in instances:
+        if str(row.get("generator_guid") or "").strip() != guid:
+            continue
+        try:
+            xml_bone = xml_bones.get(int(row.get("source_bone_id")) - 1)
+        except (TypeError, ValueError):
+            xml_bone = None
+        if xml_bone is not None and xml_bone.attrib.get("Generator"):
+            names.add(xml_bone.attrib["Generator"])
+    proof = "receipt_generator_guid_to_existing_xml_bone"
+
+    if not names:
+        token = next(
+            (
+                value
+                for marker, value in (
+                    ("LeafMesh", "leaf"),
+                    ("Grass", "grass"),
+                    ("Spline", "branch"),
+                    ("Branch", "branch"),
+                    ("Frond", "frond"),
+                )
+                if marker in source_rtti
+            ),
+            "",
+        )
+        for material in xml_root.iter("Material"):
+            try:
+                data = json.loads(material.attrib.get("UserData") or "")
+                name = str(data.get("generator") or "").strip()
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if token and token in name.casefold():
+                names.add(name)
+        proof = "receipt_generator_guid_and_unique_xml_material_intent"
+    if len(names) != 1:
+        raise RuntimeError(
+            f"Synthetic native bone {bone_id} has no unique evidenced source "
+            "generator; refusing to invent a simulation group"
+        )
+    return next(iter(names)), {"proof": proof, "generator_guid": guid}
+
+
+def _validate_synthetic_xml_bone(element, bone, scale):
+    bone_id = int(bone["id"])
+    try:
+        if int(element.attrib.get("ParentID", "-1")) != int(bone["parent_id"]) - 1:
+            raise ValueError("parent mismatch")
+        for prefix, key in (("Start", "start_native"), ("End", "end_native")):
+            actual = [float(element.attrib[f"{prefix}{axis}"]) for axis in "XYZ"]
+            expected = [float(value) * scale for value in bone[key]]
+            if max(abs(a - b) for a, b in zip(actual, expected)) > (
+                _XML_SYNTHETIC_COORDINATE_TOLERANCE
+            ):
+                raise ValueError(f"{prefix} coordinate mismatch")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Existing synthetic XML Bone {bone_id - 1} conflicts with its "
+            "native receipt"
+        ) from exc
+
+
+def reconcile_xml_with_native_receipt(
+    xml_path, native_receipt, spm, *, create_backup=True
+):
+    """Supplement only receipt-proven reserved bones in a SpeedTree XML.
+
+    Existing Bone rows are byte-preserved. Ordinary missing IDs, conflicting
+    reserved IDs, an unproven generator, or a coordinate-contract mismatch all
+    fail closed before the XML is written.
+    """
+    xml_path = Path(xml_path)
+    native_receipt = Path(native_receipt)
+    if not _native_receipt_is_valid(native_receipt, spm):
+        raise RuntimeError(
+            "Cannot reconcile SpeedTree XML from a stale native receipt: "
+            + str(native_receipt)
+        )
+    receipt = json.loads(native_receipt.read_text(encoding="utf-8"))
+    receipt_rows = list(receipt.get("bones") or [])
+    if not receipt_rows:
+        return {
+            "status": "not_required",
+            "changed": False,
+            "added_xml_ids": [],
+            "backup": "",
+        }
+
+    original = xml_path.read_bytes()
+    has_utf8_bom = original.startswith(codecs.BOM_UTF8)
+    try:
+        text = original.decode("utf-8-sig")
+        xml_root = ET.fromstring(text)
+    except (UnicodeDecodeError, ET.ParseError) as exc:
+        raise RuntimeError(
+            "SpeedTree XML is not valid UTF-8 XML: " + str(xml_path)
+        ) from exc
+    sections = list(xml_root.iter("Bones"))
+    if len(sections) != 1:
+        raise RuntimeError("SpeedTree XML requires exactly one Bones section")
+    section = sections[0]
+    xml_by_id = {}
+    try:
+        for element in section.findall("Bone"):
+            bone_id = int(element.attrib["ID"])
+            if bone_id in xml_by_id:
+                raise RuntimeError(f"Duplicate SpeedTree XML Bone ID: {bone_id}")
+            xml_by_id[bone_id] = element
+        if int(section.attrib["Count"]) != len(xml_by_id):
+            raise RuntimeError("SpeedTree XML Bones Count does not match its rows")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("SpeedTree XML contains invalid Bone metadata") from exc
+
+    receipt_by_id = {}
+    try:
+        for source in receipt_rows:
+            bone_id = int(source["id"])
+            bone = dict(source)
+            bone["id"] = bone_id
+            bone["parent_id"] = int(source["parent_id"])
+            bone["start_native"] = tuple(float(v) for v in source["start_native"])
+            bone["end_native"] = tuple(float(v) for v in source["end_native"])
+            if (
+                bone_id <= 0
+                or bone_id in receipt_by_id
+                or bone["parent_id"] < 0
+                or len(bone["start_native"]) != 3
+                or len(bone["end_native"]) != 3
+            ):
+                raise ValueError("invalid receipt bone")
+            receipt_by_id[bone_id] = bone
+        scale = float(receipt["coordinate_contract"]["native_unit_to_solver"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Native receipt contains invalid Bone metadata") from exc
+    if abs(scale - _NATIVE_TO_XML_COORDINATE_SCALE) > (
+        _NATIVE_TO_XML_COORDINATE_SCALE_TOLERANCE
+    ):
+        raise RuntimeError(
+            f"Native receipt/XML coordinate scale is not exactly 30.48: {scale}"
+        )
+
+    missing_native_ids = [
+        bone_id
+        for bone_id in sorted(receipt_by_id)
+        if bone_id - 1 not in xml_by_id
+    ]
+    ordinary_missing = [
+        bone_id
+        for bone_id in missing_native_ids
+        if bone_id < _NATIVE_SYNTHETIC_BONE_ID_START
+    ]
+    if ordinary_missing:
+        raise RuntimeError(
+            "SpeedTree XML is missing ordinary native receipt bones; only "
+            "reserved synthetic IDs may be reconciled: "
+            + ", ".join(str(value) for value in ordinary_missing)
+        )
+
+    for bone_id, receipt_bone in receipt_by_id.items():
+        if bone_id < _NATIVE_SYNTHETIC_BONE_ID_START:
+            continue
+        existing = xml_by_id.get(bone_id - 1)
+        if existing is not None:
+            _validate_synthetic_xml_bone(existing, receipt_bone, scale)
+
+    if not missing_native_ids:
+        return {
+            "status": "already_reconciled",
+            "changed": False,
+            "added_xml_ids": [],
+            "backup": "",
+        }
+
+    missing_set = set(missing_native_ids)
+    additions = []
+    provenance = []
+    for bone_id in missing_native_ids:
+        receipt_bone = receipt_by_id[bone_id]
+        source_rtti = str(receipt_bone.get("source_rtti") or "").strip()
+        if not source_rtti or not source_rtti.endswith("Node@@"):
+            raise RuntimeError(
+                f"Reserved native bone {bone_id} lacks a proven source node RTTI"
+            )
+        parent_id = int(receipt_bone["parent_id"])
+        if parent_id > 0 and (
+            parent_id - 1 not in xml_by_id and parent_id not in missing_set
+        ):
+            raise RuntimeError(
+                f"Reserved native bone {bone_id} references missing parent "
+                f"bone {parent_id}"
+            )
+        generator, proof = _synthetic_generator(
+            receipt, receipt_bone, xml_root, xml_by_id
+        )
+        number = lambda value: format(
+            0.0 if abs(float(value)) < 0.5e-9 else float(value), ".10g"
+        )
+        start = [value * scale for value in receipt_bone["start_native"]]
+        end = [value * scale for value in receipt_bone["end_native"]]
+        element = ET.Element("Bone", {
+            "ID": str(bone_id - 1),
+            "ParentID": str(parent_id - 1),
+            "Radius": "0",
+            **{f"Start{axis}": number(value) for axis, value in zip("XYZ", start)},
+            **{f"End{axis}": number(value) for axis, value in zip("XYZ", end)},
+            "Mass": "0",
+            "Generator": generator,
+        })
+        additions.append(ET.tostring(element, encoding="unicode"))
+        provenance.append({
+            "native_bone_id": bone_id,
+            "xml_bone_id": bone_id - 1,
+            "source_rtti": source_rtti,
+            "generator": generator,
+            **proof,
+        })
+
+    opening_matches = list(re.finditer(
+        r'<Bones\b(?P<before>[^>]*\bCount=")(?P<count>\d+)(?P<after>"[^>]*)>',
+        text,
+    ))
+    closing_matches = list(re.finditer(r'(?m)^(?P<indent>[ \t]*)</Bones>', text))
+    if len(opening_matches) != 1 or len(closing_matches) != 1:
+        raise RuntimeError(
+            "SpeedTree XML Bones text layout is not uniquely writable"
+        )
+    opening = opening_matches[0]
+    closing = closing_matches[0]
+    if closing.start() <= opening.end():
+        raise RuntimeError("SpeedTree XML Bones section has invalid ordering")
+    declared_count = int(opening.group("count"))
+    updated_opening = (
+        opening.group(0)[: opening.start("count") - opening.start()]
+        + str(declared_count + len(additions))
+        + opening.group(0)[opening.end("count") - opening.start():]
+    )
+    text = text[:opening.start()] + updated_opening + text[opening.end():]
+
+    count_delta = len(updated_opening) - len(opening.group(0))
+    closing_start = closing.start() + count_delta
+    newline = "\r\n" if "\r\n" in text else "\n"
+    child_indent = closing.group("indent") + "\t"
+    insertion = "".join(
+        child_indent + line + newline for line in additions
+    )
+    text = text[:closing_start] + insertion + text[closing_start:]
+    payload = (codecs.BOM_UTF8 if has_utf8_bom else b"") + text.encode("utf-8")
+    backup = _verified_xml_backup(xml_path) if create_backup else None
+    temporary = xml_path.with_name(
+        f".{xml_path.name}.bwr-reconcile-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary.write_bytes(payload)
+        ET.parse(temporary)
+        os.replace(temporary, xml_path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    check_root = ET.parse(xml_path).getroot()
+    check_section = next(check_root.iter("Bones"))
+    check_by_id = {
+        int(element.attrib["ID"]): element
+        for element in check_section.findall("Bone")
+    }
+    if int(check_section.attrib["Count"]) != len(check_by_id):
+        raise RuntimeError("Reconciled SpeedTree XML Bones Count is invalid")
+    for bone_id in missing_native_ids:
+        added = check_by_id.get(bone_id - 1)
+        if added is None:
+            raise RuntimeError(
+                f"Reconciled SpeedTree XML is missing Bone ID {bone_id - 1}"
+            )
+        _validate_synthetic_xml_bone(added, receipt_by_id[bone_id], scale)
+    return {
+        "status": "reconciled_reserved_synthetic_bones",
+        "changed": True,
+        "added_xml_ids": [value - 1 for value in missing_native_ids],
+        "backup": str(backup) if backup is not None else "",
+        "coordinate_scale": scale,
+        "provenance": provenance,
+    }
 
 
 def _read_process_log(handle):
@@ -1044,7 +1396,51 @@ def _export_bundle_fallback(
         row["bundled_process"] = False
         row["bundle_fallback"] = True
         results[item["kind"]] = row
+    _reconcile_completed_bundle_results(
+        results, native_receipt, spm, create_backup=True
+    )
     return results
+
+
+def _refresh_xml_result_cache(result, reconciliation):
+    target = Path(str((result or {}).get("path") or ""))
+    if not target.is_file():
+        raise RuntimeError(
+            "Cannot refresh reconciliation cache for missing XML: "
+            + str(target)
+        )
+    artifacts = [_artifact_record(target, target.parent)]
+    cache_path = Path(
+        str((result or {}).get("cache_path") or _cache_path(target))
+    )
+    cache = _load_cache(cache_path)
+    if not cache:
+        raise RuntimeError(
+            "Cannot refresh missing SpeedTree XML export cache: "
+            + str(cache_path)
+        )
+    cache["artifacts"] = artifacts
+    cache["native_receipt_xml_reconciliation"] = reconciliation
+    _write_cache(cache_path, cache)
+    result["artifacts"] = artifacts
+    result["native_receipt_xml_reconciliation"] = reconciliation
+
+
+def _reconcile_completed_bundle_results(
+    results, native_receipt, spm, *, create_backup
+):
+    if native_receipt is None or "xml" not in results:
+        return None
+    reconciliation = reconcile_xml_with_native_receipt(
+        results["xml"]["path"],
+        native_receipt,
+        spm,
+        create_backup=create_backup,
+    )
+    _refresh_xml_result_cache(results["xml"], reconciliation)
+    if "fbx" in results:
+        results["fbx"]["native_receipt_xml_reconciliation"] = reconciliation
+    return reconciliation
 
 
 def export_bundle(
@@ -1148,6 +1544,9 @@ def export_bundle(
             ),
         )
         results[item["kind"]]["bundled_process"] = False
+        _reconcile_completed_bundle_results(
+            results, native_receipt, spm, create_backup=True
+        )
         return results
     if len(prepared) != 2:
         raise RuntimeError("Bundled SpeedTree export requires exactly FBX and XML.")
@@ -1162,6 +1561,7 @@ def export_bundle(
     export_attempts = []
     stdout = ""
     stderr = ""
+    bundle_reconciliation = None
     for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
         with tempfile.TemporaryDirectory(
             prefix="bwr_speedtree_bundle_"
@@ -1238,6 +1638,20 @@ def export_bundle(
                 return _export_bundle_fallback(
                     exe, spm, prepared, results, timeout_seconds, native_receipt
                 )
+            if staged_receipt is not None and "xml" in staged:
+                bundle_reconciliation = reconcile_xml_with_native_receipt(
+                    staged["xml"],
+                    staged_receipt,
+                    spm,
+                    create_backup=False,
+                )
+                if bundle_reconciliation.get("changed"):
+                    xml_item = next(
+                        item for item in prepared if item["kind"] == "xml"
+                    )
+                    if xml_item["target"].is_file():
+                        backup = _verified_xml_backup(xml_item["target"])
+                        bundle_reconciliation["backup"] = str(backup)
             _transactional_promote(staging_root, common_root)
             break
 
@@ -1267,6 +1681,10 @@ def export_bundle(
                 else ""
             ),
         }
+        if bundle_reconciliation is not None:
+            cache_data["native_receipt_xml_reconciliation"] = (
+                bundle_reconciliation
+            )
         _write_cache(item["cache_path"], cache_data)
         results[item["kind"]] = {
             "path": str(item["target"]),
@@ -1291,4 +1709,8 @@ def export_bundle(
                 else ""
             ),
         }
+        if bundle_reconciliation is not None:
+            results[item["kind"]]["native_receipt_xml_reconciliation"] = (
+                bundle_reconciliation
+            )
     return results
