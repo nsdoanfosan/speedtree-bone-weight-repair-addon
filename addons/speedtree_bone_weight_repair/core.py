@@ -244,6 +244,7 @@ def run_speedtree_cli_export(
     export_fbx=True,
     export_xml=True,
     timeout_seconds=900,
+    force_reexport=False,
 ):
     spm = Path(spm_path)
     if not spm.exists():
@@ -288,6 +289,7 @@ def run_speedtree_cli_export(
             targets=targets,
             timeout_seconds=timeout_seconds,
             native_receipt=native_receipt,
+            force_reexport=force_reexport,
         )
     else:
         for kind, target, options in targets:
@@ -301,6 +303,7 @@ def run_speedtree_cli_export(
                 native_receipt=(
                     native_receipt if kind == "fbx" else None
                 ),
+                force_reexport=force_reexport,
             )
 
     bundle_mtime_sync = None
@@ -321,6 +324,7 @@ def run_speedtree_cli_export(
         "output_root": str(root),
         "name_stem": stem,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
+        "force_reexport_requested": bool(force_reexport),
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
         "native_receipt": (

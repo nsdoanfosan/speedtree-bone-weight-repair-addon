@@ -1062,6 +1062,7 @@ def export_target(
     timeout_seconds=900,
     verification_only=False,
     native_receipt=None,
+    force_reexport=False,
 ):
     """Export one FBX/XML target with cache, staging, and timeout cleanup."""
     exe = Path(exe)
@@ -1092,7 +1093,11 @@ def export_target(
             and _native_receipt_is_valid(native_receipt, spm)
         )
     )
-    if _cache_hit(cache, fingerprint, kind, target, inputs) and receipt_ready:
+    if (
+        not force_reexport
+        and _cache_hit(cache, fingerprint, kind, target, inputs)
+        and receipt_ready
+    ):
         finished = _utc_timestamp()
         return {
             "path": str(target),
@@ -1106,6 +1111,7 @@ def export_target(
             "stderr": "",
             "cache_hit": True,
             "cache_seeded": False,
+            "force_reexport_requested": False,
             "cache_path": str(cache_path),
             "input_fingerprint": fingerprint,
             "artifacts": cache.get("artifacts", []),
@@ -1115,7 +1121,11 @@ def export_target(
     # Migration for valid outputs written by the former no-cache exporter.
     # Do not use it for a corrupt/stale/mismatched existing receipt: those
     # cases need a real export so the known provenance is restored.
-    if not cache_path.exists() and native_receipt is None:
+    if (
+        not force_reexport
+        and not cache_path.exists()
+        and native_receipt is None
+    ):
         seed_artifacts = _fresh_existing_artifacts(kind, target, inputs)
         if seed_artifacts:
             finished = _utc_timestamp()
@@ -1142,6 +1152,7 @@ def export_target(
                 "stderr": "",
                 "cache_hit": True,
                 "cache_seeded": True,
+                "force_reexport_requested": False,
                 "cache_path": str(cache_path),
                 "input_fingerprint": fingerprint,
                 "artifacts": seed_artifacts,
@@ -1188,19 +1199,22 @@ def export_target(
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
                         native_receipt=native_receipt,
+                        force_reexport=force_reexport,
                     )
                     result["collision_fallback"] = True
                     return result
-                preserved = _preserve_existing_output(
-                    kind,
-                    target,
-                    cache_path,
-                    fingerprint,
-                    inputs,
-                    started,
-                    options,
-                    verification_only=True,
-                )
+                preserved = None
+                if not force_reexport:
+                    preserved = _preserve_existing_output(
+                        kind,
+                        target,
+                        cache_path,
+                        fingerprint,
+                        inputs,
+                        started,
+                        options,
+                        verification_only=True,
+                    )
                 if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
@@ -1242,19 +1256,22 @@ def export_target(
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
                         native_receipt=native_receipt,
+                        force_reexport=force_reexport,
                     )
                     result["collision_fallback"] = True
                     return result
-                preserved = _preserve_existing_output(
-                    kind,
-                    target,
-                    cache_path,
-                    fingerprint,
-                    inputs,
-                    started,
-                    options,
-                    verification_only=True,
-                )
+                preserved = None
+                if not force_reexport:
+                    preserved = _preserve_existing_output(
+                        kind,
+                        target,
+                        cache_path,
+                        fingerprint,
+                        inputs,
+                        started,
+                        options,
+                        verification_only=True,
+                    )
                 if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
@@ -1284,19 +1301,22 @@ def export_target(
                         timeout_seconds=timeout_seconds,
                         verification_only=True,
                         native_receipt=native_receipt,
+                        force_reexport=force_reexport,
                     )
                     result["collision_fallback"] = True
                     return result
-                preserved = _preserve_existing_output(
-                    kind,
-                    target,
-                    cache_path,
-                    fingerprint,
-                    inputs,
-                    started,
-                    options,
-                    verification_only=True,
-                )
+                preserved = None
+                if not force_reexport:
+                    preserved = _preserve_existing_output(
+                        kind,
+                        target,
+                        cache_path,
+                        fingerprint,
+                        inputs,
+                        started,
+                        options,
+                        verification_only=True,
+                    )
                 if preserved is not None and native_receipt is None:
                     preserved["collision_fallback"] = True
                     return preserved
@@ -1356,6 +1376,7 @@ def export_target(
         "artifacts": artifacts,
         "export_attempts": export_attempts,
         "verification_only": bool(verification_only),
+        "force_reexport_requested": bool(force_reexport),
         "native_receipt": str(native_receipt) if native_receipt else "",
     }
 
@@ -1367,10 +1388,14 @@ def _export_bundle_fallback(
     results,
     timeout_seconds,
     native_receipt=None,
+    force_reexport=False,
 ):
     for item in prepared:
         row = None
-        if not (native_receipt is not None and item["kind"] == "fbx"):
+        if (
+            not force_reexport
+            and not (native_receipt is not None and item["kind"] == "fbx")
+        ):
             row = _preserve_existing_output(
                 item["kind"],
                 item["target"],
@@ -1392,6 +1417,7 @@ def _export_bundle_fallback(
                 native_receipt=(
                     native_receipt if item["kind"] == "fbx" else None
                 ),
+                force_reexport=force_reexport,
             )
         row["bundled_process"] = False
         row["bundle_fallback"] = True
@@ -1449,6 +1475,7 @@ def export_bundle(
     targets,
     timeout_seconds=900,
     native_receipt=None,
+    force_reexport=False,
 ):
     """Export FBX and XML through one collision-CLI/Modeler process.
 
@@ -1486,7 +1513,10 @@ def export_bundle(
             "started": started,
         }
         all_items.append(item)
-        if _cache_hit(cache, fingerprint, kind, target, inputs):
+        if (
+            not force_reexport
+            and _cache_hit(cache, fingerprint, kind, target, inputs)
+        ):
             results[kind] = {
                 "path": str(target),
                 "export_options": str(options),
@@ -1499,6 +1529,7 @@ def export_bundle(
                 "stderr": "",
                 "cache_hit": True,
                 "cache_seeded": False,
+                "force_reexport_requested": False,
                 "cache_path": str(cache_path),
                 "input_fingerprint": fingerprint,
                 "artifacts": cache.get("artifacts", []),
@@ -1542,6 +1573,7 @@ def export_bundle(
             native_receipt=(
                 native_receipt if item["kind"] == "fbx" else None
             ),
+            force_reexport=force_reexport,
         )
         results[item["kind"]]["bundled_process"] = False
         _reconcile_completed_bundle_results(
@@ -1598,7 +1630,13 @@ def export_bundle(
                 )
             except subprocess.TimeoutExpired:
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds, native_receipt
+                    exe,
+                    spm,
+                    prepared,
+                    results,
+                    timeout_seconds,
+                    native_receipt,
+                    force_reexport,
                 )
 
             attempt_record = {
@@ -1618,7 +1656,13 @@ def export_bundle(
                     time.sleep(backoff)
                     continue
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds, native_receipt
+                    exe,
+                    spm,
+                    prepared,
+                    results,
+                    timeout_seconds,
+                    native_receipt,
+                    force_reexport,
                 )
             invalid = [
                 item["kind"]
@@ -1629,14 +1673,26 @@ def export_bundle(
             ]
             if invalid:
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds, native_receipt
+                    exe,
+                    spm,
+                    prepared,
+                    results,
+                    timeout_seconds,
+                    native_receipt,
+                    force_reexport,
                 )
             if (
                 staged_receipt is not None
                 and not _native_receipt_is_valid(staged_receipt, spm)
             ):
                 return _export_bundle_fallback(
-                    exe, spm, prepared, results, timeout_seconds, native_receipt
+                    exe,
+                    spm,
+                    prepared,
+                    results,
+                    timeout_seconds,
+                    native_receipt,
+                    force_reexport,
                 )
             if staged_receipt is not None and "xml" in staged:
                 bundle_reconciliation = reconcile_xml_with_native_receipt(
@@ -1703,6 +1759,7 @@ def export_bundle(
             "artifacts": artifacts,
             "export_attempts": export_attempts,
             "bundled_process": True,
+            "force_reexport_requested": bool(force_reexport),
             "native_receipt": (
                 str(native_receipt)
                 if native_receipt is not None and item["kind"] == "fbx"

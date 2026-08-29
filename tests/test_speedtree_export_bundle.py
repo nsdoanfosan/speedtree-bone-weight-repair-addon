@@ -431,6 +431,87 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertEqual(fbx.read_bytes(), b"fbx")
             self.assertEqual(xml.read_text(encoding="utf-8"), "<SpeedTreeRaw />")
 
+    def test_force_reexport_bypasses_valid_bundle_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            spm = root / "tree.spm"
+            fbx_options = root / "fbx.ini"
+            xml_options = root / "xml.ini"
+            fbx = root / "out" / "fbx" / "tree.fbx"
+            xml = root / "out" / "xml" / "tree.xml"
+            exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
+            spm.write_bytes(b"spm")
+            preset = "[Options]\nTextureSkipWriting=true\n"
+            fbx_options.write_text(preset, encoding="utf-8")
+            xml_options.write_text(preset, encoding="utf-8")
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                marker = str(len(calls)).encode("ascii")
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"fbx-" + marker)
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />", encoding="utf-8"
+                )
+                secondary.write_text(
+                    f'<SpeedTreeRaw run="{len(calls)}" />',
+                    encoding="utf-8",
+                )
+                return 0, "ok", ""
+
+            speedtree_cli._run_process = fake_run
+            try:
+                first = speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [
+                        ("fbx", fbx, fbx_options),
+                        ("xml", xml, xml_options),
+                    ],
+                )
+                cached = speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [
+                        ("fbx", fbx, fbx_options),
+                        ("xml", xml, xml_options),
+                    ],
+                )
+                forced = speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [
+                        ("fbx", fbx, fbx_options),
+                        ("xml", xml, xml_options),
+                    ],
+                    force_reexport=True,
+                )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(first["fbx"]["cache_hit"])
+            self.assertTrue(cached["fbx"]["cache_hit"])
+            self.assertTrue(cached["xml"]["cache_hit"])
+            self.assertFalse(forced["fbx"]["cache_hit"])
+            self.assertFalse(forced["xml"]["cache_hit"])
+            self.assertTrue(forced["fbx"]["force_reexport_requested"])
+            self.assertTrue(forced["xml"]["force_reexport_requested"])
+            self.assertEqual(fbx.read_bytes(), b"fbx-2")
+            self.assertEqual(
+                xml.read_text(encoding="utf-8"),
+                '<SpeedTreeRaw run="2" />',
+            )
+
     def test_bundle_timeout_falls_back_to_independent_exports(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -488,6 +569,80 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertTrue(result["xml"]["verification_only"])
             self.assertEqual(fbx.read_bytes(), b"fbx")
             self.assertEqual(xml.read_text(encoding="utf-8"), "<SpeedTreeRaw />")
+
+    def test_force_reexport_failure_preserves_outputs_and_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            spm = root / "tree.spm"
+            fbx_options = root / "fbx.ini"
+            xml_options = root / "xml.ini"
+            fbx = root / "out" / "fbx" / "tree.fbx"
+            xml = root / "out" / "xml" / "tree.xml"
+            exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
+            spm.write_bytes(b"spm")
+            preset = "[Options]\nTextureSkipWriting=true\n"
+            fbx_options.write_text(preset, encoding="utf-8")
+            xml_options.write_text(preset, encoding="utf-8")
+            original = speedtree_cli._run_process
+
+            def successful_run(command, cwd, timeout_seconds):
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"known-good-fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />", encoding="utf-8"
+                )
+                secondary.write_text(
+                    "<SpeedTreeRaw />", encoding="utf-8"
+                )
+                return 0, "ok", ""
+
+            speedtree_cli._run_process = successful_run
+            try:
+                speedtree_cli.export_bundle(
+                    exe,
+                    spm,
+                    [
+                        ("fbx", fbx, fbx_options),
+                        ("xml", xml, xml_options),
+                    ],
+                )
+                protected = {
+                    path: path.read_bytes()
+                    for path in (
+                        fbx,
+                        fbx.with_suffix(".stmat"),
+                        xml,
+                        speedtree_cli._cache_path(fbx),
+                        speedtree_cli._cache_path(xml),
+                    )
+                }
+
+                def failing_run(command, cwd, timeout_seconds):
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+                speedtree_cli._run_process = failing_run
+                with self.assertRaises(RuntimeError):
+                    speedtree_cli.export_bundle(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        force_reexport=True,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            for path, expected in protected.items():
+                self.assertEqual(path.read_bytes(), expected)
 
     def test_single_target_timeout_falls_back_without_collision_bake(self):
         with tempfile.TemporaryDirectory() as temp_dir:
