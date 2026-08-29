@@ -7913,28 +7913,45 @@ def build_boneless_rigid_metadata(xml_path, armature, reason):
         armature.get("speedtree_native_boneless_binding", "")
     )
     bones = list(armature.data.bones)
-    if (
-        binding != "native_boneless_rigid_axis_v1"
-        or len(bones) != 1
-        or bones[0].name != "Bone_1_Start"
-        or bones[0].parent is not None
-    ):
+    legacy_axis = (
+        binding == "native_boneless_rigid_axis_v1"
+        and len(bones) == 1
+        and bones[0].name == "Bone_1_Start"
+        and bones[0].parent is None
+    )
+    native_axis = (
+        binding == ""
+        and [bone.name for bone in bones]
+        == ["Root", "Bone_10000_Start", "Bone_10000_End"]
+        and bones[0].parent is None
+        and bones[1].parent == bones[0]
+        and bones[2].parent == bones[1]
+    )
+    if not legacy_axis and not native_axis:
         raise RuntimeError(
             "Bone-less SpeedTree XML requires the exact native rigid-axis "
             "armature contract; found binding="
             f"{binding!r}, bones={[bone.name for bone in bones]}"
         )
-    records = [{
-        "name": "Bone_1_Start",
-        "bone_index": 0,
-        "parent_index": -1,
-        "xml_id": None,
-        "generator": "NativeBonelessRigid",
-        "mass": 0.0,
-        "radius": 0.0,
-        "group": 0,
-        "native_role": "boneless_rigid_axis",
-    }]
+    records = []
+    for index, bone in enumerate(bones):
+        records.append({
+            "name": bone.name,
+            "bone_index": index,
+            "parent_index": (
+                armature.data.bones.find(bone.parent.name)
+                if bone.parent is not None else -1
+            ),
+            "xml_id": None,
+            "generator": "NativeBonelessRigid",
+            "mass": 0.0,
+            "radius": 0.0,
+            "group": 0,
+            "native_role": (
+                "fbx_wrapper_root" if bone.name == "Root"
+                else "boneless_rigid_axis"
+            ),
+        })
     simulation_group = {
         "index": 0,
         "generators": ["NativeBonelessRigid"],
@@ -7946,8 +7963,11 @@ def build_boneless_rigid_metadata(xml_path, armature, reason):
     info = {
         "source": str(xml_path),
         "xml_bone_count": 0,
-        "armature_bone_count": 1,
-        "mapping_contract": "native_boneless_rigid_axis_v1",
+        "armature_bone_count": len(bones),
+        "mapping_contract": (
+            "native_zero_bone_absolute_axis_v2"
+            if native_axis else "native_boneless_rigid_axis_v1"
+        ),
         "synthetic": True,
         "fallback_reason": reason,
         "generators": {"NativeBonelessRigid": 0},
@@ -8030,11 +8050,7 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
                 f"Duplicate SpeedTree XML Bone ID: {xml_id}"
             )
         xml_by_id[xml_id] = xml_bone
-    expected_xml_ids = set(range(len(xml_bones)))
-    if set(xml_by_id) != expected_xml_ids:
-        raise RuntimeError(
-            "SpeedTree XML Bone IDs are not a contiguous zero-based range"
-        )
+    expected_xml_ids = set(xml_by_id)
 
     matrix = armature.matrix_world
     groups, group_of_generator = build_simulation_groups(xml_bones, trunk_generator_regex)
@@ -8121,7 +8137,7 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
         "source": str(xml_path),
         "xml_bone_count": len(xml_bones),
         "armature_bone_count": len(armature.data.bones),
-        "mapping_contract": "native_bone_ordinal_to_xml_id_v1",
+        "mapping_contract": "native_sparse_exact_bone_id_to_xml_id_v2",
         "scale": NATIVE_SPEEDTREE_XML_SCALE,
         "trunk_generator_regex": trunk_generator_regex,
         "generators": {name: index for name, index in sorted(group_of_generator.items())},
