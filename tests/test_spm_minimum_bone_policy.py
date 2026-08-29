@@ -147,6 +147,18 @@ class MinimumAbsoluteBranchBonePolicyTests(unittest.TestCase):
             self.assertEqual(report["status"], "updated")
             self.assertEqual(report["changed_generator_count"], 2)
 
+    def test_empty_self_closing_root_generators_is_already_compliant(self):
+        with tempfile.TemporaryDirectory() as td:
+            spm = Path(td) / "SK_tree_empty_generators.spm"
+            original = b"<SpeedTree><Generators /><Nodes /></SpeedTree>"
+            spm.write_bytes(original)
+
+            report = speedtree_cli.ensure_minimum_absolute_branch_bones(spm)
+
+            self.assertEqual(report["status"], "already_compliant")
+            self.assertFalse(report["changed"])
+            self.assertEqual(spm.read_bytes(), original)
+
     def test_cluster_folder_and_cluster_stem_are_excluded_without_writes(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

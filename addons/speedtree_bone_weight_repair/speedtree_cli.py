@@ -87,10 +87,32 @@ def _root_direct_element_byte_spans(xml_bytes, element_name):
     open_starts = []
     spans = []
 
+    def opening_tag_end(start_index):
+        quote = None
+        for index in range(start_index, len(xml_bytes)):
+            value = xml_bytes[index]
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                continue
+            if value in (ord('"'), ord("'")):
+                quote = value
+            elif value == ord(">"):
+                return index + 1
+        raise RuntimeError(
+            f"SpeedTree XML has an incomplete {element_name} opening tag"
+        )
+
     def start(name, _attributes):
         nonlocal depth
         if depth == 1 and name == element_name:
-            open_starts.append(parser.CurrentByteIndex)
+            section_start = parser.CurrentByteIndex
+            section_end = opening_tag_end(section_start)
+            if xml_bytes[section_start:section_end].rstrip().endswith(b"/>"):
+                spans.append((section_start, section_end))
+                open_starts.append(None)
+            else:
+                open_starts.append(section_start)
         depth += 1
 
     def end(name):
@@ -101,13 +123,16 @@ def _root_direct_element_byte_spans(xml_bytes, element_name):
                 raise RuntimeError(
                     f"SpeedTree XML closed {element_name} without a root-direct start"
                 )
+            section_start = open_starts.pop()
+            if section_start is None:
+                return
             closing_start = parser.CurrentByteIndex
             closing_end = xml_bytes.find(b">", closing_start)
             if closing_end < 0:
                 raise RuntimeError(
                     f"SpeedTree XML has an incomplete {element_name} closing tag"
                 )
-            spans.append((open_starts.pop(), closing_end + 1))
+            spans.append((section_start, closing_end + 1))
 
     parser.StartElementHandler = start
     parser.EndElementHandler = end
