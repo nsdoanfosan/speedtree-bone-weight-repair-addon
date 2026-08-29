@@ -279,33 +279,17 @@ def run_speedtree_cli_export(
             raise RuntimeError(f"SpeedTree {kind.upper()} export options INI does not exist: {options}")
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
-    spm_bone_policy = speedtree_cli.ensure_minimum_absolute_branch_bones(spm)
-    if (
-        len(targets) == 2
-        and exe.name.casefold() == "speedtree_collision_cli.exe"
-    ):
-        results = speedtree_cli.export_bundle(
-            exe=exe,
-            spm=spm,
-            targets=targets,
-            timeout_seconds=timeout_seconds,
-            native_receipt=native_receipt,
-            force_reexport=force_reexport,
-        )
-    else:
-        for kind, target, options in targets:
-            results[kind] = speedtree_cli.export_target(
-                exe=exe,
-                spm=spm,
-                options=options,
-                kind=kind,
-                target=target,
-                timeout_seconds=timeout_seconds,
-                native_receipt=(
-                    native_receipt if kind == "fbx" else None
-                ),
-                force_reexport=force_reexport,
-            )
+    policy_report = {}
+    results = speedtree_cli.export_bundle_with_minimum_bone_policy(
+        exe=exe,
+        spm=spm,
+        targets=targets,
+        timeout_seconds=timeout_seconds,
+        native_receipt=native_receipt,
+        force_reexport=force_reexport,
+        policy_report=policy_report,
+    )
+    spm_bone_policy = policy_report["spm_bone_policy"]
 
     bundle_mtime_sync = None
     if "fbx" in results and "xml" in results:
@@ -6682,6 +6666,11 @@ def build_native_boneless_rigid_armature(
         "meshes": [obj.name for obj in meshes],
         "vertex_count": sum(len(obj.data.vertices) for obj in meshes),
     }
+
+
+def ensure_minimum_absolute_branch_bones(spm_path):
+    """Gateway operation for preflight-wide persistent SPM normalization."""
+    return speedtree_cli.apply_minimum_absolute_branch_bone_policy(spm_path)
 
 
 def restore_omitted_native_root_weights(imported, receipt):

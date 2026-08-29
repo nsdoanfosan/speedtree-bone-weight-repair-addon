@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -175,6 +176,8 @@ def ensure_minimum_absolute_branch_bones(spm):
     single reference-axis policy and are never modified here.
     """
     spm = Path(spm).resolve()
+    original = spm.read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
     if _is_cluster_source_spm(spm):
         return {
             "status": "excluded_cluster_source",
@@ -183,10 +186,10 @@ def ensure_minimum_absolute_branch_bones(spm):
             "changed_generator_count": 0,
             "changed_generators": [],
             "backup": "",
+            "source_sha256": original_sha256,
+            "policy": "cluster_reference_axis_policy_unchanged_v1",
         }
 
-    original = spm.read_bytes()
-    original_sha256 = hashlib.sha256(original).hexdigest()
     compressed = original.startswith(b"\x1f\x8b")
     try:
         xml_bytes = gzip.decompress(original) if compressed else original
@@ -350,7 +353,7 @@ def ensure_minimum_absolute_branch_bones(spm):
 
 
 @contextmanager
-def speedtree_export_gate():
+def _system_speedtree_export_gate():
     """Share one machine-wide Modeler export slot with SK Batch."""
     name = os.environ.get(
         SPEEDTREE_EXPORT_MUTEX_ENV, SPEEDTREE_EXPORT_MUTEX_DEFAULT
@@ -405,6 +408,29 @@ def speedtree_export_gate():
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+_SPEEDTREE_EXPORT_GATE_LOCAL = threading.local()
+
+
+@contextmanager
+def speedtree_export_gate():
+    """Acquire the machine gate once while allowing nested helper exports."""
+    depth = int(getattr(_SPEEDTREE_EXPORT_GATE_LOCAL, "depth", 0) or 0)
+    if depth > 0:
+        _SPEEDTREE_EXPORT_GATE_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _SPEEDTREE_EXPORT_GATE_LOCAL.depth = depth
+        return
+
+    with _system_speedtree_export_gate():
+        _SPEEDTREE_EXPORT_GATE_LOCAL.depth = 1
+        try:
+            yield
+        finally:
+            _SPEEDTREE_EXPORT_GATE_LOCAL.depth = 0
 
 
 def _utc_timestamp():
@@ -1762,6 +1788,184 @@ def _reconcile_completed_bundle_results(
     if "fbx" in results:
         results["fbx"]["native_receipt_xml_reconciliation"] = reconciliation
     return reconciliation
+
+
+def _validated_minimum_bone_policy_receipt(spm, receipt):
+    """Validate the persistent policy result against the bytes on disk."""
+    spm = Path(spm).resolve()
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Minimum branch-bone policy returned no receipt")
+    status = str(receipt.get("status") or "")
+    allowed = {
+        "updated",
+        "already_compliant",
+        "excluded_cluster_source",
+    }
+    if status not in allowed:
+        raise RuntimeError(
+            "Minimum branch-bone policy returned an unsupported status: "
+            + repr(status)
+        )
+    try:
+        receipt_spm = Path(str(receipt.get("spm") or "")).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has no valid SPM path"
+        ) from exc
+    if receipt_spm != spm:
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt belongs to another SPM"
+        )
+
+    changed = receipt.get("changed")
+    changed_count = receipt.get("changed_generator_count")
+    if not isinstance(changed, bool) or not isinstance(changed_count, int):
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has malformed change fields"
+        )
+    if status == "updated":
+        if not changed or changed_count <= 0:
+            raise RuntimeError(
+                "Updated minimum branch-bone policy receipt is inconsistent"
+            )
+    elif changed or changed_count != 0:
+        raise RuntimeError(
+            "Non-updated minimum branch-bone policy receipt is inconsistent"
+        )
+
+    current = _file_identity(spm)
+    expected_digest_field = (
+        "updated_sha256" if status == "updated" else "source_sha256"
+    )
+    expected_digest = str(receipt.get(expected_digest_field) or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has no valid "
+            + expected_digest_field
+        )
+    if expected_digest != str(current.get("sha256") or "").lower():
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt does not match persisted SPM"
+        )
+
+    if status == "updated":
+        backup = Path(str(receipt.get("backup") or "")).resolve()
+        source_digest = str(receipt.get("source_sha256") or "").lower()
+        if not backup.is_file() or not re.fullmatch(
+            r"[0-9a-f]{64}", source_digest
+        ):
+            raise RuntimeError(
+                "Updated minimum branch-bone policy receipt has no verified backup"
+            )
+        if _sha256_file(backup).lower() != source_digest:
+            raise RuntimeError(
+                "Minimum branch-bone policy backup digest does not match receipt"
+            )
+
+    validated = dict(receipt)
+    validated["sealed_source_identity"] = current
+    return validated
+
+
+def apply_minimum_absolute_branch_bone_policy(spm):
+    """Apply and validate the SPM policy under the shared Modeler mutex."""
+    with speedtree_export_gate():
+        return _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+
+
+def _validated_policy_export_request(exe, spm, targets, native_receipt):
+    """Validate every immutable export input before persistent SPM repair."""
+    exe = Path(exe).resolve()
+    spm = Path(spm).resolve()
+    rows = tuple(
+        (str(kind).lower(), Path(target).resolve(), Path(options).resolve())
+        for kind, target, options in targets
+    )
+    if not exe.is_file():
+        raise RuntimeError("SpeedTree executable does not exist: " + str(exe))
+    if not spm.is_file() or spm.suffix.casefold() != ".spm":
+        raise RuntimeError("SpeedTree SPM does not exist: " + str(spm))
+    hook = exe.with_name("speedtree_collision_hook.dll")
+    if not hook.is_file():
+        raise RuntimeError(
+            "SpeedTree collision hook is missing beside the launcher: "
+            + str(hook)
+        )
+    if not rows or len(rows) > 2:
+        raise RuntimeError(
+            "Minimum-bone export transaction requires one or two targets"
+        )
+    kinds = [kind for kind, _target, _options in rows]
+    if len(set(kinds)) != len(kinds) or any(
+        kind not in {"fbx", "xml"} for kind in kinds
+    ):
+        raise RuntimeError(
+            "Minimum-bone export transaction target kinds are invalid"
+        )
+    for kind, target, options in rows:
+        require_texture_skip_writing(
+            options,
+            purpose=f"SpeedTree {kind.upper()} export",
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    receipt = Path(native_receipt).resolve() if native_receipt else None
+    if receipt is not None:
+        fbx_rows = [row for row in rows if row[0] == "fbx"]
+        if len(fbx_rows) != 1:
+            raise RuntimeError(
+                "Native receipt export requires exactly one FBX target."
+            )
+        if receipt.parent != fbx_rows[0][1].parent:
+            raise ValueError(
+                "Native receipt and FBX target must share one transaction directory."
+            )
+    return exe, spm, rows, receipt
+
+
+def export_bundle_with_minimum_bone_policy(
+    exe,
+    spm,
+    targets,
+    timeout_seconds=900,
+    native_receipt=None,
+    force_reexport=False,
+    policy_report=None,
+):
+    """Persist Absolute/1 and export one sealed SPM under one mutex."""
+    exe, spm, targets, native_receipt = _validated_policy_export_request(
+        exe,
+        spm,
+        targets,
+        native_receipt,
+    )
+    with speedtree_export_gate():
+        policy = _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+        sealed = dict(policy["sealed_source_identity"])
+        try:
+            results = export_bundle(
+                exe=exe,
+                spm=spm,
+                targets=targets,
+                timeout_seconds=timeout_seconds,
+                native_receipt=native_receipt,
+                force_reexport=force_reexport,
+            )
+        finally:
+            current = _file_identity(spm)
+            if current != sealed:
+                raise RuntimeError(
+                    "SpeedTree SPM changed during the sealed export transaction"
+                )
+    if policy_report is not None:
+        policy_report["spm_bone_policy"] = policy
+    return results
 
 
 def export_bundle(

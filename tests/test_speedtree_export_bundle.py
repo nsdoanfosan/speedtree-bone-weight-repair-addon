@@ -1,9 +1,11 @@
 import importlib.util
 import codecs
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -19,6 +21,165 @@ SPEC.loader.exec_module(speedtree_cli)
 
 
 class SpeedTreeExportBundleTests(unittest.TestCase):
+    @staticmethod
+    def _policy_export_fixture(root):
+        exe = root / "speedtree_collision_cli.exe"
+        hook = root / "speedtree_collision_hook.dll"
+        spm = root / "tree.spm"
+        options = root / "fbx.ini"
+        target = root / "out" / "tree.fbx"
+        exe.write_bytes(b"exe")
+        hook.write_bytes(b"hook")
+        spm.write_text(
+            "<SpeedTreeModel><Generators /></SpeedTreeModel>",
+            encoding="utf-8",
+        )
+        options.write_text(
+            "[Options]\nTextureSkipWriting=true\n",
+            encoding="utf-8",
+        )
+        return exe, spm, options, target
+
+    def test_minimum_bone_export_transaction_seals_policy_before_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            original = spm.read_bytes()
+            updated = original.replace(b" />", b"></Generators>")
+            backup = root / "tree.spm.backup"
+            events = []
+            originals = (
+                speedtree_cli.speedtree_export_gate,
+                speedtree_cli.ensure_minimum_absolute_branch_bones,
+                speedtree_cli.export_bundle,
+            )
+
+            @contextmanager
+            def gate():
+                events.append("gate_enter")
+                yield
+                events.append("gate_exit")
+
+            def ensure(path):
+                events.append("policy")
+                backup.write_bytes(original)
+                Path(path).write_bytes(updated)
+                return {
+                    "status": "updated",
+                    "spm": str(Path(path).resolve()),
+                    "changed": True,
+                    "changed_generator_count": 1,
+                    "changed_generators": [{"name": "Branch"}],
+                    "backup": str(backup),
+                    "source_sha256": hashlib.sha256(original).hexdigest(),
+                    "updated_sha256": hashlib.sha256(updated).hexdigest(),
+                    "policy": (
+                        "non_cluster_zero_bone_branch_to_absolute_one_v1"
+                    ),
+                }
+
+            def export(**_kwargs):
+                events.append("export")
+                self.assertEqual(spm.read_bytes(), updated)
+                return {"fbx": {"status": "ok"}}
+
+            speedtree_cli.speedtree_export_gate = gate
+            speedtree_cli.ensure_minimum_absolute_branch_bones = ensure
+            speedtree_cli.export_bundle = export
+            policy_report = {}
+            try:
+                result = (
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                        policy_report=policy_report,
+                    )
+                )
+            finally:
+                (
+                    speedtree_cli.speedtree_export_gate,
+                    speedtree_cli.ensure_minimum_absolute_branch_bones,
+                    speedtree_cli.export_bundle,
+                ) = originals
+
+            self.assertEqual(
+                events,
+                ["gate_enter", "policy", "export", "gate_exit"],
+            )
+            self.assertEqual(result["fbx"]["status"], "ok")
+            self.assertEqual(
+                policy_report["spm_bone_policy"]["updated_sha256"],
+                hashlib.sha256(updated).hexdigest(),
+            )
+
+    def test_minimum_bone_export_transaction_rejects_export_time_spm_drift(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            digest = hashlib.sha256(spm.read_bytes()).hexdigest()
+            originals = (
+                speedtree_cli.ensure_minimum_absolute_branch_bones,
+                speedtree_cli.export_bundle,
+            )
+
+            def ensure(path):
+                return {
+                    "status": "already_compliant",
+                    "spm": str(Path(path).resolve()),
+                    "changed": False,
+                    "changed_generator_count": 0,
+                    "changed_generators": [],
+                    "backup": "",
+                    "source_sha256": digest,
+                    "policy": (
+                        "non_cluster_zero_bone_branch_to_absolute_one_v1"
+                    ),
+                }
+
+            def export(**_kwargs):
+                spm.write_bytes(spm.read_bytes() + b"external-drift")
+                return {"fbx": {"status": "ok"}}
+
+            speedtree_cli.ensure_minimum_absolute_branch_bones = ensure
+            speedtree_cli.export_bundle = export
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "changed during the sealed export transaction",
+                ):
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                    )
+            finally:
+                (
+                    speedtree_cli.ensure_minimum_absolute_branch_bones,
+                    speedtree_cli.export_bundle,
+                ) = originals
+
+    def test_minimum_bone_export_transaction_rejects_malformed_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            original = speedtree_cli.ensure_minimum_absolute_branch_bones
+            speedtree_cli.ensure_minimum_absolute_branch_bones = (
+                lambda _path: {"status": "failed"}
+            )
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unsupported status",
+                ):
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                    )
+            finally:
+                speedtree_cli.ensure_minimum_absolute_branch_bones = original
+
     @staticmethod
     def _write_native_receipt(path, spm):
         stat = spm.stat()
