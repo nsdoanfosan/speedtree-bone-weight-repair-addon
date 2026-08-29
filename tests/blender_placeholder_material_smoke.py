@@ -175,6 +175,21 @@ with tempfile.TemporaryDirectory(
         assert "exactly one semantic bark" in str(exc), exc
     else:
         raise AssertionError("ambiguous bark candidates were auto-remapped")
+    resolved = core.normalize_merged_speedtree_placeholder_material(
+        ambiguous,
+        contract([default_intent, bark_intent, second_intent]),
+        bone_group_evidence={
+            "placeholder_groups": ["Bone_12_End"],
+            "groups_by_material": {
+                bark_material.name: ["Bone_12_End", "Bone_13_End"],
+                second_bark.name: ["Bone_99_End"],
+            },
+        },
+    )
+    assert resolved["target_material"] == bark_material.name, resolved
+    assert resolved["selection_policy"] == (
+        "unique_premerge_bone_group_superset_semantic_bark"
+    ), resolved
 
     unknown_none = mesh_object("UnknownNone", [bark_material, None])
     unknown_before = list(unknown_none.data.materials)

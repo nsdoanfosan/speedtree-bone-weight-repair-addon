@@ -8268,8 +8268,33 @@ def _is_semantic_bark_intent(intent):
     )
 
 
+def _placeholder_bone_group_evidence(source_objects):
+    """Snapshot pre-merge skin ownership for material-less Default geometry."""
+    api = handoff_contract.central_contract_api()
+    placeholder_groups = set()
+    groups_by_material = defaultdict(set)
+    for obj in source_objects or []:
+        if obj is None or obj.type != "MESH" or obj.data is None:
+            continue
+        group_names = {group.name for group in obj.vertex_groups}
+        materials = [material for material in obj.data.materials if material]
+        object_key = api.normalize_material_key(
+            api.production_group_base_name(obj.name)
+        )
+        if not materials and object_key == "default":
+            placeholder_groups.update(group_names)
+        for material in materials:
+            groups_by_material[material.name].update(group_names)
+    return {
+        "placeholder_groups": sorted(placeholder_groups),
+        "groups_by_material": {
+            name: sorted(groups) for name, groups in groups_by_material.items()
+        },
+    }
+
+
 def normalize_merged_speedtree_placeholder_material(
-    merged_obj, texture_contract=None
+    merged_obj, texture_contract=None, bone_group_evidence=None
 ):
     """Remove an unused proven Default/None slot without inventing semantics.
 
@@ -8388,6 +8413,25 @@ def normalize_merged_speedtree_placeholder_material(
                 continue
             seen_candidates.add(material.as_pointer())
             candidates.append((slot_index, material))
+        selection_policy = "unique_semantic_bark_only"
+        if len(candidates) > 1 and isinstance(bone_group_evidence, dict):
+            placeholder_groups = set(
+                bone_group_evidence.get("placeholder_groups") or []
+            )
+            groups_by_material = bone_group_evidence.get("groups_by_material") or {}
+            exact_owners = [
+                candidate
+                for candidate in candidates
+                if placeholder_groups
+                and placeholder_groups.issubset(
+                    set(groups_by_material.get(candidate[1].name) or [])
+                )
+            ]
+            if len(exact_owners) == 1:
+                candidates = exact_owners
+                selection_policy = (
+                    "unique_premerge_bone_group_superset_semantic_bark"
+                )
         if len(candidates) != 1:
             raise RuntimeError(
                 "SpeedTree source defect: final mesh contains faces assigned "
@@ -8435,7 +8479,7 @@ def normalize_merged_speedtree_placeholder_material(
         ),
         "placeholder_slots": placeholder_slots,
         "selection_policy": (
-            "unique_semantic_bark_only"
+            selection_policy
             if assigned_target_material is not None
             else "remove_only_when_no_faces_use_placeholder"
         ),
@@ -8870,13 +8914,18 @@ def run_merge_export(
         raise RuntimeError("No skinned source meshes found.")
 
     source_object_names = [obj.name for obj in source_objects]
+    placeholder_bone_group_evidence = _placeholder_bone_group_evidence(
+        source_objects
+    )
 
     merged_obj, ranges, _material_count, uv_names = merge_skinned_meshes(
         armature, source_objects, merged_name
     )
     placeholder_material_normalization = (
         normalize_merged_speedtree_placeholder_material(
-            merged_obj, texture_contract=texture_contract
+            merged_obj,
+            texture_contract=texture_contract,
+            bone_group_evidence=placeholder_bone_group_evidence,
         )
     )
     material_slot_validation = validate_face_assigned_material_slots(
