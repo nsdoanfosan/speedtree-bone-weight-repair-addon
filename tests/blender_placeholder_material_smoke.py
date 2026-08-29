@@ -117,17 +117,16 @@ with tempfile.TemporaryDirectory(
     shared = bpy.data.objects.new("SharedBeforeCopy", merged.data)
     bpy.context.scene.collection.objects.link(shared)
 
-    try:
-        core.normalize_merged_speedtree_placeholder_material(
-            merged, contract([default_intent, bark_intent])
-        )
-    except RuntimeError as exc:
-        assert "faces assigned" in str(exc), exc
-    else:
-        raise AssertionError("face-assigned Default material was auto-remapped")
-    assert merged.data is shared.data
-    assert list(merged.data.materials) == [default_material, bark_material]
-    assert [poly.material_index for poly in merged.data.polygons] == [0, 1]
+    assigned_result = core.normalize_merged_speedtree_placeholder_material(
+        merged, contract([default_intent, bark_intent])
+    )
+    assert assigned_result["proof"] == (
+        "strict_stmat_default_to_unique_semantic_bark"
+    ), assigned_result
+    assert assigned_result["changed_face_count"] == 1, assigned_result
+    assert merged.data is not shared.data
+    assert list(merged.data.materials) == [bark_material]
+    assert [poly.material_index for poly in merged.data.polygons] == [0, 0]
 
     unused_default = mesh_object(
         "UnusedDefault", [default_material, bark_material]
@@ -148,14 +147,34 @@ with tempfile.TemporaryDirectory(
     )["status"] == "not_applicable"
 
     none_merged = mesh_object("NoneMerged", [None, bark_material])
+    none_result = core.normalize_merged_speedtree_placeholder_material(
+        none_merged, contract([default_intent, bark_intent])
+    )
+    assert none_result["changed_face_count"] == 1, none_result
+    assert list(none_merged.data.materials) == [bark_material]
+
+    second_bark = bpy.data.materials.new("M_bark_second")
+    second_bark[core.UNREAL_TREE_PART_PROPERTY] = "bark"
+    ambiguous = mesh_object(
+        "AmbiguousDefault", [default_material, bark_material, second_bark]
+    )
+    second_intent = intent(
+        api,
+        2,
+        "M_bark_second_Mat",
+        tree_part="bark",
+        mode="managed_texture_set",
+        binding=ready_binding(texture_dir, "T_bark_second"),
+    )
     try:
         core.normalize_merged_speedtree_placeholder_material(
-            none_merged, contract([default_intent, bark_intent])
+            ambiguous,
+            contract([default_intent, bark_intent, second_intent]),
         )
     except RuntimeError as exc:
-        assert "faces assigned" in str(exc), exc
+        assert "exactly one semantic bark" in str(exc), exc
     else:
-        raise AssertionError("face-assigned None placeholder was auto-remapped")
+        raise AssertionError("ambiguous bark candidates were auto-remapped")
 
     unknown_none = mesh_object("UnknownNone", [bark_material, None])
     unknown_before = list(unknown_none.data.materials)
