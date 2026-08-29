@@ -195,13 +195,15 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     source_spm = root / "shared" / "SK_Runtime.spm"
     source_spm.write_bytes(b"current-spm-fixture")
 
-    # A no-slot native FBX mesh can be the complete authored skinned plant.
-    # Slot absence alone must never delete geometry.
+    # Exact material-less Default/Material FBX objects are dummy geometry when
+    # one current unmanaged, source-empty STMAT intent proves that identity.
+    # A differently named no-slot authored mesh remains preserved.
     cleanup_material = bpy.data.materials.new("M_cluster_Runtime_01")
     cleanup_renderable = make_mesh_object(
         "CleanupRenderable", [cleanup_material]
     )
     cleanup_unassigned = make_mesh_object("Default", [])
+    cleanup_authored_no_slots = make_mesh_object("AuthoredPlant", [])
     cleanup_contract = strict_runtime_contract(
         [
             make_intent("Default", 0, tree_part=None),
@@ -209,19 +211,20 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
         ]
     )
     cleanup_result = core.discard_unassigned_geometry_before_assembly(
-        [cleanup_renderable, cleanup_unassigned],
+        [cleanup_renderable, cleanup_unassigned, cleanup_authored_no_slots],
         texture_contract=cleanup_contract,
         spm_path=str(source_spm),
         source_fbx_path=str(source_fbx),
     )
-    assert cleanup_result["status"] == "not_applicable", cleanup_result
-    assert cleanup_result["cleanup_contract_version"] == 4, cleanup_result
-    assert cleanup_result["inspected_mesh_object_count"] == 2, cleanup_result
-    assert cleanup_result["changed_object_count"] == 0, cleanup_result
-    assert cleanup_result["removed_object_count"] == 0, cleanup_result
-    assert cleanup_result["removed_face_count"] == 0, cleanup_result
-    assert cleanup_result["removed_objects"] == [], cleanup_result
-    assert bpy.data.objects.get("Default") is cleanup_unassigned
+    assert cleanup_result["status"] == "applied", cleanup_result
+    assert cleanup_result["cleanup_contract_version"] == 5, cleanup_result
+    assert cleanup_result["inspected_mesh_object_count"] == 3, cleanup_result
+    assert cleanup_result["changed_object_count"] == 1, cleanup_result
+    assert cleanup_result["removed_object_count"] == 1, cleanup_result
+    assert cleanup_result["removed_face_count"] == 1, cleanup_result
+    assert cleanup_result["removed_objects"] == ["Default"], cleanup_result
+    assert bpy.data.objects.get("Default") is None
+    assert bpy.data.objects.get("AuthoredPlant") is cleanup_authored_no_slots
     assert len(cleanup_renderable.data.polygons) == 1
     assert core.renderable_geometry_evidence([cleanup_renderable]) == {
         "status": "ok",

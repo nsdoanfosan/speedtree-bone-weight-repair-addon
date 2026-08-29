@@ -244,6 +244,7 @@ def run_speedtree_cli_export(
     export_fbx=True,
     export_xml=True,
     timeout_seconds=900,
+    force_reexport=False,
 ):
     spm = Path(spm_path)
     if not spm.exists():
@@ -288,6 +289,7 @@ def run_speedtree_cli_export(
             targets=targets,
             timeout_seconds=timeout_seconds,
             native_receipt=native_receipt,
+            force_reexport=force_reexport,
         )
     else:
         for kind, target, options in targets:
@@ -301,6 +303,7 @@ def run_speedtree_cli_export(
                 native_receipt=(
                     native_receipt if kind == "fbx" else None
                 ),
+                force_reexport=force_reexport,
             )
 
     bundle_mtime_sync = None
@@ -321,6 +324,7 @@ def run_speedtree_cli_export(
         "output_root": str(root),
         "name_stem": stem,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
+        "force_reexport_requested": bool(force_reexport),
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
         "native_receipt": (
@@ -6205,7 +6209,7 @@ def apply_speedtree_material_intents(objects, texture_contract=None):
 UNASSIGNED_GEOMETRY_CLEANUP_POLICY = (
     "discard_unassigned_geometry_before_assembly"
 )
-UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 4
+UNASSIGNED_GEOMETRY_CLEANUP_CONTRACT_VERSION = 5
 UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS = frozenset({
     "default",
     "material",
@@ -6296,6 +6300,34 @@ def _cleanup_face_reason(polygon, materials, texture_contract):
     return ""
 
 
+def _cleanup_materialless_object_key(obj, texture_contract):
+    """Prove an exact material-less Default/Material FBX dummy from STMAT."""
+    if obj is None or not isinstance(texture_contract, dict):
+        return ""
+    envelope = texture_contract.get("speedtree_pipeline_contract")
+    if not isinstance(envelope, dict):
+        return ""
+    api = handoff_contract.central_contract_api()
+    object_base = api.production_group_base_name(obj.name)
+    object_key = api.normalize_material_key(object_base)
+    if object_key not in UNASSIGNED_GEOMETRY_PLACEHOLDER_KEYS:
+        return ""
+    matches = _strict_material_intents_for_name(object_base, envelope)
+    if len(matches) != 1:
+        return ""
+    intent = matches[0]
+    binding = intent.get("texture_binding")
+    files = binding.get("files") if isinstance(binding, dict) else None
+    if (
+        api.normalize_material_key(intent.get("material_key")) != object_key
+        or str(intent.get("texture_source_mode") or "")
+        == "managed_texture_set"
+        or files
+    ):
+        return ""
+    return object_key
+
+
 def renderable_geometry_evidence(objects):
     meshes = [
         obj
@@ -6375,7 +6407,9 @@ def discard_unassigned_geometry_before_assembly(
 
     This runs before Blender joins material-grouped imports. Exact current
     STMAT evidence admits source-empty ``Default`` and ``Material``; a generic
-    name, an empty slot, or no slots at all never authorizes deletion.
+    name or an empty slot never authorizes deletion.  A material-less object is
+    deleted only when its exact Default/Material object identity is backed by
+    one current unmanaged, source-empty STMAT intent.
     """
     mesh_objects = [
         obj
@@ -6392,15 +6426,29 @@ def discard_unassigned_geometry_before_assembly(
     candidates = []
     for obj in mesh_objects:
         materials = list(obj.data.materials)
-        invalid = [
-            (int(polygon.index), reason)
-            for polygon in obj.data.polygons
-            if (
-                reason := _cleanup_face_reason(
-                    polygon, materials, texture_contract
+        materialless_key = (
+            _cleanup_materialless_object_key(obj, texture_contract)
+            if not materials
+            else ""
+        )
+        if materialless_key:
+            invalid = [
+                (
+                    int(polygon.index),
+                    f"canonical_unmanaged_{materialless_key}_object_without_slots",
                 )
-            )
-        ]
+                for polygon in obj.data.polygons
+            ]
+        else:
+            invalid = [
+                (int(polygon.index), reason)
+                for polygon in obj.data.polygons
+                if (
+                    reason := _cleanup_face_reason(
+                        polygon, materials, texture_contract
+                    )
+                )
+            ]
         if invalid:
             candidates.append((obj, materials, invalid))
 
@@ -6791,12 +6839,69 @@ def tag_native_export_geometry(imported, source_fbx_path, spm_path):
     }
 
 
+RAW_IMPORT_OBSERVER_DATA_COLLECTIONS = (
+    "meshes",
+    "armatures",
+    "materials",
+    "images",
+    "actions",
+)
+
+
+def snapshot_raw_import_observer_data():
+    """Capture only the datablocks an FBX import may orphan on rollback."""
+    return {
+        name: {value.as_pointer() for value in getattr(bpy.data, name)}
+        for name in RAW_IMPORT_OBSERVER_DATA_COLLECTIONS
+    }
+
+
+def rollback_raw_import_observer(imported_objects, data_snapshot):
+    """Remove a raw import after a pre-mutation observer rejects it."""
+    for obj in list(imported_objects):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except ReferenceError:
+            continue
+    for name in RAW_IMPORT_OBSERVER_DATA_COLLECTIONS:
+        collection = getattr(bpy.data, name)
+        previous = data_snapshot.get(name, set())
+        for value in list(collection):
+            try:
+                is_new = value.as_pointer() not in previous
+                has_no_users = value.users == 0
+            except ReferenceError:
+                continue
+            if is_new and has_no_users:
+                collection.remove(value)
+
+
+def observe_raw_import_before_mutation(
+    raw_import_observer,
+    imported_objects,
+    source_fbx_path,
+    data_snapshot,
+):
+    """Expose an exact raw FBX import and fail closed if inspection rejects it."""
+    if raw_import_observer is None:
+        return None
+    try:
+        return raw_import_observer(
+            imported_objects,
+            Path(source_fbx_path).resolve(),
+        )
+    except Exception:
+        rollback_raw_import_observer(imported_objects, data_snapshot)
+        raise
+
+
 def run_import_source_fbx(
     source_fbx_path,
     source_collection_name="SpeedTree_Source",
     spm_path="",
     texture_contract=None,
     source_identity_path="",
+    raw_import_observer=None,
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -6805,8 +6910,29 @@ def run_import_source_fbx(
         texture_contract = _bat_runtime_texture_contract(None)
 
     before = {obj.name for obj in bpy.data.objects}
-    bpy.ops.import_scene.fbx(filepath=str(path))
+    observer_data_snapshot = (
+        snapshot_raw_import_observer_data()
+        if raw_import_observer is not None
+        else None
+    )
+    import_operator_result = bpy.ops.import_scene.fbx(filepath=str(path))
     imported = [obj for obj in bpy.data.objects if obj.name not in before]
+    if (
+        raw_import_observer is not None
+        and "FINISHED" not in import_operator_result
+    ):
+        rollback_raw_import_observer(imported, observer_data_snapshot)
+        raise RuntimeError(
+            f"Raw FBX observer import returned {import_operator_result}"
+        )
+    for obj in imported:
+        obj["codex_source_fbx"] = str(path)
+    observe_raw_import_before_mutation(
+        raw_import_observer,
+        imported,
+        path,
+        observer_data_snapshot,
+    )
     native_geometry_identity = tag_native_export_geometry(
         imported,
         path,
@@ -6817,7 +6943,6 @@ def run_import_source_fbx(
     # stray source objects there would split the asset into multiple FBX files.
     source_collection = ensure_scene_collection(source_collection_name)
     for obj in imported:
-        obj["codex_source_fbx"] = str(path)
         if source_identity_path:
             obj["codex_source_identity"] = str(source_identity_path)
         ensure_only_collection(obj, source_collection)
@@ -7913,28 +8038,45 @@ def build_boneless_rigid_metadata(xml_path, armature, reason):
         armature.get("speedtree_native_boneless_binding", "")
     )
     bones = list(armature.data.bones)
-    if (
-        binding != "native_boneless_rigid_axis_v1"
-        or len(bones) != 1
-        or bones[0].name != "Bone_1_Start"
-        or bones[0].parent is not None
-    ):
+    legacy_axis = (
+        binding == "native_boneless_rigid_axis_v1"
+        and len(bones) == 1
+        and bones[0].name == "Bone_1_Start"
+        and bones[0].parent is None
+    )
+    native_axis = (
+        binding == ""
+        and [bone.name for bone in bones]
+        == ["Root", "Bone_10000_Start", "Bone_10000_End"]
+        and bones[0].parent is None
+        and bones[1].parent == bones[0]
+        and bones[2].parent == bones[1]
+    )
+    if not legacy_axis and not native_axis:
         raise RuntimeError(
             "Bone-less SpeedTree XML requires the exact native rigid-axis "
             "armature contract; found binding="
             f"{binding!r}, bones={[bone.name for bone in bones]}"
         )
-    records = [{
-        "name": "Bone_1_Start",
-        "bone_index": 0,
-        "parent_index": -1,
-        "xml_id": None,
-        "generator": "NativeBonelessRigid",
-        "mass": 0.0,
-        "radius": 0.0,
-        "group": 0,
-        "native_role": "boneless_rigid_axis",
-    }]
+    records = []
+    for index, bone in enumerate(bones):
+        records.append({
+            "name": bone.name,
+            "bone_index": index,
+            "parent_index": (
+                armature.data.bones.find(bone.parent.name)
+                if bone.parent is not None else -1
+            ),
+            "xml_id": None,
+            "generator": "NativeBonelessRigid",
+            "mass": 0.0,
+            "radius": 0.0,
+            "group": 0,
+            "native_role": (
+                "fbx_wrapper_root" if bone.name == "Root"
+                else "boneless_rigid_axis"
+            ),
+        })
     simulation_group = {
         "index": 0,
         "generators": ["NativeBonelessRigid"],
@@ -7946,8 +8088,11 @@ def build_boneless_rigid_metadata(xml_path, armature, reason):
     info = {
         "source": str(xml_path),
         "xml_bone_count": 0,
-        "armature_bone_count": 1,
-        "mapping_contract": "native_boneless_rigid_axis_v1",
+        "armature_bone_count": len(bones),
+        "mapping_contract": (
+            "native_zero_bone_absolute_axis_v2"
+            if native_axis else "native_boneless_rigid_axis_v1"
+        ),
         "synthetic": True,
         "fallback_reason": reason,
         "generators": {"NativeBonelessRigid": 0},
@@ -8030,11 +8175,7 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
                 f"Duplicate SpeedTree XML Bone ID: {xml_id}"
             )
         xml_by_id[xml_id] = xml_bone
-    expected_xml_ids = set(range(len(xml_bones)))
-    if set(xml_by_id) != expected_xml_ids:
-        raise RuntimeError(
-            "SpeedTree XML Bone IDs are not a contiguous zero-based range"
-        )
+    expected_xml_ids = set(xml_by_id)
 
     matrix = armature.matrix_world
     groups, group_of_generator = build_simulation_groups(xml_bones, trunk_generator_regex)
@@ -8121,7 +8262,7 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
         "source": str(xml_path),
         "xml_bone_count": len(xml_bones),
         "armature_bone_count": len(armature.data.bones),
-        "mapping_contract": "native_bone_ordinal_to_xml_id_v1",
+        "mapping_contract": "native_sparse_exact_bone_id_to_xml_id_v2",
         "scale": NATIVE_SPEEDTREE_XML_SCALE,
         "trunk_generator_regex": trunk_generator_regex,
         "generators": {name: index for name, index in sorted(group_of_generator.items())},
@@ -8221,37 +8362,6 @@ def _is_unmanaged_empty_default_intent(intent):
     )
 
 
-def _is_ready_managed_bark_intent(intent):
-    binding = intent.get("texture_binding")
-    if not isinstance(binding, dict):
-        return False
-    if (
-        str(intent.get("tree_part") or "") != "bark"
-        or str(intent.get("texture_source_mode") or "")
-        != "managed_texture_set"
-        or str(binding.get("status") or "") != "ok"
-    ):
-        return False
-    files = binding.get("files")
-    if not isinstance(files, dict):
-        return False
-    for role in SPEEDTREE_TEXTURE_ROLES:
-        path = Path(str(files.get(role) or ""))
-        try:
-            if not path.is_file() or path.stat().st_size <= 0:
-                return False
-        except OSError:
-            return False
-    return True
-
-
-def _is_semantic_bark_intent(intent):
-    return bool(
-        isinstance(intent, dict)
-        and str(intent.get("tree_part") or "") == "bark"
-    )
-
-
 def normalize_merged_speedtree_placeholder_material(
     merged_obj, texture_contract=None
 ):
@@ -8262,8 +8372,9 @@ def normalize_merged_speedtree_placeholder_material(
     envelope supplies the only accepted semantic evidence.  No material name
     other than the central exact ``default`` key is treated as a placeholder,
     and a ``None`` slot is accepted only at the one STMAT Default ordinal.
-    A face assigned to that slot is an authored/exported defect and is rejected;
-    it is never reassigned to bark or any other guessed material.
+    A face assigned to that slot remains an authored/exported defect. Dummy
+    geometry must be deleted before weighting and merge, never relabeled as a
+    nearby bark material after the topology and skin data have been combined.
     """
     if not isinstance(texture_contract, dict) or not texture_contract.get(
         "strict_speedtree_pipeline_contract"
@@ -8283,9 +8394,6 @@ def normalize_merged_speedtree_placeholder_material(
         )
 
     api = handoff_contract.central_contract_api()
-    runtime_tolerant = _runtime_tolerant_texture_contract(
-        texture_contract
-    )
     intents = list(envelope.get("material_intents") or [])
     default_intents = [
         row for row in intents if _is_unmanaged_empty_default_intent(row)
@@ -8354,9 +8462,10 @@ def normalize_merged_speedtree_placeholder_material(
     )
     if assigned_placeholder_faces:
         raise RuntimeError(
-            "SpeedTree source defect: final mesh contains faces assigned to "
-            "a generic Default material slot; repair the SPM material "
-            "assignment instead of remapping it during Assembly"
+            "SpeedTree source defect: final mesh still contains faces assigned "
+            "to a generic Default material slot. Delete the proven dummy "
+            "geometry before weighting/merge or repair the source SPM; "
+            f"assigned face count: {assigned_placeholder_faces}"
         )
 
     if merged_obj.data.users > 1:
@@ -8383,7 +8492,9 @@ def normalize_merged_speedtree_placeholder_material(
         "proof": "unused_strict_stmat_default_slot_removed",
         "placeholder_slots": placeholder_slots,
         "selection_policy": "remove_only_when_no_faces_use_placeholder",
-        "changed_face_count": 0,
+        "target_material": None,
+        "target_material_slot": None,
+        "changed_face_count": assigned_placeholder_faces,
         "material_count_before": len(old_materials),
         "material_count_after": len(mesh.materials),
     }
@@ -8808,13 +8919,13 @@ def run_merge_export(
         raise RuntimeError("No skinned source meshes found.")
 
     source_object_names = [obj.name for obj in source_objects]
-
     merged_obj, ranges, _material_count, uv_names = merge_skinned_meshes(
         armature, source_objects, merged_name
     )
     placeholder_material_normalization = (
         normalize_merged_speedtree_placeholder_material(
-            merged_obj, texture_contract=texture_contract
+            merged_obj,
+            texture_contract=texture_contract,
         )
     )
     material_slot_validation = validate_face_assigned_material_slots(
@@ -9406,7 +9517,7 @@ def clear_previous_codex_build(settings):
     }
 
 
-def run_import_and_assemble(settings):
+def run_import_and_assemble(settings, raw_import_observer=None):
     # settings must already carry source_fbx_path (and ideally xml_path) from the
     # SpeedTree export step. Wipes the previous build, re-imports, re-runs the
     # assembly pipeline. Pressing the button again is a clean update.
@@ -9428,6 +9539,7 @@ def run_import_and_assemble(settings):
         spm_path=settings.get("spm_path", ""),
         texture_contract=texture_contract,
         source_identity_path=settings.get("source_identity_path", ""),
+        raw_import_observer=raw_import_observer,
     )
     import_duration = perf_counter() - import_started
     if authorized_dummy_cleanup_left_no_renderable_geometry(imported):

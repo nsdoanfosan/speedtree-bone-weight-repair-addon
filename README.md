@@ -38,7 +38,7 @@ Cluster Normalizer ownership. That path changes export ownership only.
 - Module: `speedtree_bone_weight_repair`
 - Panel: `View3D > Sidebar > SpeedTree > Assembly`
 - Installed junction:
-  `C:\Users\PARK\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons\speedtree_bone_weight_repair`
+  `C:\Users\PARK\AppData\Roaming\Blender Foundation\Blender\5.2\scripts\addons\speedtree_bone_weight_repair`
 
 ## Main controls
 
