@@ -66,6 +66,9 @@ _PRIVATE_DESKTOP_CREATION_FAILED = 14
 _PROCESS_EXPORT_STALLED = 24
 _EXPORT_RETRY_ATTEMPTS = 3
 _EXPORT_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
+FRESH_VERIFICATION_SEALED_MARKER = (
+    "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+)
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -1968,6 +1971,181 @@ def export_bundle_with_minimum_bone_policy(
     return results
 
 
+def _validate_fresh_verification_bundle(
+    results,
+    targets,
+    native_receipt,
+    spm,
+):
+    """Prove one fresh verification-only process sealed the exact bundle."""
+
+    target_by_kind = {
+        str(kind).lower(): Path(target).resolve()
+        for kind, target, _options in targets
+    }
+    if set(target_by_kind) != {"fbx", "xml"} or set(results) != {
+        "fbx",
+        "xml",
+    }:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX/XML results"
+        )
+    receipt = Path(native_receipt).resolve() if native_receipt else None
+    if receipt is None or not _native_receipt_is_valid(receipt, spm):
+        raise RuntimeError(
+            "Fresh verification-only export did not seal a current native receipt"
+        )
+
+    sealed_artifacts = {}
+    for kind in ("fbx", "xml"):
+        row = results[kind]
+        target = target_by_kind[kind]
+        try:
+            row_path = Path(str(row.get("path") or "")).resolve()
+        except (OSError, RuntimeError):
+            row_path = Path()
+        if (
+            row_path != target
+            or row.get("exists") is not True
+            or row.get("cache_hit") is not False
+            or row.get("force_reexport_requested") is not True
+            or row.get("verification_only") is not True
+            or row.get("bundled_process") is not True
+            or row.get("bundle_fallback") is not False
+            or FRESH_VERIFICATION_SEALED_MARKER
+            not in str(row.get("stdout") or "")
+            or not _basic_output_is_valid(kind, target, parse_xml=True)
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export result is not one sealed "
+                f"launcher bundle: {kind}"
+            )
+        attempts = row.get("export_attempts") or []
+        if (
+            len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export was not exactly one "
+                f"successful process attempt: {kind}"
+            )
+        required = [target]
+        if kind == "fbx":
+            required.extend([target.with_suffix(".stmat"), receipt])
+        artifacts = {
+            str(record.get("relative_path") or "").casefold(): record
+            for record in row.get("artifacts") or ()
+            if isinstance(record, dict)
+        }
+        verified = []
+        for path in required:
+            relative = path.resolve().relative_to(target.parent).as_posix()
+            record = artifacts.get(relative.casefold())
+            if record is None or not path.is_file():
+                raise RuntimeError(
+                    "Fresh verification-only export is missing a sealed "
+                    f"artifact: {path}"
+                )
+            stat = path.stat()
+            digest = _sha256_file(path)
+            if (
+                int(record.get("size") or -1) != stat.st_size
+                or str(record.get("sha256") or "").casefold()
+                != digest.casefold()
+            ):
+                raise RuntimeError(
+                    "Fresh verification-only export artifact identity drifted: "
+                    + str(path)
+                )
+            verified.append({
+                "path": str(path),
+                "size": stat.st_size,
+                "sha256": digest,
+            })
+        sealed_artifacts[kind] = verified
+
+    return {
+        "status": "sealed",
+        "policy": "fresh_verification_only_as_sole_export_v1",
+        "explicit_opt_in_required": True,
+        "force_reexport": True,
+        "collision_prune_bundle_attempt_count": 0,
+        "verification_bundle_attempt_count": 1,
+        "independent_fallback_attempt_count": 0,
+        "launcher_sealed_completion": {
+            "status": "observed",
+            "marker": FRESH_VERIFICATION_SEALED_MARKER,
+        },
+        "native_receipt": str(receipt),
+        "sealed_artifacts": sealed_artifacts,
+    }
+
+
+def export_fresh_verification_bundle_with_minimum_bone_policy(
+    exe,
+    spm,
+    targets,
+    timeout_seconds=900,
+    native_receipt=None,
+    force_reexport=False,
+    policy_report=None,
+):
+    """Run one explicitly requested fresh verification-only FBX/XML export."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires force_reexport=True"
+        )
+    exe, spm, targets, native_receipt = _validated_policy_export_request(
+        exe,
+        spm,
+        targets,
+        native_receipt,
+    )
+    if {kind for kind, _target, _options in targets} != {"fbx", "xml"}:
+        raise RuntimeError(
+            "Fresh verification-only export requires exactly FBX and XML"
+        )
+    if native_receipt is None:
+        raise RuntimeError(
+            "Fresh verification-only export requires a native receipt target"
+        )
+    with speedtree_export_gate():
+        policy = _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+        sealed = dict(policy["sealed_source_identity"])
+        try:
+            results = export_bundle(
+                exe=exe,
+                spm=spm,
+                targets=targets,
+                timeout_seconds=timeout_seconds,
+                native_receipt=native_receipt,
+                force_reexport=True,
+                verification_only=True,
+                fail_closed=True,
+            )
+            verification = _validate_fresh_verification_bundle(
+                results,
+                targets,
+                native_receipt,
+                spm,
+            )
+        finally:
+            current = _file_identity(spm)
+            if current != sealed:
+                raise RuntimeError(
+                    "SpeedTree SPM changed during the sealed export transaction"
+                )
+    if policy_report is not None:
+        policy_report["spm_bone_policy"] = policy
+        policy_report["fresh_verification_only_export"] = verification
+    return results
+
+
 def export_bundle(
     exe,
     spm,
@@ -1975,6 +2153,8 @@ def export_bundle(
     timeout_seconds=900,
     native_receipt=None,
     force_reexport=False,
+    verification_only=False,
+    fail_closed=False,
 ):
     """Export FBX and XML through one collision-CLI/Modeler process.
 
@@ -1985,6 +2165,14 @@ def export_bundle(
     exe = Path(exe)
     spm = Path(spm)
     native_receipt = Path(native_receipt) if native_receipt else None
+    if verification_only and not force_reexport:
+        raise RuntimeError(
+            "Verification-only bundle execution requires force_reexport=True"
+        )
+    if fail_closed and not verification_only:
+        raise RuntimeError(
+            "Fail-closed bundle execution requires verification_only=True"
+        )
     prepared = []
     all_items = []
     results = {}
@@ -2093,7 +2281,8 @@ def export_bundle(
     stdout = ""
     stderr = ""
     bundle_reconciliation = None
-    for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
+    maximum_attempts = 1 if fail_closed else _EXPORT_RETRY_ATTEMPTS
+    for attempt in range(1, maximum_attempts + 1):
         with tempfile.TemporaryDirectory(
             prefix="bwr_speedtree_bundle_"
         ) as temp_dir:
@@ -2105,6 +2294,8 @@ def export_bundle(
                 staged[item["kind"]].parent.mkdir(parents=True, exist_ok=True)
             staged_receipt = None
             command = [str(exe)]
+            if verification_only:
+                command.append("--verification-only")
             if native_receipt is not None:
                 relative_receipt = native_receipt.resolve().relative_to(common_root)
                 staged_receipt = staging_root / relative_receipt
@@ -2127,7 +2318,12 @@ def export_bundle(
                     cwd=spm.parent,
                     timeout_seconds=timeout_seconds,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle timed out before "
+                        "launcher-sealed completion"
+                    ) from exc
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2149,11 +2345,17 @@ def export_bundle(
                 attempt_record["failure_kind"] = (
                     failure_kind or "process_export_failed"
                 )
-                if failure_kind and attempt < _EXPORT_RETRY_ATTEMPTS:
+                if failure_kind and attempt < maximum_attempts:
                     backoff = _EXPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
                     attempt_record["retry_backoff_seconds"] = backoff
                     time.sleep(backoff)
                     continue
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle failed before "
+                        "launcher-sealed completion: returncode="
+                        f"{returncode}"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2170,7 +2372,17 @@ def export_bundle(
                     item["kind"], staged[item["kind"]], parse_xml=True
                 )
             ]
+            if (
+                verification_only
+                and FRESH_VERIFICATION_SEALED_MARKER not in stdout
+            ):
+                invalid.append("launcher_sealed_completion_marker")
             if invalid:
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle failed exact output "
+                        "validation: " + ", ".join(invalid)
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2184,6 +2396,11 @@ def export_bundle(
                 staged_receipt is not None
                 and not _native_receipt_is_valid(staged_receipt, spm)
             ):
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle did not create a "
+                        "current native receipt"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2230,6 +2447,7 @@ def export_bundle(
             "artifacts": artifacts,
             "completed_at": finished,
             "bundled_process": True,
+            "verification_only": bool(verification_only),
             "native_receipt": (
                 str(native_receipt)
                 if native_receipt is not None and item["kind"] == "fbx"
@@ -2258,6 +2476,8 @@ def export_bundle(
             "artifacts": artifacts,
             "export_attempts": export_attempts,
             "bundled_process": True,
+            "verification_only": bool(verification_only),
+            "bundle_fallback": False,
             "force_reexport_requested": bool(force_reexport),
             "native_receipt": (
                 str(native_receipt)

@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 import codecs
 import hashlib
 import json
@@ -21,6 +22,50 @@ SPEC.loader.exec_module(speedtree_cli)
 
 
 class SpeedTreeExportBundleTests(unittest.TestCase):
+    def test_core_exposes_a_separate_explicit_gateway_operation(self):
+        core_path = MODULE_PATH.with_name("core.py")
+        tree = ast.parse(core_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        normal = functions["run_speedtree_cli_export"]
+        fresh = functions["run_fresh_verification_only_export"]
+        self.assertEqual(
+            [argument.arg for argument in normal.args.args],
+            [argument.arg for argument in fresh.args.args],
+        )
+
+        def selected_mode(function):
+            calls = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_run_speedtree_cli_export"
+            ]
+            self.assertEqual(len(calls), 1)
+            keyword = next(
+                row
+                for row in calls[0].keywords
+                if row.arg == "fresh_verification_only"
+            )
+            self.assertIsInstance(keyword.value, ast.Constant)
+            return keyword.value.value
+
+        self.assertIs(selected_mode(normal), False)
+        self.assertIs(selected_mode(fresh), True)
+        fresh_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            fresh,
+        )
+        self.assertIn("if force_reexport is not True:", fresh_source)
+        self.assertIn(
+            "if export_fbx is not True or export_xml is not True:",
+            fresh_source,
+        )
+
     @staticmethod
     def _policy_export_fixture(root):
         exe = root / "speedtree_collision_cli.exe"
@@ -179,6 +224,185 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
                     )
             finally:
                 speedtree_cli.ensure_minimum_absolute_branch_bones = original
+
+    def test_fresh_verification_only_is_one_sealed_bundle_without_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                self.assertIn("--verification-only", command)
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                staged_receipt = Path(
+                    command[command.index("--native-receipt") + 1]
+                )
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"fresh-fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />",
+                    encoding="utf-8",
+                )
+                secondary.write_text("<SpeedTreeRaw />", encoding="utf-8")
+                self._write_native_receipt(staged_receipt, spm)
+                return (
+                    0,
+                    speedtree_cli.FRESH_VERIFICATION_SEALED_MARKER,
+                    "",
+                )
+
+            speedtree_cli._run_process = fake_run
+            policy_report = {}
+            try:
+                result = (
+                    speedtree_cli
+                    .export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                        policy_report=policy_report,
+                    )
+                )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(result["fbx"]["verification_only"])
+            self.assertTrue(result["xml"]["verification_only"])
+            self.assertTrue(result["fbx"]["bundled_process"])
+            self.assertFalse(result["fbx"]["bundle_fallback"])
+            evidence = policy_report["fresh_verification_only_export"]
+            self.assertEqual(
+                evidence["collision_prune_bundle_attempt_count"], 0
+            )
+            self.assertEqual(evidence["verification_bundle_attempt_count"], 1)
+            self.assertEqual(evidence["independent_fallback_attempt_count"], 0)
+            self.assertEqual(
+                evidence["launcher_sealed_completion"]["status"],
+                "observed",
+            )
+            self.assertEqual(fbx.read_bytes(), b"fresh-fbx")
+            self.assertTrue(receipt.is_file())
+            self.assertTrue(xml.is_file())
+
+    def test_fresh_verification_only_missing_sealed_marker_fails_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                staged_receipt = Path(
+                    command[command.index("--native-receipt") + 1]
+                )
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"unsealed-fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />",
+                    encoding="utf-8",
+                )
+                secondary.write_text("<SpeedTreeRaw />", encoding="utf-8")
+                self._write_native_receipt(staged_receipt, spm)
+                return 0, "missing marker", ""
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "launcher_sealed_completion_marker",
+                ):
+                    speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(fbx.exists())
+            self.assertFalse(xml.exists())
+            self.assertFalse(receipt.exists())
+
+    def test_fresh_verification_only_timeout_fails_without_retry_or_promotion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "timed out before launcher-sealed completion",
+                ):
+                    speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn("--verification-only", calls[0])
+            self.assertFalse(fbx.exists())
+            self.assertFalse(xml.exists())
+            self.assertFalse(receipt.exists())
 
     @staticmethod
     def _write_native_receipt(path, spm):

@@ -233,7 +233,7 @@ def default_speedtree_export_options(spm_path, kind="fbx"):
     return r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\export_presets\VFX\__FBX.ini"
 
 
-def run_speedtree_cli_export(
+def _run_speedtree_cli_export(
     spm_path,
     speedtree_exe_path="",
     export_options_path="",
@@ -245,6 +245,7 @@ def run_speedtree_cli_export(
     export_xml=True,
     timeout_seconds=900,
     force_reexport=False,
+    fresh_verification_only=False,
 ):
     spm = Path(spm_path)
     if not spm.exists():
@@ -280,7 +281,12 @@ def run_speedtree_cli_export(
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
     policy_report = {}
-    results = speedtree_cli.export_bundle_with_minimum_bone_policy(
+    export_transaction = (
+        speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy
+        if fresh_verification_only
+        else speedtree_cli.export_bundle_with_minimum_bone_policy
+    )
+    results = export_transaction(
         exe=exe,
         spm=spm,
         targets=targets,
@@ -311,12 +317,89 @@ def run_speedtree_cli_export(
         "spm_bone_policy": spm_bone_policy,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "force_reexport_requested": bool(force_reexport),
+        "fresh_verification_only_export": (
+            policy_report.get("fresh_verification_only_export")
+            if fresh_verification_only
+            else {
+                "status": "not_requested",
+                "policy": "normal_collision_export_with_existing_fallback_v1",
+                "explicit_opt_in_required": True,
+            }
+        ),
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
         "native_receipt": (
             str(native_receipt) if native_receipt is not None else ""
         ),
     }
+
+
+def run_speedtree_cli_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+):
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=export_fbx,
+        export_xml=export_xml,
+        timeout_seconds=timeout_seconds,
+        force_reexport=force_reexport,
+        fresh_verification_only=False,
+    )
+
+
+def run_fresh_verification_only_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+):
+    """Run the explicit fresh, sole verification-only FBX/XML transaction."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires force_reexport=True"
+        )
+    if export_fbx is not True or export_xml is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX and XML"
+        )
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=True,
+        export_xml=True,
+        timeout_seconds=timeout_seconds,
+        force_reexport=True,
+        fresh_verification_only=True,
+    )
 
 
 def remove_phantom_image_nodes(objects):
