@@ -5715,7 +5715,9 @@ def _numeric_material_equivalence(left, right, texture_contract):
 
 
 def _consolidate_blender_numeric_material_duplicates(
-    mesh_objects, texture_contract=None
+    mesh_objects,
+    texture_contract=None,
+    authoritative_material_names=(),
 ):
     """Remap proven ``Material``/``Material.001`` collisions to one datablock."""
     used_materials = []
@@ -5802,6 +5804,11 @@ def _consolidate_blender_numeric_material_duplicates(
         ):
             targets_by_base[base_name.casefold()].append(material)
 
+    authoritative_keys = {
+        str(name or "").strip().casefold()
+        for name in (authoritative_material_names or ())
+        if str(name or "").strip()
+    }
     material_targets = {}
     proofs = {}
     skipped_groups = []
@@ -5814,6 +5821,19 @@ def _consolidate_blender_numeric_material_duplicates(
             proof = _numeric_material_equivalence(
                 material, target, texture_contract
             )
+            if (
+                not proof
+                and base_name.casefold() in authoritative_keys
+                and target.name.casefold() == base_name.casefold()
+            ):
+                # Cluster Normalizer owns this exact public material identity.
+                # When the raw SpeedTree FBX is imported into the persisted
+                # normalized blend, Blender may rename the incoming material
+                # to ``.001`` solely because the authoritative card material
+                # already exists.  This exact role contract is sufficient to
+                # repair that creation-time collision without guessing from a
+                # nearby name or stripping arbitrary numeric suffixes.
+                proof = "authoritative_cluster_material_identity"
             if proof:
                 candidates.append((target, proof))
         if len(candidates) == 1:
@@ -5941,7 +5961,11 @@ def _consolidate_blender_numeric_material_duplicates(
     }
 
 
-def consolidate_speedtree_group_materials(objects, texture_contract=None):
+def consolidate_speedtree_group_materials(
+    objects,
+    texture_contract=None,
+    authoritative_material_names=(),
+):
     # Atlas Builder child collections become numeric-boundary material suffixes.
     # Collapse proven shared-source slots before merge/weight export; do not
     # touch object transforms, UVs, vertex groups, or weights.
@@ -5958,8 +5982,16 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
     )
+    exact_material_names = list(authoritative_material_names or ())
+    authoritative_keys = {
+        str(name or "").strip().casefold()
+        for name in exact_material_names
+        if str(name or "").strip()
+    }
     numeric_result = _consolidate_blender_numeric_material_duplicates(
-        mesh_objects, texture_contract=texture_contract
+        mesh_objects,
+        texture_contract=texture_contract,
+        authoritative_material_names=exact_material_names,
     )
     # The validated contract is authoritative. Legacy manifest consolidation
     # must not mutate a strict scene before its binding signatures are checked.
@@ -6027,11 +6059,12 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             continue
 
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
-        target_name = unified_material_name(base_name, source_materials)
+        source_target_name = unified_material_name(base_name, source_materials)
+        target_name = source_target_name
         if strict_contract:
             try:
                 target_intent = handoff_contract.resolve_material_intent(
-                    target_name,
+                    source_target_name,
                     texture_contract["speedtree_pipeline_contract"],
                 )
             except RuntimeError as exc:
@@ -6046,7 +6079,7 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                     skipped_groups.append(
                         {
                             "mode": "production_group_suffix",
-                            "target_material": target_name,
+                            "target_material": source_target_name,
                             "source_materials": [
                                 material.name for material in source_materials
                             ],
@@ -6064,7 +6097,7 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             if target_intent is None or target_semantics != expected_semantics:
                 raise RuntimeError(
                     "SpeedTree production-group target intent conflicts with "
-                    f"its source variants: {target_name}"
+                    f"its source variants: {source_target_name}"
                 )
             target_proof = json.dumps(
                 {
@@ -6081,16 +6114,37 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             target_proof = ""
         readiness_mode = provenance_type
         if provenance_type == "material_intent":
-            target_material = next(
-                (
-                    candidate
-                    for candidate in source_materials
-                    if _speedtree_material_name_key(candidate.name)
-                    == _speedtree_material_name_key(target_name)
-                ),
-                None,
+            target_material = None
+            authoritative_target = (
+                target_name.casefold() in authoritative_keys
             )
-            if target_material is None:
+            if authoritative_target:
+                exact_targets = [
+                    candidate
+                    for candidate in bpy.data.materials
+                    if candidate.name.casefold() == target_name.casefold()
+                ]
+                if len(exact_targets) > 1:
+                    raise RuntimeError(
+                        "Authoritative Cluster material identity is ambiguous: "
+                        + target_name
+                    )
+                if exact_targets:
+                    target_material = exact_targets[0]
+                    readiness_mode = (
+                        "authoritative_cluster_material_identity"
+                    )
+            if not authoritative_target:
+                target_material = next(
+                    (
+                        candidate
+                        for candidate in source_materials
+                        if _speedtree_material_name_key(candidate.name)
+                        == _speedtree_material_name_key(target_name)
+                    ),
+                    None,
+                )
+            if target_material is None and not authoritative_target:
                 # The Assembly builder can normalize multiple exact provider
                 # contracts in one Blender scene. Reuse only a suffix-free
                 # material previously created from the same strict production
@@ -6134,6 +6188,8 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             target_material = source_materials[0].copy()
             target_material.name = target_name
             target_material["codex_speedtree_consolidated_from"] = [material.name for material in source_materials]
+            if target_name.casefold() in authoritative_keys:
+                readiness_mode = "authoritative_cluster_material_created"
         if strict_contract:
             target_material[
                 "codex_speedtree_consolidation_target_proof"
@@ -7000,6 +7056,7 @@ def run_import_source_fbx(
     texture_contract=None,
     source_identity_path="",
     raw_import_observer=None,
+    authoritative_material_names=(),
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -7068,7 +7125,9 @@ def run_import_source_fbx(
     applied_scales = apply_object_scales(imported)
     renamed_materials = strip_speedtree_material_suffixes(imported)
     material_consolidation = consolidate_speedtree_group_materials(
-        imported, texture_contract=texture_contract
+        imported,
+        texture_contract=texture_contract,
+        authoritative_material_names=authoritative_material_names,
     )
     material_intents = apply_speedtree_material_intents(
         imported, texture_contract=texture_contract
@@ -9347,7 +9406,14 @@ def run_assembly_pipeline(
 
     if import_result is None:
         material_consolidation = consolidate_speedtree_group_materials(
-            source_import_meshes, texture_contract=texture_contract
+            source_import_meshes,
+            texture_contract=texture_contract,
+            authoritative_material_names=(
+                (settings or {}).get(
+                    "authoritative_cluster_material_names",
+                    (),
+                )
+            ),
         )
     else:
         material_consolidation = import_result.get(
@@ -9360,6 +9426,50 @@ def run_assembly_pipeline(
             "changed_object_count": material_consolidation.get("changed_object_count", 0),
             "changed_face_count": material_consolidation.get("changed_face_count", 0),
             "groups": material_consolidation.get("groups", []),
+        }
+    )
+
+    authoritative_names = list(
+        (settings or {}).get(
+            "authoritative_cluster_material_names",
+            (),
+        )
+    )
+    if authoritative_names:
+        scene_material_reconciliation = (
+            _consolidate_blender_numeric_material_duplicates(
+                [
+                    obj
+                    for obj in bpy.context.scene.objects
+                    if obj.type == "MESH" and obj.data
+                ],
+                texture_contract=texture_contract,
+                authoritative_material_names=authoritative_names,
+            )
+        )
+    else:
+        scene_material_reconciliation = {
+            "groups": [],
+            "skipped_groups": [],
+            "changed_object_count": 0,
+            "changed_face_count": 0,
+        }
+    reports["authoritative_cluster_material_reconciliation"] = (
+        scene_material_reconciliation
+    )
+    reports["steps"].append(
+        {
+            "name": "reconcile_authoritative_cluster_materials",
+            "status": (
+                "applied"
+                if scene_material_reconciliation.get("groups")
+                else "skipped"
+            ),
+            "groups": scene_material_reconciliation.get("groups", []),
+            "skipped_groups": scene_material_reconciliation.get(
+                "skipped_groups",
+                [],
+            ),
         }
     )
 
@@ -9638,6 +9748,10 @@ def run_import_and_assemble(settings, raw_import_observer=None):
         texture_contract=texture_contract,
         source_identity_path=settings.get("source_identity_path", ""),
         raw_import_observer=raw_import_observer,
+        authoritative_material_names=settings.get(
+            "authoritative_cluster_material_names",
+            (),
+        ),
     )
     import_duration = perf_counter() - import_started
     if authorized_dummy_cleanup_left_no_renderable_geometry(imported):
