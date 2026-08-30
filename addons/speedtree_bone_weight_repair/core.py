@@ -245,8 +245,11 @@ def _run_speedtree_cli_export(
     export_xml=True,
     timeout_seconds=900,
     force_reexport=False,
+    allow_verification_fallback=True,
     fresh_verification_only=False,
 ):
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     spm = Path(spm_path)
     if not spm.exists():
         raise RuntimeError(f"SPM does not exist: {spm_path}")
@@ -286,14 +289,21 @@ def _run_speedtree_cli_export(
         if fresh_verification_only
         else speedtree_cli.export_bundle_with_minimum_bone_policy
     )
+    transaction_options = {
+        "exe": exe,
+        "spm": spm,
+        "targets": targets,
+        "timeout_seconds": timeout_seconds,
+        "native_receipt": native_receipt,
+        "force_reexport": force_reexport,
+        "policy_report": policy_report,
+    }
+    if not fresh_verification_only:
+        transaction_options["allow_verification_fallback"] = (
+            allow_verification_fallback
+        )
     results = export_transaction(
-        exe=exe,
-        spm=spm,
-        targets=targets,
-        timeout_seconds=timeout_seconds,
-        native_receipt=native_receipt,
-        force_reexport=force_reexport,
-        policy_report=policy_report,
+        **transaction_options
     )
     spm_bone_policy = policy_report["spm_bone_policy"]
 
@@ -317,13 +327,23 @@ def _run_speedtree_cli_export(
         "spm_bone_policy": spm_bone_policy,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "force_reexport_requested": bool(force_reexport),
+        "allow_verification_fallback": bool(
+            allow_verification_fallback and not fresh_verification_only
+        ),
         "fresh_verification_only_export": (
             policy_report.get("fresh_verification_only_export")
             if fresh_verification_only
             else {
                 "status": "not_requested",
-                "policy": "normal_collision_export_with_existing_fallback_v1",
+                "policy": (
+                    "normal_collision_export_with_existing_fallback_v1"
+                    if allow_verification_fallback
+                    else "strict_normal_collision_export_v1"
+                ),
                 "explicit_opt_in_required": True,
+                "verification_fallback_allowed": bool(
+                    allow_verification_fallback
+                ),
             }
         ),
         "export_bundle_mtime_sync": bundle_mtime_sync,
@@ -346,6 +366,7 @@ def run_speedtree_cli_export(
     export_xml=True,
     timeout_seconds=900,
     force_reexport=False,
+    allow_verification_fallback=True,
 ):
     return _run_speedtree_cli_export(
         spm_path,
@@ -359,6 +380,7 @@ def run_speedtree_cli_export(
         export_xml=export_xml,
         timeout_seconds=timeout_seconds,
         force_reexport=force_reexport,
+        allow_verification_fallback=allow_verification_fallback,
         fresh_verification_only=False,
     )
 
@@ -375,6 +397,7 @@ def run_fresh_verification_only_export(
     export_xml=True,
     timeout_seconds=900,
     force_reexport=False,
+    allow_verification_fallback=True,
 ):
     """Run the explicit fresh, sole verification-only FBX/XML transaction."""
 
@@ -398,6 +421,7 @@ def run_fresh_verification_only_export(
         export_xml=True,
         timeout_seconds=timeout_seconds,
         force_reexport=True,
+        allow_verification_fallback=allow_verification_fallback,
         fresh_verification_only=True,
     )
 

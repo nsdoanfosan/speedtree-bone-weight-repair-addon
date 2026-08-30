@@ -36,6 +36,10 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             [argument.arg for argument in normal.args.args],
             [argument.arg for argument in fresh.args.args],
         )
+        self.assertIn(
+            "allow_verification_fallback",
+            [argument.arg for argument in normal.args.args],
+        )
 
         def selected_mode(function):
             calls = [
@@ -56,6 +60,32 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
 
         self.assertIs(selected_mode(normal), False)
         self.assertIs(selected_mode(fresh), True)
+        normal_call = next(
+            node
+            for node in ast.walk(normal)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_speedtree_cli_export"
+        )
+        fallback_keyword = next(
+            row
+            for row in normal_call.keywords
+            if row.arg == "allow_verification_fallback"
+        )
+        self.assertIsInstance(fallback_keyword.value, ast.Name)
+        self.assertEqual(
+            fallback_keyword.value.id,
+            "allow_verification_fallback",
+        )
+        runner_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            functions["_run_speedtree_cli_export"],
+        )
+        self.assertIn(
+            'transaction_options["allow_verification_fallback"]',
+            runner_source,
+        )
+        self.assertIn("if not fresh_verification_only:", runner_source)
         fresh_source = ast.get_source_segment(
             core_path.read_text(encoding="utf-8"),
             fresh,
@@ -123,9 +153,13 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
                     ),
                 }
 
-            def export(**_kwargs):
+            def export(**kwargs):
                 events.append("export")
                 self.assertEqual(spm.read_bytes(), updated)
+                self.assertIs(
+                    kwargs["allow_verification_fallback"],
+                    False,
+                )
                 return {"fbx": {"status": "ok"}}
 
             speedtree_cli.speedtree_export_gate = gate
@@ -139,6 +173,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
                         spm,
                         [("fbx", target, options)],
                         policy_report=policy_report,
+                        allow_verification_fallback=False,
                     )
                 )
             finally:
@@ -977,6 +1012,128 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertTrue(result["xml"]["verification_only"])
             self.assertEqual(fbx.read_bytes(), b"fbx")
             self.assertEqual(xml.read_text(encoding="utf-8"), "<SpeedTreeRaw />")
+
+    def test_strict_normal_bundle_failures_never_enter_verification_fallback(self):
+        for failure_mode in ("timeout", "nonzero", "invalid", "receipt"):
+            with self.subTest(failure_mode=failure_mode):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    exe = root / "speedtree_collision_cli.exe"
+                    spm = root / "tree.spm"
+                    fbx_options = root / "fbx.ini"
+                    xml_options = root / "xml.ini"
+                    fbx = root / "out" / "fbx" / "tree.fbx"
+                    xml = root / "out" / "xml" / "tree.xml"
+                    receipt = (
+                        fbx.parent / "tree.speedtree_native_receipt.json"
+                        if failure_mode == "receipt"
+                        else None
+                    )
+                    exe.write_bytes(b"exe")
+                    exe.with_name(
+                        "speedtree_collision_hook.dll"
+                    ).write_bytes(b"hook")
+                    spm.write_bytes(b"spm")
+                    preset = "[Options]\nTextureSkipWriting=true\n"
+                    fbx_options.write_text(preset, encoding="utf-8")
+                    xml_options.write_text(preset, encoding="utf-8")
+                    calls = []
+                    original = speedtree_cli._run_process
+
+                    def fake_run(command, cwd, timeout_seconds):
+                        calls.append(list(command))
+                        self.assertNotIn("--verification-only", command)
+                        if failure_mode == "timeout":
+                            raise subprocess.TimeoutExpired(
+                                command, timeout_seconds
+                            )
+                        if failure_mode == "nonzero":
+                            return 7, "normal failed", ""
+                        if failure_mode == "invalid":
+                            return 0, "normal returned no outputs", ""
+                        primary = Path(
+                            command[command.index("-export") + 1]
+                        )
+                        secondary = Path(
+                            command[
+                                command.index("--secondary-export") + 1
+                            ]
+                        )
+                        primary.parent.mkdir(parents=True, exist_ok=True)
+                        secondary.parent.mkdir(parents=True, exist_ok=True)
+                        primary.write_bytes(b"fbx")
+                        primary.with_suffix(".stmat").write_text(
+                            "<Materials />", encoding="utf-8"
+                        )
+                        secondary.write_text(
+                            "<SpeedTreeRaw />", encoding="utf-8"
+                        )
+                        return 0, "normal omitted receipt", ""
+
+                    speedtree_cli._run_process = fake_run
+                    try:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "verification fallback is disabled",
+                        ):
+                            speedtree_cli.export_bundle(
+                                exe,
+                                spm,
+                                [
+                                    ("fbx", fbx, fbx_options),
+                                    ("xml", xml, xml_options),
+                                ],
+                                native_receipt=receipt,
+                                allow_verification_fallback=False,
+                            )
+                    finally:
+                        speedtree_cli._run_process = original
+
+                    self.assertEqual(len(calls), 1)
+                    self.assertFalse(fbx.exists())
+                    self.assertFalse(xml.exists())
+                    if receipt is not None:
+                        self.assertFalse(receipt.exists())
+
+    def test_strict_normal_single_target_timeout_does_not_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            spm = root / "tree.spm"
+            options = root / "fbx.ini"
+            target = root / "out" / "tree.fbx"
+            exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
+            spm.write_bytes(b"spm")
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                self.assertNotIn("--verification-only", command)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "verification fallback is disabled",
+                ):
+                    speedtree_cli.export_bundle(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                        allow_verification_fallback=False,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(target.exists())
 
     def test_force_reexport_failure_preserves_outputs_and_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1387,13 +1387,16 @@ def export_target(
     verification_only=False,
     native_receipt=None,
     force_reexport=False,
+    allow_verification_fallback=True,
 ):
-    """Export one FBX/XML target with cache, staging, and timeout cleanup."""
+    """Export one target, optionally forbidding normal-to-verification fallback."""
     exe = Path(exe)
     spm = Path(spm)
     options = Path(options)
     target = Path(target)
     native_receipt = Path(native_receipt) if native_receipt else None
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     if native_receipt is not None:
         native_receipt.parent.mkdir(parents=True, exist_ok=True)
         if native_receipt.parent.resolve() != target.parent.resolve():
@@ -1514,19 +1517,25 @@ def export_target(
                 )
             except subprocess.TimeoutExpired as exc:
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
-                    )
-                    result["collision_fallback"] = True
-                    return result
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export timed out; "
+                        "verification fallback is disabled"
+                    ) from exc
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1571,19 +1580,25 @@ def export_target(
                     time.sleep(backoff)
                     continue
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export failed with "
+                        f"code {returncode}; verification fallback is disabled"
                     )
-                    result["collision_fallback"] = True
-                    return result
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1616,19 +1631,25 @@ def export_target(
                 kind, staged_target, parse_xml=True
             ):
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export created an "
+                        "invalid staged file; verification fallback is disabled"
                     )
-                    result["collision_fallback"] = True
-                    return result
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1937,8 +1958,11 @@ def export_bundle_with_minimum_bone_policy(
     native_receipt=None,
     force_reexport=False,
     policy_report=None,
+    allow_verification_fallback=True,
 ):
     """Persist Absolute/1 and export one sealed SPM under one mutex."""
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     exe, spm, targets, native_receipt = _validated_policy_export_request(
         exe,
         spm,
@@ -1959,6 +1983,7 @@ def export_bundle_with_minimum_bone_policy(
                 timeout_seconds=timeout_seconds,
                 native_receipt=native_receipt,
                 force_reexport=force_reexport,
+                allow_verification_fallback=allow_verification_fallback,
             )
         finally:
             current = _file_identity(spm)
@@ -2155,16 +2180,21 @@ def export_bundle(
     force_reexport=False,
     verification_only=False,
     fail_closed=False,
+    allow_verification_fallback=True,
 ):
     """Export FBX and XML through one collision-CLI/Modeler process.
 
     Each target keeps its independent content cache. A one-target miss still
     uses ``export_target``; only two simultaneous misses pay for the bundled
-    native-CLI invocation.
+    native-CLI invocation. Set ``allow_verification_fallback=False`` to keep a
+    normal export normal and fail immediately instead of retrying in
+    verification-only mode.
     """
     exe = Path(exe)
     spm = Path(spm)
     native_receipt = Path(native_receipt) if native_receipt else None
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     if verification_only and not force_reexport:
         raise RuntimeError(
             "Verification-only bundle execution requires force_reexport=True"
@@ -2261,6 +2291,7 @@ def export_bundle(
                 native_receipt if item["kind"] == "fbx" else None
             ),
             force_reexport=force_reexport,
+            allow_verification_fallback=allow_verification_fallback,
         )
         results[item["kind"]]["bundled_process"] = False
         _reconcile_completed_bundle_results(
@@ -2324,6 +2355,11 @@ def export_bundle(
                         "Fresh verification-only bundle timed out before "
                         "launcher-sealed completion"
                     ) from exc
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle timed out; verification "
+                        "fallback is disabled"
+                    ) from exc
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2356,6 +2392,11 @@ def export_bundle(
                         "launcher-sealed completion: returncode="
                         f"{returncode}"
                     )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle failed with returncode="
+                        f"{returncode}; verification fallback is disabled"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2383,6 +2424,12 @@ def export_bundle(
                         "Fresh verification-only bundle failed exact output "
                         "validation: " + ", ".join(invalid)
                     )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle failed output validation: "
+                        + ", ".join(invalid)
+                        + "; verification fallback is disabled"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -2400,6 +2447,11 @@ def export_bundle(
                     raise RuntimeError(
                         "Fresh verification-only bundle did not create a "
                         "current native receipt"
+                    )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle did not create a current "
+                        "native receipt; verification fallback is disabled"
                     )
                 return _export_bundle_fallback(
                     exe,
