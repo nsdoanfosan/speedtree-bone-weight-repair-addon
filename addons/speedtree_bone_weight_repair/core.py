@@ -385,6 +385,47 @@ def run_speedtree_cli_export(
     )
 
 
+def run_fresh_collision_prune_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+    allow_verification_fallback=True,
+):
+    """Run one forced fresh normal Collision/Prune FBX/XML transaction."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh Collision/Prune export requires force_reexport=True"
+        )
+    if export_fbx is not True or export_xml is not True:
+        raise RuntimeError(
+            "Fresh Collision/Prune export requires exact FBX and XML"
+        )
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=True,
+        export_xml=True,
+        timeout_seconds=timeout_seconds,
+        force_reexport=True,
+        allow_verification_fallback=False,
+        fresh_verification_only=False,
+    )
+
+
 def run_fresh_verification_only_export(
     spm_path,
     speedtree_exe_path="",

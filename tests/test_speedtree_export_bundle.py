@@ -31,10 +31,15 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         normal = functions["run_speedtree_cli_export"]
+        fresh_collision = functions["run_fresh_collision_prune_export"]
         fresh = functions["run_fresh_verification_only_export"]
         self.assertEqual(
             [argument.arg for argument in normal.args.args],
             [argument.arg for argument in fresh.args.args],
+        )
+        self.assertEqual(
+            [argument.arg for argument in normal.args.args],
+            [argument.arg for argument in fresh_collision.args.args],
         )
         self.assertIn(
             "allow_verification_fallback",
@@ -59,6 +64,7 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             return keyword.value.value
 
         self.assertIs(selected_mode(normal), False)
+        self.assertIs(selected_mode(fresh_collision), False)
         self.assertIs(selected_mode(fresh), True)
         normal_call = next(
             node
@@ -95,6 +101,83 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             "if export_fbx is not True or export_xml is not True:",
             fresh_source,
         )
+        fresh_collision_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            fresh_collision,
+        )
+        self.assertIn(
+            "if force_reexport is not True:", fresh_collision_source
+        )
+        self.assertIn(
+            "if export_fbx is not True or export_xml is not True:",
+            fresh_collision_source,
+        )
+        fresh_collision_call = next(
+            node
+            for node in ast.walk(fresh_collision)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_speedtree_cli_export"
+        )
+        collision_keywords = {
+            row.arg: row.value for row in fresh_collision_call.keywords
+        }
+        for field, expected in (
+            ("force_reexport", True),
+            ("allow_verification_fallback", False),
+            ("fresh_verification_only", False),
+        ):
+            self.assertIsInstance(collision_keywords[field], ast.Constant)
+            self.assertIs(collision_keywords[field].value, expected)
+
+    def test_fresh_collision_prune_gateway_executes_strict_normal_mode(self):
+        core_path = MODULE_PATH.with_name("core.py")
+        tree = ast.parse(core_path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_fresh_collision_prune_export"
+        )
+        calls = []
+
+        def runner(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"status": "ok"}
+
+        namespace = {"_run_speedtree_cli_export": runner}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(core_path),
+                "exec",
+            ),
+            namespace,
+        )
+        gateway = namespace["run_fresh_collision_prune_export"]
+        self.assertEqual(
+            gateway(
+                "tree.spm",
+                force_reexport=True,
+                export_fbx=True,
+                export_xml=True,
+            ),
+            {"status": "ok"},
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][1]["force_reexport"], True)
+        self.assertIs(calls[0][1]["allow_verification_fallback"], False)
+        self.assertIs(calls[0][1]["fresh_verification_only"], False)
+
+        with self.assertRaisesRegex(RuntimeError, "force_reexport=True"):
+            gateway("tree.spm", force_reexport=False)
+        with self.assertRaisesRegex(RuntimeError, "exact FBX and XML"):
+            gateway(
+                "tree.spm",
+                force_reexport=True,
+                export_xml=False,
+            )
+        self.assertEqual(len(calls), 1)
 
     @staticmethod
     def _policy_export_fixture(root):
