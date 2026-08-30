@@ -173,9 +173,13 @@ def _is_cluster_source_spm(spm):
 def ensure_minimum_absolute_branch_bones(spm):
     """Persist the non-Cluster Branch/Spline-Branch minimum-bone policy.
 
-    Every parsed zero-bone Branch generator is authored as Absolute/1 before
-    Modeler sees it.  This is an SPM data repair, not a post-export Blender
-    approximation.  Cluster providers deliberately retain their historical
+    Every graph-visible zero-bone Branch generator which owns at least one
+    visible, non-deleted, non-culled runtime Branch node is authored as
+    Absolute/1 before Modeler sees it. Generator-library residue and hidden
+    authoring alternatives are not live tree data: changing either can alter
+    Frond export admission even though no exported Branch node uses that
+    generator. This is an SPM data repair, not a post-export Blender
+    approximation. Cluster providers deliberately retain their historical
     single reference-axis policy and are never modified here.
     """
     spm = Path(spm).resolve()
@@ -204,6 +208,12 @@ def ensure_minimum_absolute_branch_bones(spm):
         section_spans = _root_direct_element_byte_spans(
             xml_bytes, "Generators"
         )
+        node_section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Nodes"
+        )
+        link_section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Links"
+        )
     except (expat.ExpatError, RuntimeError) as exc:
         raise RuntimeError(
             "SpeedTree SPM document is not valid writable XML: " + str(spm)
@@ -213,19 +223,137 @@ def ensure_minimum_absolute_branch_bones(spm):
             "SpeedTree SPM requires exactly one root Generators section: "
             + str(spm)
         )
+    if len(node_section_spans) > 1:
+        raise RuntimeError(
+            "SpeedTree SPM has more than one root Nodes section: "
+            + str(spm)
+        )
+    if len(link_section_spans) > 1:
+        raise RuntimeError(
+            "SpeedTree SPM has more than one root Links section: "
+            + str(spm)
+        )
     section_start, section_end = section_spans[0]
     try:
         generators = ET.fromstring(xml_bytes[section_start:section_end])
+        if node_section_spans:
+            node_section_start, node_section_end = node_section_spans[0]
+            nodes = ET.fromstring(
+                xml_bytes[node_section_start:node_section_end]
+            )
+        else:
+            # A generator-only library document owns no parsed runtime Branch
+            # nodes, so it has nothing for this policy to mutate.
+            nodes = ET.Element("Nodes")
+        if link_section_spans:
+            link_section_start, link_section_end = link_section_spans[0]
+            links = ET.fromstring(
+                xml_bytes[link_section_start:link_section_end]
+            )
+        else:
+            links = ET.Element("Links")
     except ET.ParseError as exc:
         raise RuntimeError(
-            "SpeedTree SPM root Generators section is not valid XML: "
+            "SpeedTree SPM root Generators/Nodes/Links section is not valid XML: "
             + str(spm)
         ) from exc
+
+    generators_by_guid = {}
+    hidden_by_generator_guid = {}
+    for generator in generators.findall("Generator"):
+        generator_guid = str(generator.findtext("GUID") or "").strip()
+        if not generator_guid:
+            continue
+        if generator_guid in generators_by_guid:
+            raise RuntimeError(
+                "SpeedTree SPM has a duplicate Generator GUID: "
+                + generator_guid
+            )
+        generators_by_guid[generator_guid] = generator
+        hidden_by_generator_guid[generator_guid] = (
+            str(generator.findtext("Hidden") or "").strip().casefold()
+            == "true"
+        )
+
+    parent_generator_guid_by_child = {}
+    for link in links.findall("Link"):
+        source_guid = str(link.findtext("SourceGUID") or "").strip()
+        target_guid = str(link.findtext("TargetGUID") or "").strip()
+        if not source_guid or not target_guid:
+            raise RuntimeError(
+                "SpeedTree Generator Link has no exact SourceGUID/TargetGUID"
+            )
+        previous = parent_generator_guid_by_child.get(target_guid)
+        if previous is not None and previous != source_guid:
+            raise RuntimeError(
+                "SpeedTree Generator has more than one exact graph parent: "
+                + target_guid
+            )
+        parent_generator_guid_by_child[target_guid] = source_guid
+
+    def generator_is_effectively_hidden(generator_guid):
+        current_guid = generator_guid
+        visited = set()
+        while current_guid:
+            if current_guid in visited:
+                raise RuntimeError(
+                    "SpeedTree Generator graph contains a cycle at GUID: "
+                    + current_guid
+                )
+            visited.add(current_guid)
+            if current_guid not in generators_by_guid:
+                raise RuntimeError(
+                    "SpeedTree Generator graph references a missing GUID: "
+                    + current_guid
+                )
+            if hidden_by_generator_guid[current_guid]:
+                return True
+            current_guid = parent_generator_guid_by_child.get(
+                current_guid, ""
+            )
+        return False
+
+    runtime_branch_node_count_by_generator = {}
+    for node in nodes.findall("Node"):
+        node_type = str(node.attrib.get("Type") or "").strip().casefold()
+        if node_type not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        node_hidden = (
+            str(node.findtext("Hidden") or "").strip().casefold()
+            == "true"
+        )
+        node_deleted = (
+            str(node.findtext("Extra/m_bDeleted") or "").strip().casefold()
+            == "true"
+        )
+        node_culled = (
+            str(node.findtext("Extra/m_bCulled") or "").strip().casefold()
+            == "true"
+        )
+        if node_hidden or node_deleted or node_culled:
+            continue
+        generator_guid = str(node.findtext("GeneratorGUID") or "").strip()
+        if not generator_guid:
+            raise RuntimeError(
+                "SpeedTree runtime Branch node has no GeneratorGUID: "
+                + str(node.findtext("Name") or "?")
+            )
+        runtime_branch_node_count_by_generator[generator_guid] = (
+            runtime_branch_node_count_by_generator.get(generator_guid, 0) + 1
+        )
 
     changed_generators = []
     for generator in generators.findall("Generator"):
         generator_type = str(generator.attrib.get("Type") or "").strip()
         if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        generator_guid = str(generator.findtext("GUID") or "").strip()
+        runtime_branch_node_count = (
+            runtime_branch_node_count_by_generator.get(generator_guid, 0)
+        )
+        if runtime_branch_node_count <= 0:
+            continue
+        if generator_is_effectively_hidden(generator_guid):
             continue
         bones_value = _spm_property_value_element(
             generator, "Physics:Bones"
@@ -258,11 +386,11 @@ def ensure_minimum_absolute_branch_bones(spm):
         style_value.text = "0"
         bones_value.text = "1"
         changed_generators.append({
-            "guid": str(generator.findtext("GUID") or ""),
+            "guid": generator_guid,
             "name": str(generator.findtext("Name") or "?"),
             "type": generator_type,
-            "hidden": str(generator.findtext("Hidden") or "").casefold()
-            == "true",
+            "hidden": False,
+            "runtime_branch_node_count": runtime_branch_node_count,
             "before": {
                 "bone_style": style_before,
                 "bones": bones_before,
@@ -351,7 +479,7 @@ def ensure_minimum_absolute_branch_bones(spm):
         "source_sha256": original_sha256,
         "updated_sha256": hashlib.sha256(persisted).hexdigest(),
         "compressed": compressed,
-        "policy": "non_cluster_zero_bone_branch_to_absolute_one_v1",
+        "policy": "live_non_cluster_zero_bone_branch_to_absolute_one_v3",
     }
 
 
