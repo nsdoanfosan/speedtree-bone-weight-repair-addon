@@ -6476,13 +6476,15 @@ def _cleanup_face_reason(polygon, materials, texture_contract):
         # deletion authority.  Only an explicit, current STMAT-backed generic
         # placeholder below may be discarded.
         return ""
-    material = materials[slot_index]
+    return _cleanup_material_reason(materials[slot_index], texture_contract)
+
+
+def _cleanup_material_reason(material, texture_contract):
+    """Resolve the face cleanup reason once for one Blender material slot."""
+
     if material is None:
         return ""
-    placeholder_key = _cleanup_placeholder_material_key(
-        material,
-        texture_contract,
-    )
+    placeholder_key = _cleanup_placeholder_material_key(material, texture_contract)
     if placeholder_key == "default":
         return "canonical_unmanaged_default_material"
     if placeholder_key == "material":
@@ -6630,15 +6632,30 @@ def discard_unassigned_geometry_before_assembly(
                 for polygon in obj.data.polygons
             ]
         else:
-            invalid = [
-                (int(polygon.index), reason)
-                for polygon in obj.data.polygons
-                if (
-                    reason := _cleanup_face_reason(
-                        polygon, materials, texture_contract
+            # Cleanup authority depends only on the assigned material slot and
+            # the immutable runtime texture contract.  Willow-class FBX files
+            # can contain more than a million faces but only a handful of
+            # slots; resolving the same strict STMAT intent per face turned a
+            # read-only gate into the dominant import cost.  Preserve the
+            # exact face selection while resolving every slot only once, and
+            # skip polygon RNA entirely when no slot can authorize deletion.
+            slot_reasons = tuple(
+                _cleanup_material_reason(material, texture_contract)
+                for material in materials
+            )
+            invalid = (
+                [
+                    (int(polygon.index), slot_reasons[slot_index])
+                    for polygon in obj.data.polygons
+                    if (
+                        0 <= (slot_index := int(polygon.material_index))
+                        < len(slot_reasons)
+                        and slot_reasons[slot_index]
                     )
-                )
-            ]
+                ]
+                if any(slot_reasons)
+                else []
+            )
         if invalid:
             candidates.append((obj, materials, invalid))
 
@@ -8712,9 +8729,17 @@ def validate_face_assigned_material_slots(mesh_obj):
         )
     materials = list(mesh_obj.data.materials)
     material_indices = mesh_polygon_material_indices(mesh_obj.data)
+    unique_slots, unique_counts = np.unique(
+        material_indices,
+        return_counts=True,
+    )
+    material_index_counts = {
+        int(slot_index): int(count)
+        for slot_index, count in zip(unique_slots, unique_counts)
+    }
     invalid_slot_values = {
         int(slot_index)
-        for slot_index in np.unique(material_indices)
+        for slot_index in unique_slots
         if (
             int(slot_index) < 0
             or int(slot_index) >= len(materials)
@@ -8739,13 +8764,31 @@ def validate_face_assigned_material_slots(mesh_obj):
         "status": "ok",
         "material_count": len(materials),
         "assigned_slot_indices": sorted(
-            int(value) for value in np.unique(material_indices)
+            material_index_counts
         ),
         "unused_empty_slot_indices": [
             index
             for index, material in enumerate(materials)
             if material is None
         ],
+        "material_index_evidence": {
+            "kind": "speedtree_blender_material_index_counts",
+            "schema_version": 1,
+            "object_name": str(mesh_obj.name),
+            "mesh_name": str(mesh_obj.data.name),
+            "polygon_count": len(mesh_obj.data.polygons),
+            "material_slots": [
+                str(material.name) if material is not None else None
+                for material in materials
+            ],
+            "material_index_counts": [
+                {
+                    "material_index": slot_index,
+                    "polygon_count": material_index_counts[slot_index],
+                }
+                for slot_index in sorted(material_index_counts)
+            ],
+        },
     }
 
 
@@ -8989,24 +9032,39 @@ def park_cluster_source_full_reference(
     }
 
 
-def _mesh_face_material_counts(obj):
+def _mesh_face_material_counts(obj, material_index_counts=None):
     materials = list(obj.data.materials)
     counts = Counter()
-    material_indices = mesh_polygon_material_indices(obj.data)
-    slot_counts = np.bincount(
-        material_indices,
-        minlength=len(materials),
-    )
-    for slot, count in enumerate(slot_counts):
+    if material_index_counts is None:
+        # Source meshes must still be scanned exactly: Blender permits a
+        # polygon material index that does not resolve to an existing slot,
+        # even on a zero/one-slot mesh.  Only the already validated merged
+        # histogram may bypass this read.
+        material_indices = mesh_polygon_material_indices(obj.data)
+        unique_slots, unique_counts = np.unique(
+            material_indices,
+            return_counts=True,
+        )
+        material_index_counts = {
+            int(slot): int(count)
+            for slot, count in zip(unique_slots, unique_counts)
+        }
+    for slot, count in sorted(material_index_counts.items()):
         if not count:
             continue
+        slot = int(slot)
         material = materials[slot] if 0 <= slot < len(materials) else None
         key = material.name if material is not None else f"<unassigned:{slot}>"
         counts[key] += int(count)
     return counts
 
 
-def validate_source_geometry_coverage(source_objects, merged_obj):
+def validate_source_geometry_coverage(
+    source_objects,
+    merged_obj,
+    *,
+    merged_material_index_counts=None,
+):
     """Prove that every cleaned source face survives the final SK merge.
 
     SpeedTree material-grouped FBX files may contain authored scan trunks,
@@ -9040,7 +9098,10 @@ def validate_source_geometry_coverage(source_objects, merged_obj):
             }
         )
 
-    actual_materials = _mesh_face_material_counts(merged_obj)
+    actual_materials = _mesh_face_material_counts(
+        merged_obj,
+        merged_material_index_counts,
+    )
     expected_faces = sum(row["faces"] for row in expected_objects)
     actual_faces = len(merged_obj.data.polygons)
     missing_material_faces = {
@@ -9142,8 +9203,18 @@ def run_merge_export(
             api.production_group_base_name(material.name)
         ) == "default"
     ]
+    merged_material_index_counts = {
+        int(row["material_index"]): int(row["polygon_count"])
+        for row in material_slot_validation[
+            "material_index_evidence"
+        ]["material_index_counts"]
+    }
     source_geometry_coverage = (
-        validate_source_geometry_coverage(expected_source_objects, merged_obj)
+        validate_source_geometry_coverage(
+            expected_source_objects,
+            merged_obj,
+            merged_material_index_counts=merged_material_index_counts,
+        )
         if expected_source_objects is not None
         else {"status": "not_requested"}
     )

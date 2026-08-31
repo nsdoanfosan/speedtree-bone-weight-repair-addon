@@ -261,6 +261,42 @@ with tempfile.TemporaryDirectory(prefix="bwr_runtime_structural_") as temporary:
     )
     assert cleanup_recheck["status"] == "not_applicable", cleanup_recheck
 
+    # Cleanup authority is a material-slot property.  A many-face mesh whose
+    # sole slot is not a proven placeholder must resolve that slot once and
+    # avoid touching polygon RNA entirely.
+    scan_mesh = bpy.data.meshes.new("CleanupSlotMemoizationMesh")
+    scan_vertices = []
+    scan_faces = []
+    for index in range(50):
+        offset = len(scan_vertices)
+        scan_vertices.extend(
+            ((float(index), 0.0, 0.0), (float(index), 1.0, 0.0), (float(index), 0.0, 1.0))
+        )
+        scan_faces.append((offset, offset + 1, offset + 2))
+    scan_mesh.from_pydata(scan_vertices, [], scan_faces)
+    scan_mesh.materials.append(cleanup_material)
+    scan_object = bpy.data.objects.new("CleanupSlotMemoization", scan_mesh)
+    bpy.context.scene.collection.objects.link(scan_object)
+    original_cleanup_key = core._cleanup_placeholder_material_key
+    cleanup_key_calls = []
+
+    def counted_cleanup_key(material, texture_contract):
+        cleanup_key_calls.append(material.name if material else None)
+        return original_cleanup_key(material, texture_contract)
+
+    core._cleanup_placeholder_material_key = counted_cleanup_key
+    try:
+        scan_result = core.discard_unassigned_geometry_before_assembly(
+            [scan_object],
+            texture_contract=cleanup_contract,
+            spm_path=str(source_spm),
+            source_fbx_path=str(source_fbx),
+        )
+    finally:
+        core._cleanup_placeholder_material_key = original_cleanup_key
+    assert scan_result["status"] == "not_applicable", scan_result
+    assert cleanup_key_calls == [cleanup_material.name], cleanup_key_calls
+
     cleanup_default_material = bpy.data.materials.new("Default")
     cleanup_mixed = make_mesh_object(
         "CleanupMixed",
