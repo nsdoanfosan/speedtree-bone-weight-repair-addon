@@ -7964,6 +7964,12 @@ def build_dynamic_wind_data(
     )
     joints = []
     for bone in indexed:
+        if ground_cover and bone["bone_index"] == 0 and bone["parent_index"] == -1:
+            # Keep the authored root in the final SkeletonContract, but leave
+            # it out of DynamicWind joints. Ground-cover exports use this root
+            # only as a shared FBX wrapper; simulating it would merge every
+            # blade into one very long influence chain.
+            continue
         group = bone.get("group")
         if group is None:
             # Import roots and intentionally non-simulated bones remain in the
