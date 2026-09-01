@@ -6894,6 +6894,16 @@ def ensure_minimum_absolute_branch_bones(spm_path):
     return speedtree_cli.apply_minimum_absolute_branch_bone_policy(spm_path)
 
 
+def plan_relative_branch_bones_one(spm_path):
+    """Gateway operation for a read-only Relative=1 plan."""
+    return speedtree_cli.plan_relative_branch_bones_one(spm_path)
+
+
+def apply_relative_branch_bones_one(spm_path):
+    """Gateway operation that persists every Relative Branch setting as one."""
+    return speedtree_cli.apply_relative_branch_bones_one(spm_path)
+
+
 def restore_omitted_native_root_weights(imported, receipt):
     """Restore only the Root weights the native FBX serializer could not write.
 

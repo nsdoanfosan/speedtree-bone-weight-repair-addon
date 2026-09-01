@@ -483,6 +483,191 @@ def ensure_minimum_absolute_branch_bones(spm):
     }
 
 
+def _relative_branch_bones_one_candidate(spm):
+    """Build an exact SPM candidate with every Relative Branch set to one."""
+    spm = Path(spm).resolve()
+    original = spm.read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    compressed = original.startswith(b"\x1f\x8b")
+    try:
+        xml_bytes = gzip.decompress(original) if compressed else original
+        section_spans = _root_direct_element_byte_spans(xml_bytes, "Generators")
+    except (OSError, expat.ExpatError, RuntimeError) as exc:
+        raise RuntimeError(
+            "SpeedTree SPM is not valid writable XML: " + str(spm)
+        ) from exc
+    if len(section_spans) != 1:
+        raise RuntimeError(
+            "SpeedTree SPM requires exactly one root Generators section: "
+            + str(spm)
+        )
+    section_start, section_end = section_spans[0]
+    try:
+        generators = ET.fromstring(xml_bytes[section_start:section_end])
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "SpeedTree SPM root Generators section is not valid XML: "
+            + str(spm)
+        ) from exc
+
+    changed_generators = []
+    relative_generator_count = 0
+    for generator in generators.findall("Generator"):
+        generator_type = str(generator.attrib.get("Type") or "").strip()
+        if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        style_value = _spm_property_value_element(
+            generator,
+            "Physics:Bone style",
+        )
+        bones_value = _spm_property_value_element(generator, "Physics:Bones")
+        if style_value is None or bones_value is None:
+            continue
+        try:
+            style = float(str(style_value.text or "").strip())
+            bones_before = float(str(bones_value.text or "").strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                "SpeedTree Branch generator has invalid bone settings: "
+                + str(generator.findtext("Name") or "?")
+            ) from exc
+        if not math.isfinite(style) or not math.isfinite(bones_before):
+            raise RuntimeError(
+                "SpeedTree Branch generator has non-finite bone settings: "
+                + str(generator.findtext("Name") or "?")
+            )
+        if style != 1.0:
+            continue
+        relative_generator_count += 1
+        if bones_before == 1.0:
+            continue
+        bones_value.text = "1"
+        changed_generators.append({
+            "guid": str(generator.findtext("GUID") or "").strip(),
+            "name": str(generator.findtext("Name") or "?"),
+            "type": generator_type,
+            "before": {
+                "bone_style": style,
+                "bones": bones_before,
+            },
+            "after": {
+                "bone_style": 1,
+                "bones": 1,
+            },
+        })
+
+    if changed_generators:
+        rendered = ET.tostring(
+            generators,
+            encoding="utf-8",
+            short_empty_elements=True,
+        )
+        updated_xml = (
+            xml_bytes[:section_start]
+            + rendered
+            + xml_bytes[section_end:]
+        )
+        try:
+            ET.fromstring(updated_xml)
+        except ET.ParseError as exc:
+            raise RuntimeError(
+                "Relative-one SPM candidate failed XML validation: " + str(spm)
+            ) from exc
+        updated = (
+            gzip.compress(updated_xml, compresslevel=9, mtime=0)
+            if compressed
+            else updated_xml
+        )
+    else:
+        updated = original
+
+    return {
+        "status": "planned" if changed_generators else "already_compliant",
+        "spm": str(spm),
+        "changed": bool(changed_generators),
+        "relative_generator_count": relative_generator_count,
+        "changed_generator_count": len(changed_generators),
+        "changed_generators": changed_generators,
+        "source_sha256": original_sha256,
+        "updated_sha256": hashlib.sha256(updated).hexdigest(),
+        "compressed": compressed,
+        "policy": "all_relative_branch_bones_exactly_one_v1",
+        "_source_bytes": original,
+        "_updated_bytes": updated,
+    }
+
+
+def plan_relative_branch_bones_one(spm):
+    """Read-only plan for setting every Relative Branch/Spline Branch to one."""
+    result = _relative_branch_bones_one_candidate(spm)
+    return {
+        key: value
+        for key, value in result.items()
+        if not key.startswith("_")
+    }
+
+
+def apply_relative_branch_bones_one(spm):
+    """Persist Relative=1 with a verified backup and atomic replacement."""
+    with speedtree_export_gate():
+        result = _relative_branch_bones_one_candidate(spm)
+        spm = Path(result["spm"])
+        if not result["changed"]:
+            return {
+                **{
+                    key: value
+                    for key, value in result.items()
+                    if not key.startswith("_")
+                },
+                "backup": "",
+            }
+        original = result["_source_bytes"]
+        updated = result["_updated_bytes"]
+        source_sha256 = result["source_sha256"]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_root = (
+            spm.parent
+            / "_spm_backups"
+            / f"relative_branch_bones_one_{timestamp}_{source_sha256[:8]}"
+        )
+        backup_root.mkdir(parents=True, exist_ok=False)
+        backup = backup_root / spm.name
+        backup.write_bytes(original)
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != source_sha256:
+            raise RuntimeError("Relative-one SPM backup hash verification failed")
+        if spm.read_bytes() != original:
+            raise RuntimeError(
+                "SpeedTree SPM changed while Relative-one policy was computed: "
+                + str(spm)
+            )
+        temporary = spm.with_name(
+            f".{spm.name}.relative-one-{uuid.uuid4().hex}"
+        )
+        try:
+            temporary.write_bytes(updated)
+            check = temporary.read_bytes()
+            check_xml = gzip.decompress(check) if result["compressed"] else check
+            ET.fromstring(check_xml)
+            os.replace(temporary, spm)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        persisted = spm.read_bytes()
+        if persisted != updated:
+            raise RuntimeError("Relative-one SPM persisted bytes did not verify")
+        return {
+            **{
+                key: value
+                for key, value in result.items()
+                if not key.startswith("_")
+            },
+            "status": "updated",
+            "backup": str(backup),
+        }
+
+
 @contextmanager
 def _system_speedtree_export_gate():
     """Share one machine-wide Modeler export slot with SK Batch."""
