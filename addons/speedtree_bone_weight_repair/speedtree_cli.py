@@ -9,18 +9,22 @@ waits only for the process handle.
 
 import ctypes
 import codecs
+import gzip
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +66,9 @@ _PRIVATE_DESKTOP_CREATION_FAILED = 14
 _PROCESS_EXPORT_STALLED = 24
 _EXPORT_RETRY_ATTEMPTS = 3
 _EXPORT_RETRY_BACKOFF_SECONDS = (0.25, 0.75)
+FRESH_VERIFICATION_SEALED_MARKER = (
+    "SPEEDTREE_FRESH_VERIFICATION_EXPORT_SEALED=1"
+)
 SPEEDTREE_EXPORT_MUTEX_ENV = "SPEEDTREE_EXPORT_MUTEX_NAME"
 SPEEDTREE_EXPORT_MUTEX_DEFAULT = (
     r"Local\PARK.SpeedTree.Modeler.Export.v1.slot0"
@@ -70,10 +77,599 @@ _NATIVE_SYNTHETIC_BONE_ID_START = 10000
 _NATIVE_TO_XML_COORDINATE_SCALE = 30.48
 _NATIVE_TO_XML_COORDINATE_SCALE_TOLERANCE = 1.0e-9
 _XML_SYNTHETIC_COORDINATE_TOLERANCE = 0.1
+_SPM_MINIMUM_BONE_GENERATOR_TYPES = {
+    "branch",
+    "spline branch",
+    "splinebranch",
+}
+
+
+def _root_direct_element_byte_spans(xml_bytes, element_name):
+    """Return exact UTF-8 byte spans for one root-direct XML element type."""
+    parser = expat.ParserCreate()
+    depth = 0
+    open_starts = []
+    spans = []
+
+    def opening_tag_end(start_index):
+        quote = None
+        for index in range(start_index, len(xml_bytes)):
+            value = xml_bytes[index]
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                continue
+            if value in (ord('"'), ord("'")):
+                quote = value
+            elif value == ord(">"):
+                return index + 1
+        raise RuntimeError(
+            f"SpeedTree XML has an incomplete {element_name} opening tag"
+        )
+
+    def start(name, _attributes):
+        nonlocal depth
+        if depth == 1 and name == element_name:
+            section_start = parser.CurrentByteIndex
+            section_end = opening_tag_end(section_start)
+            if xml_bytes[section_start:section_end].rstrip().endswith(b"/>"):
+                spans.append((section_start, section_end))
+                open_starts.append(None)
+            else:
+                open_starts.append(section_start)
+        depth += 1
+
+    def end(name):
+        nonlocal depth
+        depth -= 1
+        if depth == 1 and name == element_name:
+            if not open_starts:
+                raise RuntimeError(
+                    f"SpeedTree XML closed {element_name} without a root-direct start"
+                )
+            section_start = open_starts.pop()
+            if section_start is None:
+                return
+            closing_start = parser.CurrentByteIndex
+            closing_end = xml_bytes.find(b">", closing_start)
+            if closing_end < 0:
+                raise RuntimeError(
+                    f"SpeedTree XML has an incomplete {element_name} closing tag"
+                )
+            spans.append((section_start, closing_end + 1))
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.Parse(xml_bytes, True)
+    if open_starts:
+        raise RuntimeError(
+            f"SpeedTree XML has an unclosed root-direct {element_name} section"
+        )
+    return spans
+
+
+def _spm_property_value_element(generator, property_name):
+    for element in generator.iter():
+        name = element.find("Name")
+        if name is None or str(name.text or "") != property_name:
+            continue
+        value = element.find("Value")
+        if value is None:
+            raise RuntimeError(
+                f"SpeedTree property has no Value element: {property_name}"
+            )
+        return value
+    return None
+
+
+def _is_cluster_source_spm(spm):
+    spm = Path(spm)
+    return (
+        spm.parent.name.casefold() == "cluster"
+        or spm.stem.casefold().startswith("sk_cluster_")
+    )
+
+
+def ensure_minimum_absolute_branch_bones(spm):
+    """Persist the non-Cluster Branch/Spline-Branch minimum-bone policy.
+
+    Every graph-visible zero-bone Branch generator which owns at least one
+    visible, non-deleted, non-culled runtime Branch node is authored as
+    Absolute/1 before Modeler sees it. Generator-library residue and hidden
+    authoring alternatives are not live tree data: changing either can alter
+    Frond export admission even though no exported Branch node uses that
+    generator. This is an SPM data repair, not a post-export Blender
+    approximation. Cluster providers deliberately retain their historical
+    single reference-axis policy and are never modified here.
+    """
+    spm = Path(spm).resolve()
+    original = spm.read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    if _is_cluster_source_spm(spm):
+        return {
+            "status": "excluded_cluster_source",
+            "spm": str(spm),
+            "changed": False,
+            "changed_generator_count": 0,
+            "changed_generators": [],
+            "backup": "",
+            "source_sha256": original_sha256,
+            "policy": "cluster_reference_axis_policy_unchanged_v1",
+        }
+
+    compressed = original.startswith(b"\x1f\x8b")
+    try:
+        xml_bytes = gzip.decompress(original) if compressed else original
+        text = xml_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"SpeedTree SPM is not readable UTF-8 XML: {spm}") from exc
+
+    try:
+        section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Generators"
+        )
+        node_section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Nodes"
+        )
+        link_section_spans = _root_direct_element_byte_spans(
+            xml_bytes, "Links"
+        )
+    except (expat.ExpatError, RuntimeError) as exc:
+        raise RuntimeError(
+            "SpeedTree SPM document is not valid writable XML: " + str(spm)
+        ) from exc
+    if len(section_spans) != 1:
+        raise RuntimeError(
+            "SpeedTree SPM requires exactly one root Generators section: "
+            + str(spm)
+        )
+    if len(node_section_spans) > 1:
+        raise RuntimeError(
+            "SpeedTree SPM has more than one root Nodes section: "
+            + str(spm)
+        )
+    if len(link_section_spans) > 1:
+        raise RuntimeError(
+            "SpeedTree SPM has more than one root Links section: "
+            + str(spm)
+        )
+    section_start, section_end = section_spans[0]
+    try:
+        generators = ET.fromstring(xml_bytes[section_start:section_end])
+        if node_section_spans:
+            node_section_start, node_section_end = node_section_spans[0]
+            nodes = ET.fromstring(
+                xml_bytes[node_section_start:node_section_end]
+            )
+        else:
+            # A generator-only library document owns no parsed runtime Branch
+            # nodes, so it has nothing for this policy to mutate.
+            nodes = ET.Element("Nodes")
+        if link_section_spans:
+            link_section_start, link_section_end = link_section_spans[0]
+            links = ET.fromstring(
+                xml_bytes[link_section_start:link_section_end]
+            )
+        else:
+            links = ET.Element("Links")
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "SpeedTree SPM root Generators/Nodes/Links section is not valid XML: "
+            + str(spm)
+        ) from exc
+
+    generators_by_guid = {}
+    hidden_by_generator_guid = {}
+    for generator in generators.findall("Generator"):
+        generator_guid = str(generator.findtext("GUID") or "").strip()
+        if not generator_guid:
+            continue
+        if generator_guid in generators_by_guid:
+            raise RuntimeError(
+                "SpeedTree SPM has a duplicate Generator GUID: "
+                + generator_guid
+            )
+        generators_by_guid[generator_guid] = generator
+        hidden_by_generator_guid[generator_guid] = (
+            str(generator.findtext("Hidden") or "").strip().casefold()
+            == "true"
+        )
+
+    parent_generator_guid_by_child = {}
+    for link in links.findall("Link"):
+        source_guid = str(link.findtext("SourceGUID") or "").strip()
+        target_guid = str(link.findtext("TargetGUID") or "").strip()
+        if not source_guid or not target_guid:
+            raise RuntimeError(
+                "SpeedTree Generator Link has no exact SourceGUID/TargetGUID"
+            )
+        previous = parent_generator_guid_by_child.get(target_guid)
+        if previous is not None and previous != source_guid:
+            raise RuntimeError(
+                "SpeedTree Generator has more than one exact graph parent: "
+                + target_guid
+            )
+        parent_generator_guid_by_child[target_guid] = source_guid
+
+    def generator_is_effectively_hidden(generator_guid):
+        current_guid = generator_guid
+        visited = set()
+        while current_guid:
+            if current_guid in visited:
+                raise RuntimeError(
+                    "SpeedTree Generator graph contains a cycle at GUID: "
+                    + current_guid
+                )
+            visited.add(current_guid)
+            if current_guid not in generators_by_guid:
+                raise RuntimeError(
+                    "SpeedTree Generator graph references a missing GUID: "
+                    + current_guid
+                )
+            if hidden_by_generator_guid[current_guid]:
+                return True
+            current_guid = parent_generator_guid_by_child.get(
+                current_guid, ""
+            )
+        return False
+
+    runtime_branch_node_count_by_generator = {}
+    for node in nodes.findall("Node"):
+        node_type = str(node.attrib.get("Type") or "").strip().casefold()
+        if node_type not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        node_hidden = (
+            str(node.findtext("Hidden") or "").strip().casefold()
+            == "true"
+        )
+        node_deleted = (
+            str(node.findtext("Extra/m_bDeleted") or "").strip().casefold()
+            == "true"
+        )
+        node_culled = (
+            str(node.findtext("Extra/m_bCulled") or "").strip().casefold()
+            == "true"
+        )
+        if node_hidden or node_deleted or node_culled:
+            continue
+        generator_guid = str(node.findtext("GeneratorGUID") or "").strip()
+        if not generator_guid:
+            raise RuntimeError(
+                "SpeedTree runtime Branch node has no GeneratorGUID: "
+                + str(node.findtext("Name") or "?")
+            )
+        runtime_branch_node_count_by_generator[generator_guid] = (
+            runtime_branch_node_count_by_generator.get(generator_guid, 0) + 1
+        )
+
+    changed_generators = []
+    for generator in generators.findall("Generator"):
+        generator_type = str(generator.attrib.get("Type") or "").strip()
+        if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        generator_guid = str(generator.findtext("GUID") or "").strip()
+        runtime_branch_node_count = (
+            runtime_branch_node_count_by_generator.get(generator_guid, 0)
+        )
+        if runtime_branch_node_count <= 0:
+            continue
+        if generator_is_effectively_hidden(generator_guid):
+            continue
+        bones_value = _spm_property_value_element(
+            generator, "Physics:Bones"
+        )
+        if bones_value is None:
+            continue
+        try:
+            bones_before = float(str(bones_value.text or "").strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                "SpeedTree Branch generator has an invalid Physics:Bones value: "
+                + str(generator.findtext("Name") or "?")
+            ) from exc
+        if not math.isfinite(bones_before):
+            raise RuntimeError(
+                "SpeedTree Branch generator has a non-finite Physics:Bones value: "
+                + str(generator.findtext("Name") or "?")
+            )
+        if not (bones_before <= 0.0):
+            continue
+        style_value = _spm_property_value_element(
+            generator, "Physics:Bone style"
+        )
+        if style_value is None:
+            raise RuntimeError(
+                "Zero-bone SpeedTree Branch generator has no Physics:Bone style: "
+                + str(generator.findtext("Name") or "?")
+            )
+        style_before = str(style_value.text or "").strip()
+        style_value.text = "0"
+        bones_value.text = "1"
+        changed_generators.append({
+            "guid": generator_guid,
+            "name": str(generator.findtext("Name") or "?"),
+            "type": generator_type,
+            "hidden": False,
+            "runtime_branch_node_count": runtime_branch_node_count,
+            "before": {
+                "bone_style": style_before,
+                "bones": bones_before,
+            },
+            "after": {
+                "bone_style": 0,
+                "bones": 1,
+            },
+        })
+
+    if not changed_generators:
+        return {
+            "status": "already_compliant",
+            "spm": str(spm),
+            "changed": False,
+            "changed_generator_count": 0,
+            "changed_generators": [],
+            "backup": "",
+            "source_sha256": original_sha256,
+        }
+
+    rendered_generators = ET.tostring(
+        generators, encoding="utf-8", short_empty_elements=True
+    )
+    updated_xml = (
+        xml_bytes[:section_start]
+        + rendered_generators
+        + xml_bytes[section_end:]
+    )
+    try:
+        ET.fromstring(updated_xml)
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "Minimum-bone SPM candidate failed full XML validation: " + str(spm)
+        ) from exc
+    updated = (
+        gzip.compress(updated_xml, compresslevel=9, mtime=0)
+        if compressed
+        else updated_xml
+    )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_root = (
+        spm.parent
+        / "_spm_backups"
+        / f"minimum_absolute_branch_bones_{timestamp}_{original_sha256[:8]}"
+    )
+    backup_root.mkdir(parents=True, exist_ok=False)
+    backup = backup_root / spm.name
+    backup.write_bytes(original)
+    if hashlib.sha256(backup.read_bytes()).hexdigest() != original_sha256:
+        raise RuntimeError("Minimum-bone SPM backup hash verification failed")
+
+    if spm.read_bytes() != original:
+        raise RuntimeError(
+            "SpeedTree SPM changed while minimum-bone repair was computed: "
+            + str(spm)
+        )
+    temporary = spm.with_name(
+        f".{spm.name}.minimum-bones-{uuid.uuid4().hex}"
+    )
+    try:
+        temporary.write_bytes(updated)
+        check_raw = temporary.read_bytes()
+        check_xml = (
+            gzip.decompress(check_raw) if compressed else check_raw
+        ).decode("utf-8")
+        ET.fromstring(check_xml)
+        os.replace(temporary, spm)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    persisted = spm.read_bytes()
+    if persisted != updated:
+        raise RuntimeError("Minimum-bone SPM persisted bytes did not verify")
+    return {
+        "status": "updated",
+        "spm": str(spm),
+        "changed": True,
+        "changed_generator_count": len(changed_generators),
+        "changed_generators": changed_generators,
+        "backup": str(backup),
+        "source_sha256": original_sha256,
+        "updated_sha256": hashlib.sha256(persisted).hexdigest(),
+        "compressed": compressed,
+        "policy": "live_non_cluster_zero_bone_branch_to_absolute_one_v3",
+    }
+
+
+def _relative_branch_bones_one_candidate(spm):
+    """Build an exact SPM candidate with every Relative Branch set to one."""
+    spm = Path(spm).resolve()
+    original = spm.read_bytes()
+    original_sha256 = hashlib.sha256(original).hexdigest()
+    compressed = original.startswith(b"\x1f\x8b")
+    try:
+        xml_bytes = gzip.decompress(original) if compressed else original
+        section_spans = _root_direct_element_byte_spans(xml_bytes, "Generators")
+    except (OSError, expat.ExpatError, RuntimeError) as exc:
+        raise RuntimeError(
+            "SpeedTree SPM is not valid writable XML: " + str(spm)
+        ) from exc
+    if len(section_spans) != 1:
+        raise RuntimeError(
+            "SpeedTree SPM requires exactly one root Generators section: "
+            + str(spm)
+        )
+    section_start, section_end = section_spans[0]
+    try:
+        generators = ET.fromstring(xml_bytes[section_start:section_end])
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            "SpeedTree SPM root Generators section is not valid XML: "
+            + str(spm)
+        ) from exc
+
+    changed_generators = []
+    relative_generator_count = 0
+    for generator in generators.findall("Generator"):
+        generator_type = str(generator.attrib.get("Type") or "").strip()
+        if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            continue
+        style_value = _spm_property_value_element(
+            generator,
+            "Physics:Bone style",
+        )
+        bones_value = _spm_property_value_element(generator, "Physics:Bones")
+        if style_value is None or bones_value is None:
+            continue
+        try:
+            style = float(str(style_value.text or "").strip())
+            bones_before = float(str(bones_value.text or "").strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                "SpeedTree Branch generator has invalid bone settings: "
+                + str(generator.findtext("Name") or "?")
+            ) from exc
+        if not math.isfinite(style) or not math.isfinite(bones_before):
+            raise RuntimeError(
+                "SpeedTree Branch generator has non-finite bone settings: "
+                + str(generator.findtext("Name") or "?")
+            )
+        if style != 1.0:
+            continue
+        relative_generator_count += 1
+        if bones_before == 1.0:
+            continue
+        bones_value.text = "1"
+        changed_generators.append({
+            "guid": str(generator.findtext("GUID") or "").strip(),
+            "name": str(generator.findtext("Name") or "?"),
+            "type": generator_type,
+            "before": {
+                "bone_style": style,
+                "bones": bones_before,
+            },
+            "after": {
+                "bone_style": 1,
+                "bones": 1,
+            },
+        })
+
+    if changed_generators:
+        rendered = ET.tostring(
+            generators,
+            encoding="utf-8",
+            short_empty_elements=True,
+        )
+        updated_xml = (
+            xml_bytes[:section_start]
+            + rendered
+            + xml_bytes[section_end:]
+        )
+        try:
+            ET.fromstring(updated_xml)
+        except ET.ParseError as exc:
+            raise RuntimeError(
+                "Relative-one SPM candidate failed XML validation: " + str(spm)
+            ) from exc
+        updated = (
+            gzip.compress(updated_xml, compresslevel=9, mtime=0)
+            if compressed
+            else updated_xml
+        )
+    else:
+        updated = original
+
+    return {
+        "status": "planned" if changed_generators else "already_compliant",
+        "spm": str(spm),
+        "changed": bool(changed_generators),
+        "relative_generator_count": relative_generator_count,
+        "changed_generator_count": len(changed_generators),
+        "changed_generators": changed_generators,
+        "source_sha256": original_sha256,
+        "updated_sha256": hashlib.sha256(updated).hexdigest(),
+        "compressed": compressed,
+        "policy": "all_relative_branch_bones_exactly_one_v1",
+        "_source_bytes": original,
+        "_updated_bytes": updated,
+    }
+
+
+def plan_relative_branch_bones_one(spm):
+    """Read-only plan for setting every Relative Branch/Spline Branch to one."""
+    result = _relative_branch_bones_one_candidate(spm)
+    return {
+        key: value
+        for key, value in result.items()
+        if not key.startswith("_")
+    }
+
+
+def apply_relative_branch_bones_one(spm):
+    """Persist Relative=1 with a verified backup and atomic replacement."""
+    with speedtree_export_gate():
+        result = _relative_branch_bones_one_candidate(spm)
+        spm = Path(result["spm"])
+        if not result["changed"]:
+            return {
+                **{
+                    key: value
+                    for key, value in result.items()
+                    if not key.startswith("_")
+                },
+                "backup": "",
+            }
+        original = result["_source_bytes"]
+        updated = result["_updated_bytes"]
+        source_sha256 = result["source_sha256"]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_root = (
+            spm.parent
+            / "_spm_backups"
+            / f"relative_branch_bones_one_{timestamp}_{source_sha256[:8]}"
+        )
+        backup_root.mkdir(parents=True, exist_ok=False)
+        backup = backup_root / spm.name
+        backup.write_bytes(original)
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != source_sha256:
+            raise RuntimeError("Relative-one SPM backup hash verification failed")
+        if spm.read_bytes() != original:
+            raise RuntimeError(
+                "SpeedTree SPM changed while Relative-one policy was computed: "
+                + str(spm)
+            )
+        temporary = spm.with_name(
+            f".{spm.name}.relative-one-{uuid.uuid4().hex}"
+        )
+        try:
+            temporary.write_bytes(updated)
+            check = temporary.read_bytes()
+            check_xml = gzip.decompress(check) if result["compressed"] else check
+            ET.fromstring(check_xml)
+            os.replace(temporary, spm)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        persisted = spm.read_bytes()
+        if persisted != updated:
+            raise RuntimeError("Relative-one SPM persisted bytes did not verify")
+        return {
+            **{
+                key: value
+                for key, value in result.items()
+                if not key.startswith("_")
+            },
+            "status": "updated",
+            "backup": str(backup),
+        }
 
 
 @contextmanager
-def speedtree_export_gate():
+def _system_speedtree_export_gate():
     """Share one machine-wide Modeler export slot with SK Batch."""
     name = os.environ.get(
         SPEEDTREE_EXPORT_MUTEX_ENV, SPEEDTREE_EXPORT_MUTEX_DEFAULT
@@ -128,6 +724,29 @@ def speedtree_export_gate():
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+_SPEEDTREE_EXPORT_GATE_LOCAL = threading.local()
+
+
+@contextmanager
+def speedtree_export_gate():
+    """Acquire the machine gate once while allowing nested helper exports."""
+    depth = int(getattr(_SPEEDTREE_EXPORT_GATE_LOCAL, "depth", 0) or 0)
+    if depth > 0:
+        _SPEEDTREE_EXPORT_GATE_LOCAL.depth = depth + 1
+        try:
+            yield
+        finally:
+            _SPEEDTREE_EXPORT_GATE_LOCAL.depth = depth
+        return
+
+    with _system_speedtree_export_gate():
+        _SPEEDTREE_EXPORT_GATE_LOCAL.depth = 1
+        try:
+            yield
+        finally:
+            _SPEEDTREE_EXPORT_GATE_LOCAL.depth = 0
 
 
 def _utc_timestamp():
@@ -659,13 +1278,31 @@ def _synthetic_generator(receipt, bone, xml_root, xml_bones):
     return next(iter(names)), {"proof": proof, "generator_guid": guid}
 
 
+def _parse_speedtree_xml_float(value):
+    """Parse Modeler XML numbers independently of the Windows UI locale."""
+    text = str(value).strip()
+    if "," in text:
+        if "." in text or text.count(",") != 1:
+            raise ValueError(f"ambiguous SpeedTree XML number: {text}")
+        text = text.replace(",", ".")
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite SpeedTree XML number: {text}")
+    return number
+
+
 def _validate_synthetic_xml_bone(element, bone, scale):
     bone_id = int(bone["id"])
     try:
         if int(element.attrib.get("ParentID", "-1")) != int(bone["parent_id"]) - 1:
             raise ValueError("parent mismatch")
         for prefix, key in (("Start", "start_native"), ("End", "end_native")):
-            actual = [float(element.attrib[f"{prefix}{axis}"]) for axis in "XYZ"]
+            actual = [
+                _parse_speedtree_xml_float(
+                    element.attrib[f"{prefix}{axis}"]
+                )
+                for axis in "XYZ"
+            ]
             expected = [float(value) * scale for value in bone[key]]
             if max(abs(a - b) for a, b in zip(actual, expected)) > (
                 _XML_SYNTHETIC_COORDINATE_TOLERANCE
@@ -1063,13 +1700,16 @@ def export_target(
     verification_only=False,
     native_receipt=None,
     force_reexport=False,
+    allow_verification_fallback=True,
 ):
-    """Export one FBX/XML target with cache, staging, and timeout cleanup."""
+    """Export one target, optionally forbidding normal-to-verification fallback."""
     exe = Path(exe)
     spm = Path(spm)
     options = Path(options)
     target = Path(target)
     native_receipt = Path(native_receipt) if native_receipt else None
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     if native_receipt is not None:
         native_receipt.parent.mkdir(parents=True, exist_ok=True)
         if native_receipt.parent.resolve() != target.parent.resolve():
@@ -1190,19 +1830,25 @@ def export_target(
                 )
             except subprocess.TimeoutExpired as exc:
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
-                    )
-                    result["collision_fallback"] = True
-                    return result
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export timed out; "
+                        "verification fallback is disabled"
+                    ) from exc
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1247,19 +1893,25 @@ def export_target(
                     time.sleep(backoff)
                     continue
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export failed with "
+                        f"code {returncode}; verification fallback is disabled"
                     )
-                    result["collision_fallback"] = True
-                    return result
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1292,19 +1944,25 @@ def export_target(
                 kind, staged_target, parse_xml=True
             ):
                 if not verification_only:
-                    result = export_target(
-                        exe=exe,
-                        spm=spm,
-                        options=options,
-                        kind=kind,
-                        target=target,
-                        timeout_seconds=timeout_seconds,
-                        verification_only=True,
-                        native_receipt=native_receipt,
-                        force_reexport=force_reexport,
+                    if allow_verification_fallback:
+                        result = export_target(
+                            exe=exe,
+                            spm=spm,
+                            options=options,
+                            kind=kind,
+                            target=target,
+                            timeout_seconds=timeout_seconds,
+                            verification_only=True,
+                            native_receipt=native_receipt,
+                            force_reexport=force_reexport,
+                            allow_verification_fallback=True,
+                        )
+                        result["collision_fallback"] = True
+                        return result
+                    raise RuntimeError(
+                        f"SpeedTree {kind.upper()} normal export created an "
+                        "invalid staged file; verification fallback is disabled"
                     )
-                    result["collision_fallback"] = True
-                    return result
                 preserved = None
                 if not force_reexport:
                     preserved = _preserve_existing_output(
@@ -1469,6 +2127,363 @@ def _reconcile_completed_bundle_results(
     return reconciliation
 
 
+def _validated_minimum_bone_policy_receipt(spm, receipt):
+    """Validate the persistent policy result against the bytes on disk."""
+    spm = Path(spm).resolve()
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Minimum branch-bone policy returned no receipt")
+    status = str(receipt.get("status") or "")
+    allowed = {
+        "updated",
+        "already_compliant",
+        "excluded_cluster_source",
+    }
+    if status not in allowed:
+        raise RuntimeError(
+            "Minimum branch-bone policy returned an unsupported status: "
+            + repr(status)
+        )
+    try:
+        receipt_spm = Path(str(receipt.get("spm") or "")).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has no valid SPM path"
+        ) from exc
+    if receipt_spm != spm:
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt belongs to another SPM"
+        )
+
+    changed = receipt.get("changed")
+    changed_count = receipt.get("changed_generator_count")
+    if not isinstance(changed, bool) or not isinstance(changed_count, int):
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has malformed change fields"
+        )
+    if status == "updated":
+        if not changed or changed_count <= 0:
+            raise RuntimeError(
+                "Updated minimum branch-bone policy receipt is inconsistent"
+            )
+    elif changed or changed_count != 0:
+        raise RuntimeError(
+            "Non-updated minimum branch-bone policy receipt is inconsistent"
+        )
+
+    current = _file_identity(spm)
+    expected_digest_field = (
+        "updated_sha256" if status == "updated" else "source_sha256"
+    )
+    expected_digest = str(receipt.get(expected_digest_field) or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt has no valid "
+            + expected_digest_field
+        )
+    if expected_digest != str(current.get("sha256") or "").lower():
+        raise RuntimeError(
+            "Minimum branch-bone policy receipt does not match persisted SPM"
+        )
+
+    if status == "updated":
+        backup = Path(str(receipt.get("backup") or "")).resolve()
+        source_digest = str(receipt.get("source_sha256") or "").lower()
+        if not backup.is_file() or not re.fullmatch(
+            r"[0-9a-f]{64}", source_digest
+        ):
+            raise RuntimeError(
+                "Updated minimum branch-bone policy receipt has no verified backup"
+            )
+        if _sha256_file(backup).lower() != source_digest:
+            raise RuntimeError(
+                "Minimum branch-bone policy backup digest does not match receipt"
+            )
+
+    validated = dict(receipt)
+    validated["sealed_source_identity"] = current
+    return validated
+
+
+def apply_minimum_absolute_branch_bone_policy(spm):
+    """Apply and validate the SPM policy under the shared Modeler mutex."""
+    with speedtree_export_gate():
+        return _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+
+
+def _validated_policy_export_request(exe, spm, targets, native_receipt):
+    """Validate every immutable export input before persistent SPM repair."""
+    exe = Path(exe).resolve()
+    spm = Path(spm).resolve()
+    rows = tuple(
+        (str(kind).lower(), Path(target).resolve(), Path(options).resolve())
+        for kind, target, options in targets
+    )
+    if not exe.is_file():
+        raise RuntimeError("SpeedTree executable does not exist: " + str(exe))
+    if not spm.is_file() or spm.suffix.casefold() != ".spm":
+        raise RuntimeError("SpeedTree SPM does not exist: " + str(spm))
+    hook = exe.with_name("speedtree_collision_hook.dll")
+    if not hook.is_file():
+        raise RuntimeError(
+            "SpeedTree collision hook is missing beside the launcher: "
+            + str(hook)
+        )
+    if not rows or len(rows) > 2:
+        raise RuntimeError(
+            "Minimum-bone export transaction requires one or two targets"
+        )
+    kinds = [kind for kind, _target, _options in rows]
+    if len(set(kinds)) != len(kinds) or any(
+        kind not in {"fbx", "xml"} for kind in kinds
+    ):
+        raise RuntimeError(
+            "Minimum-bone export transaction target kinds are invalid"
+        )
+    for kind, target, options in rows:
+        require_texture_skip_writing(
+            options,
+            purpose=f"SpeedTree {kind.upper()} export",
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    receipt = Path(native_receipt).resolve() if native_receipt else None
+    if receipt is not None:
+        fbx_rows = [row for row in rows if row[0] == "fbx"]
+        if len(fbx_rows) != 1:
+            raise RuntimeError(
+                "Native receipt export requires exactly one FBX target."
+            )
+        if receipt.parent != fbx_rows[0][1].parent:
+            raise ValueError(
+                "Native receipt and FBX target must share one transaction directory."
+            )
+    return exe, spm, rows, receipt
+
+
+def export_bundle_with_minimum_bone_policy(
+    exe,
+    spm,
+    targets,
+    timeout_seconds=900,
+    native_receipt=None,
+    force_reexport=False,
+    policy_report=None,
+    allow_verification_fallback=True,
+):
+    """Persist Absolute/1 and export one sealed SPM under one mutex."""
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
+    exe, spm, targets, native_receipt = _validated_policy_export_request(
+        exe,
+        spm,
+        targets,
+        native_receipt,
+    )
+    with speedtree_export_gate():
+        policy = _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+        sealed = dict(policy["sealed_source_identity"])
+        try:
+            results = export_bundle(
+                exe=exe,
+                spm=spm,
+                targets=targets,
+                timeout_seconds=timeout_seconds,
+                native_receipt=native_receipt,
+                force_reexport=force_reexport,
+                allow_verification_fallback=allow_verification_fallback,
+            )
+        finally:
+            current = _file_identity(spm)
+            if current != sealed:
+                raise RuntimeError(
+                    "SpeedTree SPM changed during the sealed export transaction"
+                )
+    if policy_report is not None:
+        policy_report["spm_bone_policy"] = policy
+    return results
+
+
+def _validate_fresh_verification_bundle(
+    results,
+    targets,
+    native_receipt,
+    spm,
+):
+    """Prove one fresh verification-only process sealed the exact bundle."""
+
+    target_by_kind = {
+        str(kind).lower(): Path(target).resolve()
+        for kind, target, _options in targets
+    }
+    if set(target_by_kind) != {"fbx", "xml"} or set(results) != {
+        "fbx",
+        "xml",
+    }:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX/XML results"
+        )
+    receipt = Path(native_receipt).resolve() if native_receipt else None
+    if receipt is None or not _native_receipt_is_valid(receipt, spm):
+        raise RuntimeError(
+            "Fresh verification-only export did not seal a current native receipt"
+        )
+
+    sealed_artifacts = {}
+    for kind in ("fbx", "xml"):
+        row = results[kind]
+        target = target_by_kind[kind]
+        try:
+            row_path = Path(str(row.get("path") or "")).resolve()
+        except (OSError, RuntimeError):
+            row_path = Path()
+        if (
+            row_path != target
+            or row.get("exists") is not True
+            or row.get("cache_hit") is not False
+            or row.get("force_reexport_requested") is not True
+            or row.get("verification_only") is not True
+            or row.get("bundled_process") is not True
+            or row.get("bundle_fallback") is not False
+            or FRESH_VERIFICATION_SEALED_MARKER
+            not in str(row.get("stdout") or "")
+            or not _basic_output_is_valid(kind, target, parse_xml=True)
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export result is not one sealed "
+                f"launcher bundle: {kind}"
+            )
+        attempts = row.get("export_attempts") or []
+        if (
+            len(attempts) != 1
+            or attempts[0].get("attempt") != 1
+            or attempts[0].get("returncode") != 0
+        ):
+            raise RuntimeError(
+                "Fresh verification-only export was not exactly one "
+                f"successful process attempt: {kind}"
+            )
+        required = [target]
+        if kind == "fbx":
+            required.extend([target.with_suffix(".stmat"), receipt])
+        artifacts = {
+            str(record.get("relative_path") or "").casefold(): record
+            for record in row.get("artifacts") or ()
+            if isinstance(record, dict)
+        }
+        verified = []
+        for path in required:
+            relative = path.resolve().relative_to(target.parent).as_posix()
+            record = artifacts.get(relative.casefold())
+            if record is None or not path.is_file():
+                raise RuntimeError(
+                    "Fresh verification-only export is missing a sealed "
+                    f"artifact: {path}"
+                )
+            stat = path.stat()
+            digest = _sha256_file(path)
+            if (
+                int(record.get("size") or -1) != stat.st_size
+                or str(record.get("sha256") or "").casefold()
+                != digest.casefold()
+            ):
+                raise RuntimeError(
+                    "Fresh verification-only export artifact identity drifted: "
+                    + str(path)
+                )
+            verified.append({
+                "path": str(path),
+                "size": stat.st_size,
+                "sha256": digest,
+            })
+        sealed_artifacts[kind] = verified
+
+    return {
+        "status": "sealed",
+        "policy": "fresh_verification_only_as_sole_export_v1",
+        "explicit_opt_in_required": True,
+        "force_reexport": True,
+        "collision_prune_bundle_attempt_count": 0,
+        "verification_bundle_attempt_count": 1,
+        "independent_fallback_attempt_count": 0,
+        "launcher_sealed_completion": {
+            "status": "observed",
+            "marker": FRESH_VERIFICATION_SEALED_MARKER,
+        },
+        "native_receipt": str(receipt),
+        "sealed_artifacts": sealed_artifacts,
+    }
+
+
+def export_fresh_verification_bundle_with_minimum_bone_policy(
+    exe,
+    spm,
+    targets,
+    timeout_seconds=900,
+    native_receipt=None,
+    force_reexport=False,
+    policy_report=None,
+):
+    """Run one explicitly requested fresh verification-only FBX/XML export."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires force_reexport=True"
+        )
+    exe, spm, targets, native_receipt = _validated_policy_export_request(
+        exe,
+        spm,
+        targets,
+        native_receipt,
+    )
+    if {kind for kind, _target, _options in targets} != {"fbx", "xml"}:
+        raise RuntimeError(
+            "Fresh verification-only export requires exactly FBX and XML"
+        )
+    if native_receipt is None:
+        raise RuntimeError(
+            "Fresh verification-only export requires a native receipt target"
+        )
+    with speedtree_export_gate():
+        policy = _validated_minimum_bone_policy_receipt(
+            spm,
+            ensure_minimum_absolute_branch_bones(spm),
+        )
+        sealed = dict(policy["sealed_source_identity"])
+        try:
+            results = export_bundle(
+                exe=exe,
+                spm=spm,
+                targets=targets,
+                timeout_seconds=timeout_seconds,
+                native_receipt=native_receipt,
+                force_reexport=True,
+                verification_only=True,
+                fail_closed=True,
+            )
+            verification = _validate_fresh_verification_bundle(
+                results,
+                targets,
+                native_receipt,
+                spm,
+            )
+        finally:
+            current = _file_identity(spm)
+            if current != sealed:
+                raise RuntimeError(
+                    "SpeedTree SPM changed during the sealed export transaction"
+                )
+    if policy_report is not None:
+        policy_report["spm_bone_policy"] = policy
+        policy_report["fresh_verification_only_export"] = verification
+    return results
+
+
 def export_bundle(
     exe,
     spm,
@@ -1476,16 +2491,31 @@ def export_bundle(
     timeout_seconds=900,
     native_receipt=None,
     force_reexport=False,
+    verification_only=False,
+    fail_closed=False,
+    allow_verification_fallback=True,
 ):
     """Export FBX and XML through one collision-CLI/Modeler process.
 
     Each target keeps its independent content cache. A one-target miss still
     uses ``export_target``; only two simultaneous misses pay for the bundled
-    native-CLI invocation.
+    native-CLI invocation. Set ``allow_verification_fallback=False`` to keep a
+    normal export normal and fail immediately instead of retrying in
+    verification-only mode.
     """
     exe = Path(exe)
     spm = Path(spm)
     native_receipt = Path(native_receipt) if native_receipt else None
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
+    if verification_only and not force_reexport:
+        raise RuntimeError(
+            "Verification-only bundle execution requires force_reexport=True"
+        )
+    if fail_closed and not verification_only:
+        raise RuntimeError(
+            "Fail-closed bundle execution requires verification_only=True"
+        )
     prepared = []
     all_items = []
     results = {}
@@ -1574,6 +2604,7 @@ def export_bundle(
                 native_receipt if item["kind"] == "fbx" else None
             ),
             force_reexport=force_reexport,
+            allow_verification_fallback=allow_verification_fallback,
         )
         results[item["kind"]]["bundled_process"] = False
         _reconcile_completed_bundle_results(
@@ -1594,7 +2625,8 @@ def export_bundle(
     stdout = ""
     stderr = ""
     bundle_reconciliation = None
-    for attempt in range(1, _EXPORT_RETRY_ATTEMPTS + 1):
+    maximum_attempts = 1 if fail_closed else _EXPORT_RETRY_ATTEMPTS
+    for attempt in range(1, maximum_attempts + 1):
         with tempfile.TemporaryDirectory(
             prefix="bwr_speedtree_bundle_"
         ) as temp_dir:
@@ -1606,6 +2638,8 @@ def export_bundle(
                 staged[item["kind"]].parent.mkdir(parents=True, exist_ok=True)
             staged_receipt = None
             command = [str(exe)]
+            if verification_only:
+                command.append("--verification-only")
             if native_receipt is not None:
                 relative_receipt = native_receipt.resolve().relative_to(common_root)
                 staged_receipt = staging_root / relative_receipt
@@ -1628,7 +2662,17 @@ def export_bundle(
                     cwd=spm.parent,
                     timeout_seconds=timeout_seconds,
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle timed out before "
+                        "launcher-sealed completion"
+                    ) from exc
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle timed out; verification "
+                        "fallback is disabled"
+                    ) from exc
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -1650,11 +2694,22 @@ def export_bundle(
                 attempt_record["failure_kind"] = (
                     failure_kind or "process_export_failed"
                 )
-                if failure_kind and attempt < _EXPORT_RETRY_ATTEMPTS:
+                if failure_kind and attempt < maximum_attempts:
                     backoff = _EXPORT_RETRY_BACKOFF_SECONDS[attempt - 1]
                     attempt_record["retry_backoff_seconds"] = backoff
                     time.sleep(backoff)
                     continue
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle failed before "
+                        "launcher-sealed completion: returncode="
+                        f"{returncode}"
+                    )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle failed with returncode="
+                        f"{returncode}; verification fallback is disabled"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -1671,7 +2726,23 @@ def export_bundle(
                     item["kind"], staged[item["kind"]], parse_xml=True
                 )
             ]
+            if (
+                verification_only
+                and FRESH_VERIFICATION_SEALED_MARKER not in stdout
+            ):
+                invalid.append("launcher_sealed_completion_marker")
             if invalid:
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle failed exact output "
+                        "validation: " + ", ".join(invalid)
+                    )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle failed output validation: "
+                        + ", ".join(invalid)
+                        + "; verification fallback is disabled"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -1685,6 +2756,16 @@ def export_bundle(
                 staged_receipt is not None
                 and not _native_receipt_is_valid(staged_receipt, spm)
             ):
+                if fail_closed:
+                    raise RuntimeError(
+                        "Fresh verification-only bundle did not create a "
+                        "current native receipt"
+                    )
+                if not allow_verification_fallback:
+                    raise RuntimeError(
+                        "Normal SpeedTree bundle did not create a current "
+                        "native receipt; verification fallback is disabled"
+                    )
                 return _export_bundle_fallback(
                     exe,
                     spm,
@@ -1731,6 +2812,7 @@ def export_bundle(
             "artifacts": artifacts,
             "completed_at": finished,
             "bundled_process": True,
+            "verification_only": bool(verification_only),
             "native_receipt": (
                 str(native_receipt)
                 if native_receipt is not None and item["kind"] == "fbx"
@@ -1759,6 +2841,8 @@ def export_bundle(
             "artifacts": artifacts,
             "export_attempts": export_attempts,
             "bundled_process": True,
+            "verification_only": bool(verification_only),
+            "bundle_fallback": False,
             "force_reexport_requested": bool(force_reexport),
             "native_receipt": (
                 str(native_receipt)

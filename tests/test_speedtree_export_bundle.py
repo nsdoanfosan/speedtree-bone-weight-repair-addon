@@ -1,9 +1,12 @@
 import importlib.util
+import ast
 import codecs
+import hashlib
 import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -19,6 +22,506 @@ SPEC.loader.exec_module(speedtree_cli)
 
 
 class SpeedTreeExportBundleTests(unittest.TestCase):
+    def test_core_exposes_a_separate_explicit_gateway_operation(self):
+        core_path = MODULE_PATH.with_name("core.py")
+        tree = ast.parse(core_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        normal = functions["run_speedtree_cli_export"]
+        fresh_collision = functions["run_fresh_collision_prune_export"]
+        fresh = functions["run_fresh_verification_only_export"]
+        self.assertEqual(
+            [argument.arg for argument in normal.args.args],
+            [argument.arg for argument in fresh.args.args],
+        )
+        self.assertEqual(
+            [argument.arg for argument in normal.args.args],
+            [argument.arg for argument in fresh_collision.args.args],
+        )
+        self.assertIn(
+            "allow_verification_fallback",
+            [argument.arg for argument in normal.args.args],
+        )
+
+        def selected_mode(function):
+            calls = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_run_speedtree_cli_export"
+            ]
+            self.assertEqual(len(calls), 1)
+            keyword = next(
+                row
+                for row in calls[0].keywords
+                if row.arg == "fresh_verification_only"
+            )
+            self.assertIsInstance(keyword.value, ast.Constant)
+            return keyword.value.value
+
+        self.assertIs(selected_mode(normal), False)
+        self.assertIs(selected_mode(fresh_collision), False)
+        self.assertIs(selected_mode(fresh), True)
+        normal_call = next(
+            node
+            for node in ast.walk(normal)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_speedtree_cli_export"
+        )
+        fallback_keyword = next(
+            row
+            for row in normal_call.keywords
+            if row.arg == "allow_verification_fallback"
+        )
+        self.assertIsInstance(fallback_keyword.value, ast.Name)
+        self.assertEqual(
+            fallback_keyword.value.id,
+            "allow_verification_fallback",
+        )
+        runner_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            functions["_run_speedtree_cli_export"],
+        )
+        self.assertIn(
+            'transaction_options["allow_verification_fallback"]',
+            runner_source,
+        )
+        self.assertIn("if not fresh_verification_only:", runner_source)
+        fresh_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            fresh,
+        )
+        self.assertIn("if force_reexport is not True:", fresh_source)
+        self.assertIn(
+            "if export_fbx is not True or export_xml is not True:",
+            fresh_source,
+        )
+        fresh_collision_source = ast.get_source_segment(
+            core_path.read_text(encoding="utf-8"),
+            fresh_collision,
+        )
+        self.assertIn(
+            "if force_reexport is not True:", fresh_collision_source
+        )
+        self.assertIn(
+            "if export_fbx is not True or export_xml is not True:",
+            fresh_collision_source,
+        )
+        fresh_collision_call = next(
+            node
+            for node in ast.walk(fresh_collision)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_run_speedtree_cli_export"
+        )
+        collision_keywords = {
+            row.arg: row.value for row in fresh_collision_call.keywords
+        }
+        for field, expected in (
+            ("force_reexport", True),
+            ("allow_verification_fallback", False),
+            ("fresh_verification_only", False),
+        ):
+            self.assertIsInstance(collision_keywords[field], ast.Constant)
+            self.assertIs(collision_keywords[field].value, expected)
+
+    def test_fresh_collision_prune_gateway_executes_strict_normal_mode(self):
+        core_path = MODULE_PATH.with_name("core.py")
+        tree = ast.parse(core_path.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_fresh_collision_prune_export"
+        )
+        calls = []
+
+        def runner(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"status": "ok"}
+
+        namespace = {"_run_speedtree_cli_export": runner}
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]),
+                str(core_path),
+                "exec",
+            ),
+            namespace,
+        )
+        gateway = namespace["run_fresh_collision_prune_export"]
+        self.assertEqual(
+            gateway(
+                "tree.spm",
+                force_reexport=True,
+                export_fbx=True,
+                export_xml=True,
+            ),
+            {"status": "ok"},
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][1]["force_reexport"], True)
+        self.assertIs(calls[0][1]["allow_verification_fallback"], False)
+        self.assertIs(calls[0][1]["fresh_verification_only"], False)
+
+        with self.assertRaisesRegex(RuntimeError, "force_reexport=True"):
+            gateway("tree.spm", force_reexport=False)
+        with self.assertRaisesRegex(RuntimeError, "exact FBX and XML"):
+            gateway(
+                "tree.spm",
+                force_reexport=True,
+                export_xml=False,
+            )
+        self.assertEqual(len(calls), 1)
+
+    @staticmethod
+    def _policy_export_fixture(root):
+        exe = root / "speedtree_collision_cli.exe"
+        hook = root / "speedtree_collision_hook.dll"
+        spm = root / "tree.spm"
+        options = root / "fbx.ini"
+        target = root / "out" / "tree.fbx"
+        exe.write_bytes(b"exe")
+        hook.write_bytes(b"hook")
+        spm.write_text(
+            "<SpeedTreeModel><Generators /></SpeedTreeModel>",
+            encoding="utf-8",
+        )
+        options.write_text(
+            "[Options]\nTextureSkipWriting=true\n",
+            encoding="utf-8",
+        )
+        return exe, spm, options, target
+
+    def test_minimum_bone_export_transaction_seals_policy_before_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            original = spm.read_bytes()
+            updated = original.replace(b" />", b"></Generators>")
+            backup = root / "tree.spm.backup"
+            events = []
+            originals = (
+                speedtree_cli.speedtree_export_gate,
+                speedtree_cli.ensure_minimum_absolute_branch_bones,
+                speedtree_cli.export_bundle,
+            )
+
+            @contextmanager
+            def gate():
+                events.append("gate_enter")
+                yield
+                events.append("gate_exit")
+
+            def ensure(path):
+                events.append("policy")
+                backup.write_bytes(original)
+                Path(path).write_bytes(updated)
+                return {
+                    "status": "updated",
+                    "spm": str(Path(path).resolve()),
+                    "changed": True,
+                    "changed_generator_count": 1,
+                    "changed_generators": [{"name": "Branch"}],
+                    "backup": str(backup),
+                    "source_sha256": hashlib.sha256(original).hexdigest(),
+                    "updated_sha256": hashlib.sha256(updated).hexdigest(),
+                    "policy": (
+                        "non_cluster_zero_bone_branch_to_absolute_one_v1"
+                    ),
+                }
+
+            def export(**kwargs):
+                events.append("export")
+                self.assertEqual(spm.read_bytes(), updated)
+                self.assertIs(
+                    kwargs["allow_verification_fallback"],
+                    False,
+                )
+                return {"fbx": {"status": "ok"}}
+
+            speedtree_cli.speedtree_export_gate = gate
+            speedtree_cli.ensure_minimum_absolute_branch_bones = ensure
+            speedtree_cli.export_bundle = export
+            policy_report = {}
+            try:
+                result = (
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                        policy_report=policy_report,
+                        allow_verification_fallback=False,
+                    )
+                )
+            finally:
+                (
+                    speedtree_cli.speedtree_export_gate,
+                    speedtree_cli.ensure_minimum_absolute_branch_bones,
+                    speedtree_cli.export_bundle,
+                ) = originals
+
+            self.assertEqual(
+                events,
+                ["gate_enter", "policy", "export", "gate_exit"],
+            )
+            self.assertEqual(result["fbx"]["status"], "ok")
+            self.assertEqual(
+                policy_report["spm_bone_policy"]["updated_sha256"],
+                hashlib.sha256(updated).hexdigest(),
+            )
+
+    def test_minimum_bone_export_transaction_rejects_export_time_spm_drift(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            digest = hashlib.sha256(spm.read_bytes()).hexdigest()
+            originals = (
+                speedtree_cli.ensure_minimum_absolute_branch_bones,
+                speedtree_cli.export_bundle,
+            )
+
+            def ensure(path):
+                return {
+                    "status": "already_compliant",
+                    "spm": str(Path(path).resolve()),
+                    "changed": False,
+                    "changed_generator_count": 0,
+                    "changed_generators": [],
+                    "backup": "",
+                    "source_sha256": digest,
+                    "policy": (
+                        "non_cluster_zero_bone_branch_to_absolute_one_v1"
+                    ),
+                }
+
+            def export(**_kwargs):
+                spm.write_bytes(spm.read_bytes() + b"external-drift")
+                return {"fbx": {"status": "ok"}}
+
+            speedtree_cli.ensure_minimum_absolute_branch_bones = ensure
+            speedtree_cli.export_bundle = export
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "changed during the sealed export transaction",
+                ):
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                    )
+            finally:
+                (
+                    speedtree_cli.ensure_minimum_absolute_branch_bones,
+                    speedtree_cli.export_bundle,
+                ) = originals
+
+    def test_minimum_bone_export_transaction_rejects_malformed_policy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, options, target = self._policy_export_fixture(root)
+            original = speedtree_cli.ensure_minimum_absolute_branch_bones
+            speedtree_cli.ensure_minimum_absolute_branch_bones = (
+                lambda _path: {"status": "failed"}
+            )
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unsupported status",
+                ):
+                    speedtree_cli.export_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                    )
+            finally:
+                speedtree_cli.ensure_minimum_absolute_branch_bones = original
+
+    def test_fresh_verification_only_is_one_sealed_bundle_without_collision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                self.assertIn("--verification-only", command)
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                staged_receipt = Path(
+                    command[command.index("--native-receipt") + 1]
+                )
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"fresh-fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />",
+                    encoding="utf-8",
+                )
+                secondary.write_text("<SpeedTreeRaw />", encoding="utf-8")
+                self._write_native_receipt(staged_receipt, spm)
+                return (
+                    0,
+                    speedtree_cli.FRESH_VERIFICATION_SEALED_MARKER,
+                    "",
+                )
+
+            speedtree_cli._run_process = fake_run
+            policy_report = {}
+            try:
+                result = (
+                    speedtree_cli
+                    .export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                        policy_report=policy_report,
+                    )
+                )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(result["fbx"]["verification_only"])
+            self.assertTrue(result["xml"]["verification_only"])
+            self.assertTrue(result["fbx"]["bundled_process"])
+            self.assertFalse(result["fbx"]["bundle_fallback"])
+            evidence = policy_report["fresh_verification_only_export"]
+            self.assertEqual(
+                evidence["collision_prune_bundle_attempt_count"], 0
+            )
+            self.assertEqual(evidence["verification_bundle_attempt_count"], 1)
+            self.assertEqual(evidence["independent_fallback_attempt_count"], 0)
+            self.assertEqual(
+                evidence["launcher_sealed_completion"]["status"],
+                "observed",
+            )
+            self.assertEqual(fbx.read_bytes(), b"fresh-fbx")
+            self.assertTrue(receipt.is_file())
+            self.assertTrue(xml.is_file())
+
+    def test_fresh_verification_only_missing_sealed_marker_fails_without_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                primary = Path(command[command.index("-export") + 1])
+                secondary = Path(
+                    command[command.index("--secondary-export") + 1]
+                )
+                staged_receipt = Path(
+                    command[command.index("--native-receipt") + 1]
+                )
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                secondary.parent.mkdir(parents=True, exist_ok=True)
+                primary.write_bytes(b"unsealed-fbx")
+                primary.with_suffix(".stmat").write_text(
+                    "<Materials />",
+                    encoding="utf-8",
+                )
+                secondary.write_text("<SpeedTreeRaw />", encoding="utf-8")
+                self._write_native_receipt(staged_receipt, spm)
+                return 0, "missing marker", ""
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "launcher_sealed_completion_marker",
+                ):
+                    speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(fbx.exists())
+            self.assertFalse(xml.exists())
+            self.assertFalse(receipt.exists())
+
+    def test_fresh_verification_only_timeout_fails_without_retry_or_promotion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe, spm, fbx_options, fbx = self._policy_export_fixture(root)
+            xml_options = root / "xml.ini"
+            xml_options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            xml = root / "xml" / "tree.xml"
+            receipt = fbx.parent / "tree.speedtree_native_receipt.json"
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "timed out before launcher-sealed completion",
+                ):
+                    speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy(
+                        exe,
+                        spm,
+                        [
+                            ("fbx", fbx, fbx_options),
+                            ("xml", xml, xml_options),
+                        ],
+                        native_receipt=receipt,
+                        force_reexport=True,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertIn("--verification-only", calls[0])
+            self.assertFalse(fbx.exists())
+            self.assertFalse(xml.exists())
+            self.assertFalse(receipt.exists())
+
     @staticmethod
     def _write_native_receipt(path, spm):
         stat = spm.stat()
@@ -151,6 +654,29 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertFalse(second["changed"])
             self.assertEqual(second["status"], "already_reconciled")
             self.assertEqual(xml.read_bytes(), first_bytes)
+
+    def test_reconcile_accepts_modeler_decimal_comma_coordinates(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spm = root / "tree.spm"
+            xml = root / "tree.xml"
+            receipt = root / "tree.speedtree_native_receipt.json"
+            spm.write_bytes(b"spm")
+            xml.write_bytes(self._root_like_xml_bytes())
+            self._write_synthetic_native_receipt(receipt, spm)
+            speedtree_cli.reconcile_xml_with_native_receipt(
+                xml, receipt, spm, create_backup=False
+            )
+            xml.write_bytes(
+                xml.read_bytes().replace(b'EndZ="30.48"', b'EndZ="30,48"')
+            )
+
+            result = speedtree_cli.reconcile_xml_with_native_receipt(
+                xml, receipt, spm, create_backup=False
+            )
+
+            self.assertEqual(result["status"], "already_reconciled")
+            self.assertFalse(result["changed"])
 
     def test_reconcile_fails_closed_for_an_ordinary_missing_bone(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -569,6 +1095,128 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
             self.assertTrue(result["xml"]["verification_only"])
             self.assertEqual(fbx.read_bytes(), b"fbx")
             self.assertEqual(xml.read_text(encoding="utf-8"), "<SpeedTreeRaw />")
+
+    def test_strict_normal_bundle_failures_never_enter_verification_fallback(self):
+        for failure_mode in ("timeout", "nonzero", "invalid", "receipt"):
+            with self.subTest(failure_mode=failure_mode):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    exe = root / "speedtree_collision_cli.exe"
+                    spm = root / "tree.spm"
+                    fbx_options = root / "fbx.ini"
+                    xml_options = root / "xml.ini"
+                    fbx = root / "out" / "fbx" / "tree.fbx"
+                    xml = root / "out" / "xml" / "tree.xml"
+                    receipt = (
+                        fbx.parent / "tree.speedtree_native_receipt.json"
+                        if failure_mode == "receipt"
+                        else None
+                    )
+                    exe.write_bytes(b"exe")
+                    exe.with_name(
+                        "speedtree_collision_hook.dll"
+                    ).write_bytes(b"hook")
+                    spm.write_bytes(b"spm")
+                    preset = "[Options]\nTextureSkipWriting=true\n"
+                    fbx_options.write_text(preset, encoding="utf-8")
+                    xml_options.write_text(preset, encoding="utf-8")
+                    calls = []
+                    original = speedtree_cli._run_process
+
+                    def fake_run(command, cwd, timeout_seconds):
+                        calls.append(list(command))
+                        self.assertNotIn("--verification-only", command)
+                        if failure_mode == "timeout":
+                            raise subprocess.TimeoutExpired(
+                                command, timeout_seconds
+                            )
+                        if failure_mode == "nonzero":
+                            return 7, "normal failed", ""
+                        if failure_mode == "invalid":
+                            return 0, "normal returned no outputs", ""
+                        primary = Path(
+                            command[command.index("-export") + 1]
+                        )
+                        secondary = Path(
+                            command[
+                                command.index("--secondary-export") + 1
+                            ]
+                        )
+                        primary.parent.mkdir(parents=True, exist_ok=True)
+                        secondary.parent.mkdir(parents=True, exist_ok=True)
+                        primary.write_bytes(b"fbx")
+                        primary.with_suffix(".stmat").write_text(
+                            "<Materials />", encoding="utf-8"
+                        )
+                        secondary.write_text(
+                            "<SpeedTreeRaw />", encoding="utf-8"
+                        )
+                        return 0, "normal omitted receipt", ""
+
+                    speedtree_cli._run_process = fake_run
+                    try:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "verification fallback is disabled",
+                        ):
+                            speedtree_cli.export_bundle(
+                                exe,
+                                spm,
+                                [
+                                    ("fbx", fbx, fbx_options),
+                                    ("xml", xml, xml_options),
+                                ],
+                                native_receipt=receipt,
+                                allow_verification_fallback=False,
+                            )
+                    finally:
+                        speedtree_cli._run_process = original
+
+                    self.assertEqual(len(calls), 1)
+                    self.assertFalse(fbx.exists())
+                    self.assertFalse(xml.exists())
+                    if receipt is not None:
+                        self.assertFalse(receipt.exists())
+
+    def test_strict_normal_single_target_timeout_does_not_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            exe = root / "speedtree_collision_cli.exe"
+            spm = root / "tree.spm"
+            options = root / "fbx.ini"
+            target = root / "out" / "tree.fbx"
+            exe.write_bytes(b"exe")
+            exe.with_name("speedtree_collision_hook.dll").write_bytes(b"hook")
+            spm.write_bytes(b"spm")
+            options.write_text(
+                "[Options]\nTextureSkipWriting=true\n",
+                encoding="utf-8",
+            )
+            calls = []
+            original = speedtree_cli._run_process
+
+            def fake_run(command, cwd, timeout_seconds):
+                calls.append(list(command))
+                self.assertNotIn("--verification-only", command)
+                raise subprocess.TimeoutExpired(command, timeout_seconds)
+
+            speedtree_cli._run_process = fake_run
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "verification fallback is disabled",
+                ):
+                    speedtree_cli.export_bundle(
+                        exe,
+                        spm,
+                        [("fbx", target, options)],
+                        allow_verification_fallback=False,
+                    )
+            finally:
+                speedtree_cli._run_process = original
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(target.exists())
 
     def test_force_reexport_failure_preserves_outputs_and_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:

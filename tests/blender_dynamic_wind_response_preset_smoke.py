@@ -46,6 +46,39 @@ def _simulation_groups():
     ]
 
 
+def _ground_cover_fan_records():
+    return [
+        {"name": "Root", "bone_index": 0, "parent_index": -1, "group": 0},
+        {"name": "BladeA_Start", "bone_index": 1, "parent_index": 0, "group": 0},
+        {"name": "BladeA_End", "bone_index": 2, "parent_index": 1, "group": 0},
+        {"name": "BladeB_Start", "bone_index": 3, "parent_index": 0, "group": 0},
+        {"name": "BladeB_End", "bone_index": 4, "parent_index": 3, "group": 0},
+    ]
+
+
+def _same_group_chains(joints):
+    by_index = {joint["BoneIndex"]: joint for joint in joints}
+    children = {bone_index: [] for bone_index in by_index}
+    for joint in joints:
+        parent = by_index.get(joint["ParentIndex"])
+        if parent and parent["SimulationGroupIndex"] == joint["SimulationGroupIndex"]:
+            children[parent["BoneIndex"]].append(joint["BoneIndex"])
+
+    origins = {}
+    for joint in joints:
+        parent = by_index.get(joint["ParentIndex"])
+        if parent and parent["SimulationGroupIndex"] == joint["SimulationGroupIndex"]:
+            continue
+        chain = []
+        pending = [joint["BoneIndex"]]
+        while pending:
+            bone_index = pending.pop()
+            chain.append(bone_index)
+            pending.extend(children[bone_index])
+        origins[joint["JointName"]] = sorted(chain)
+    return origins
+
+
 def main():
     assert canonical_wind_preset_id("GRASS") == "WEED"
     assert set(WIND_PRESETS) == {"TREE", "BUSH", "WEED", "NONE"}
@@ -89,6 +122,41 @@ def main():
             "bSourceTrunkGroup": False,
         },
     ]
+
+    fan_groups = [{"index": 0, "mean_radius": 0.2, "is_trunk_group": True}]
+    ground_cover_fan = core.build_dynamic_wind_data(
+        _ground_cover_fan_records(),
+        fan_groups,
+        ground_cover=True,
+        flexibility=3.0,
+        wind_preset="WEED",
+    )
+    assert ground_cover_fan["SkeletonContract"]["BoneCount"] == 5
+    assert ground_cover_fan["SkeletonContract"]["Bones"][0]["BoneName"] == "Root"
+    assert [joint["JointName"] for joint in ground_cover_fan["Joints"]] == [
+        "BladeA_Start",
+        "BladeA_End",
+        "BladeB_Start",
+        "BladeB_End",
+    ]
+    assert _same_group_chains(ground_cover_fan["Joints"]) == {
+        "BladeA_Start": [1, 2],
+        "BladeB_Start": [3, 4],
+    }
+
+    for preset in ("TREE", "BUSH"):
+        woody_fan = core.build_dynamic_wind_data(
+            _ground_cover_fan_records(),
+            fan_groups,
+            ground_cover=False,
+            flexibility=1.0,
+            wind_preset=preset,
+        )
+        assert len(woody_fan["Joints"]) == 5
+        assert woody_fan["Joints"][0]["JointName"] == "Root"
+        assert woody_fan["SimulationGroups"] == core.build_dynamic_wind_groups(
+            fan_groups, 1.0, False
+        )
 
     none = core.build_dynamic_wind_data(
         _bone_records(),

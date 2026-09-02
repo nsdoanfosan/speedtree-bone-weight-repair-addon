@@ -233,7 +233,7 @@ def default_speedtree_export_options(spm_path, kind="fbx"):
     return r"C:\Program Files\SpeedTree\SpeedTree Modeler v10.1.0\export_presets\VFX\__FBX.ini"
 
 
-def run_speedtree_cli_export(
+def _run_speedtree_cli_export(
     spm_path,
     speedtree_exe_path="",
     export_options_path="",
@@ -245,7 +245,11 @@ def run_speedtree_cli_export(
     export_xml=True,
     timeout_seconds=900,
     force_reexport=False,
+    allow_verification_fallback=True,
+    fresh_verification_only=False,
 ):
+    if type(allow_verification_fallback) is not bool:
+        raise ValueError("allow_verification_fallback must be a bool")
     spm = Path(spm_path)
     if not spm.exists():
         raise RuntimeError(f"SPM does not exist: {spm_path}")
@@ -279,32 +283,29 @@ def run_speedtree_cli_export(
             raise RuntimeError(f"SpeedTree {kind.upper()} export options INI does not exist: {options}")
         export_options[kind] = str(options)
         target.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        len(targets) == 2
-        and exe.name.casefold() == "speedtree_collision_cli.exe"
-    ):
-        results = speedtree_cli.export_bundle(
-            exe=exe,
-            spm=spm,
-            targets=targets,
-            timeout_seconds=timeout_seconds,
-            native_receipt=native_receipt,
-            force_reexport=force_reexport,
+    policy_report = {}
+    export_transaction = (
+        speedtree_cli.export_fresh_verification_bundle_with_minimum_bone_policy
+        if fresh_verification_only
+        else speedtree_cli.export_bundle_with_minimum_bone_policy
+    )
+    transaction_options = {
+        "exe": exe,
+        "spm": spm,
+        "targets": targets,
+        "timeout_seconds": timeout_seconds,
+        "native_receipt": native_receipt,
+        "force_reexport": force_reexport,
+        "policy_report": policy_report,
+    }
+    if not fresh_verification_only:
+        transaction_options["allow_verification_fallback"] = (
+            allow_verification_fallback
         )
-    else:
-        for kind, target, options in targets:
-            results[kind] = speedtree_cli.export_target(
-                exe=exe,
-                spm=spm,
-                options=options,
-                kind=kind,
-                target=target,
-                timeout_seconds=timeout_seconds,
-                native_receipt=(
-                    native_receipt if kind == "fbx" else None
-                ),
-                force_reexport=force_reexport,
-            )
+    results = export_transaction(
+        **transaction_options
+    )
+    spm_bone_policy = policy_report["spm_bone_policy"]
 
     bundle_mtime_sync = None
     if "fbx" in results and "xml" in results:
@@ -323,14 +324,147 @@ def run_speedtree_cli_export(
         "export_options": export_options,
         "output_root": str(root),
         "name_stem": stem,
+        "spm_bone_policy": spm_bone_policy,
         "export_cache_version": speedtree_cli.EXPORT_CACHE_VERSION,
         "force_reexport_requested": bool(force_reexport),
+        "allow_verification_fallback": bool(
+            allow_verification_fallback and not fresh_verification_only
+        ),
+        "fresh_verification_only_export": (
+            policy_report.get("fresh_verification_only_export")
+            if fresh_verification_only
+            else {
+                "status": "not_requested",
+                "policy": (
+                    "normal_collision_export_with_existing_fallback_v1"
+                    if allow_verification_fallback
+                    else "strict_normal_collision_export_v1"
+                ),
+                "explicit_opt_in_required": True,
+                "verification_fallback_allowed": bool(
+                    allow_verification_fallback
+                ),
+            }
+        ),
         "export_bundle_mtime_sync": bundle_mtime_sync,
         "exports": results,
         "native_receipt": (
             str(native_receipt) if native_receipt is not None else ""
         ),
     }
+
+
+def run_speedtree_cli_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+    allow_verification_fallback=True,
+):
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=export_fbx,
+        export_xml=export_xml,
+        timeout_seconds=timeout_seconds,
+        force_reexport=force_reexport,
+        allow_verification_fallback=allow_verification_fallback,
+        fresh_verification_only=False,
+    )
+
+
+def run_fresh_collision_prune_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+    allow_verification_fallback=True,
+):
+    """Run one forced fresh normal Collision/Prune FBX/XML transaction."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh Collision/Prune export requires force_reexport=True"
+        )
+    if export_fbx is not True or export_xml is not True:
+        raise RuntimeError(
+            "Fresh Collision/Prune export requires exact FBX and XML"
+        )
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=True,
+        export_xml=True,
+        timeout_seconds=timeout_seconds,
+        force_reexport=True,
+        allow_verification_fallback=False,
+        fresh_verification_only=False,
+    )
+
+
+def run_fresh_verification_only_export(
+    spm_path,
+    speedtree_exe_path="",
+    export_options_path="",
+    fbx_export_options_path="",
+    xml_export_options_path="",
+    output_root="",
+    name_stem="",
+    export_fbx=True,
+    export_xml=True,
+    timeout_seconds=900,
+    force_reexport=False,
+    allow_verification_fallback=True,
+):
+    """Run the explicit fresh, sole verification-only FBX/XML transaction."""
+
+    if force_reexport is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires force_reexport=True"
+        )
+    if export_fbx is not True or export_xml is not True:
+        raise RuntimeError(
+            "Fresh verification-only export requires exact FBX and XML"
+        )
+    return _run_speedtree_cli_export(
+        spm_path,
+        speedtree_exe_path=speedtree_exe_path,
+        export_options_path=export_options_path,
+        fbx_export_options_path=fbx_export_options_path,
+        xml_export_options_path=xml_export_options_path,
+        output_root=output_root,
+        name_stem=name_stem,
+        export_fbx=True,
+        export_xml=True,
+        timeout_seconds=timeout_seconds,
+        force_reexport=True,
+        allow_verification_fallback=allow_verification_fallback,
+        fresh_verification_only=True,
+    )
 
 
 def remove_phantom_image_nodes(objects):
@@ -5622,7 +5756,9 @@ def _numeric_material_equivalence(left, right, texture_contract):
 
 
 def _consolidate_blender_numeric_material_duplicates(
-    mesh_objects, texture_contract=None
+    mesh_objects,
+    texture_contract=None,
+    authoritative_material_names=(),
 ):
     """Remap proven ``Material``/``Material.001`` collisions to one datablock."""
     used_materials = []
@@ -5709,6 +5845,11 @@ def _consolidate_blender_numeric_material_duplicates(
         ):
             targets_by_base[base_name.casefold()].append(material)
 
+    authoritative_keys = {
+        str(name or "").strip().casefold()
+        for name in (authoritative_material_names or ())
+        if str(name or "").strip()
+    }
     material_targets = {}
     proofs = {}
     skipped_groups = []
@@ -5721,6 +5862,19 @@ def _consolidate_blender_numeric_material_duplicates(
             proof = _numeric_material_equivalence(
                 material, target, texture_contract
             )
+            if (
+                not proof
+                and base_name.casefold() in authoritative_keys
+                and target.name.casefold() == base_name.casefold()
+            ):
+                # Cluster Normalizer owns this exact public material identity.
+                # When the raw SpeedTree FBX is imported into the persisted
+                # normalized blend, Blender may rename the incoming material
+                # to ``.001`` solely because the authoritative card material
+                # already exists.  This exact role contract is sufficient to
+                # repair that creation-time collision without guessing from a
+                # nearby name or stripping arbitrary numeric suffixes.
+                proof = "authoritative_cluster_material_identity"
             if proof:
                 candidates.append((target, proof))
         if len(candidates) == 1:
@@ -5848,7 +6002,11 @@ def _consolidate_blender_numeric_material_duplicates(
     }
 
 
-def consolidate_speedtree_group_materials(objects, texture_contract=None):
+def consolidate_speedtree_group_materials(
+    objects,
+    texture_contract=None,
+    authoritative_material_names=(),
+):
     # Atlas Builder child collections become numeric-boundary material suffixes.
     # Collapse proven shared-source slots before merge/weight export; do not
     # touch object transforms, UVs, vertex groups, or weights.
@@ -5865,8 +6023,16 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
         isinstance(texture_contract, dict)
         and texture_contract.get("strict_speedtree_pipeline_contract")
     )
+    exact_material_names = list(authoritative_material_names or ())
+    authoritative_keys = {
+        str(name or "").strip().casefold()
+        for name in exact_material_names
+        if str(name or "").strip()
+    }
     numeric_result = _consolidate_blender_numeric_material_duplicates(
-        mesh_objects, texture_contract=texture_contract
+        mesh_objects,
+        texture_contract=texture_contract,
+        authoritative_material_names=exact_material_names,
     )
     # The validated contract is authoritative. Legacy manifest consolidation
     # must not mutate a strict scene before its binding signatures are checked.
@@ -5934,11 +6100,12 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             continue
 
         texture_signatures = sorted({material_texture_signature(material) for material in source_materials})
-        target_name = unified_material_name(base_name, source_materials)
+        source_target_name = unified_material_name(base_name, source_materials)
+        target_name = source_target_name
         if strict_contract:
             try:
                 target_intent = handoff_contract.resolve_material_intent(
-                    target_name,
+                    source_target_name,
                     texture_contract["speedtree_pipeline_contract"],
                 )
             except RuntimeError as exc:
@@ -5953,7 +6120,7 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
                     skipped_groups.append(
                         {
                             "mode": "production_group_suffix",
-                            "target_material": target_name,
+                            "target_material": source_target_name,
                             "source_materials": [
                                 material.name for material in source_materials
                             ],
@@ -5971,7 +6138,7 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             if target_intent is None or target_semantics != expected_semantics:
                 raise RuntimeError(
                     "SpeedTree production-group target intent conflicts with "
-                    f"its source variants: {target_name}"
+                    f"its source variants: {source_target_name}"
                 )
             target_proof = json.dumps(
                 {
@@ -5988,16 +6155,37 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             target_proof = ""
         readiness_mode = provenance_type
         if provenance_type == "material_intent":
-            target_material = next(
-                (
-                    candidate
-                    for candidate in source_materials
-                    if _speedtree_material_name_key(candidate.name)
-                    == _speedtree_material_name_key(target_name)
-                ),
-                None,
+            target_material = None
+            authoritative_target = (
+                target_name.casefold() in authoritative_keys
             )
-            if target_material is None:
+            if authoritative_target:
+                exact_targets = [
+                    candidate
+                    for candidate in bpy.data.materials
+                    if candidate.name.casefold() == target_name.casefold()
+                ]
+                if len(exact_targets) > 1:
+                    raise RuntimeError(
+                        "Authoritative Cluster material identity is ambiguous: "
+                        + target_name
+                    )
+                if exact_targets:
+                    target_material = exact_targets[0]
+                    readiness_mode = (
+                        "authoritative_cluster_material_identity"
+                    )
+            if not authoritative_target:
+                target_material = next(
+                    (
+                        candidate
+                        for candidate in source_materials
+                        if _speedtree_material_name_key(candidate.name)
+                        == _speedtree_material_name_key(target_name)
+                    ),
+                    None,
+                )
+            if target_material is None and not authoritative_target:
                 # The Assembly builder can normalize multiple exact provider
                 # contracts in one Blender scene. Reuse only a suffix-free
                 # material previously created from the same strict production
@@ -6041,6 +6229,8 @@ def consolidate_speedtree_group_materials(objects, texture_contract=None):
             target_material = source_materials[0].copy()
             target_material.name = target_name
             target_material["codex_speedtree_consolidated_from"] = [material.name for material in source_materials]
+            if target_name.casefold() in authoritative_keys:
+                readiness_mode = "authoritative_cluster_material_created"
         if strict_contract:
             target_material[
                 "codex_speedtree_consolidation_target_proof"
@@ -6286,13 +6476,15 @@ def _cleanup_face_reason(polygon, materials, texture_contract):
         # deletion authority.  Only an explicit, current STMAT-backed generic
         # placeholder below may be discarded.
         return ""
-    material = materials[slot_index]
+    return _cleanup_material_reason(materials[slot_index], texture_contract)
+
+
+def _cleanup_material_reason(material, texture_contract):
+    """Resolve the face cleanup reason once for one Blender material slot."""
+
     if material is None:
         return ""
-    placeholder_key = _cleanup_placeholder_material_key(
-        material,
-        texture_contract,
-    )
+    placeholder_key = _cleanup_placeholder_material_key(material, texture_contract)
     if placeholder_key == "default":
         return "canonical_unmanaged_default_material"
     if placeholder_key == "material":
@@ -6440,15 +6632,30 @@ def discard_unassigned_geometry_before_assembly(
                 for polygon in obj.data.polygons
             ]
         else:
-            invalid = [
-                (int(polygon.index), reason)
-                for polygon in obj.data.polygons
-                if (
-                    reason := _cleanup_face_reason(
-                        polygon, materials, texture_contract
+            # Cleanup authority depends only on the assigned material slot and
+            # the immutable runtime texture contract.  Willow-class FBX files
+            # can contain more than a million faces but only a handful of
+            # slots; resolving the same strict STMAT intent per face turned a
+            # read-only gate into the dominant import cost.  Preserve the
+            # exact face selection while resolving every slot only once, and
+            # skip polygon RNA entirely when no slot can authorize deletion.
+            slot_reasons = tuple(
+                _cleanup_material_reason(material, texture_contract)
+                for material in materials
+            )
+            invalid = (
+                [
+                    (int(polygon.index), slot_reasons[slot_index])
+                    for polygon in obj.data.polygons
+                    if (
+                        0 <= (slot_index := int(polygon.material_index))
+                        < len(slot_reasons)
+                        and slot_reasons[slot_index]
                     )
-                )
-            ]
+                ]
+                if any(slot_reasons)
+                else []
+            )
         if invalid:
             candidates.append((obj, materials, invalid))
 
@@ -6682,6 +6889,21 @@ def build_native_boneless_rigid_armature(
     }
 
 
+def ensure_minimum_absolute_branch_bones(spm_path):
+    """Gateway operation for preflight-wide persistent SPM normalization."""
+    return speedtree_cli.apply_minimum_absolute_branch_bone_policy(spm_path)
+
+
+def plan_relative_branch_bones_one(spm_path):
+    """Gateway operation for a read-only Relative=1 plan."""
+    return speedtree_cli.plan_relative_branch_bones_one(spm_path)
+
+
+def apply_relative_branch_bones_one(spm_path):
+    """Gateway operation that persists every Relative Branch setting as one."""
+    return speedtree_cli.apply_relative_branch_bones_one(spm_path)
+
+
 def restore_omitted_native_root_weights(imported, receipt):
     """Restore only the Root weights the native FBX serializer could not write.
 
@@ -6902,6 +7124,7 @@ def run_import_source_fbx(
     texture_contract=None,
     source_identity_path="",
     raw_import_observer=None,
+    authoritative_material_names=(),
 ):
     path = Path(source_fbx_path)
     if not source_fbx_path or not path.exists():
@@ -6970,7 +7193,9 @@ def run_import_source_fbx(
     applied_scales = apply_object_scales(imported)
     renamed_materials = strip_speedtree_material_suffixes(imported)
     material_consolidation = consolidate_speedtree_group_materials(
-        imported, texture_contract=texture_contract
+        imported,
+        texture_contract=texture_contract,
+        authoritative_material_names=authoritative_material_names,
     )
     material_intents = apply_speedtree_material_intents(
         imported, texture_contract=texture_contract
@@ -7739,6 +7964,12 @@ def build_dynamic_wind_data(
     )
     joints = []
     for bone in indexed:
+        if ground_cover and bone["bone_index"] == 0 and bone["parent_index"] == -1:
+            # Keep the authored root in the final SkeletonContract, but leave
+            # it out of DynamicWind joints. Ground-cover exports use this root
+            # only as a shared FBX wrapper; simulating it would merge every
+            # blade into one very long influence chain.
+            continue
         group = bone.get("group")
         if group is None:
             # Import roots and intentionally non-simulated bones remain in the
@@ -8514,9 +8745,17 @@ def validate_face_assigned_material_slots(mesh_obj):
         )
     materials = list(mesh_obj.data.materials)
     material_indices = mesh_polygon_material_indices(mesh_obj.data)
+    unique_slots, unique_counts = np.unique(
+        material_indices,
+        return_counts=True,
+    )
+    material_index_counts = {
+        int(slot_index): int(count)
+        for slot_index, count in zip(unique_slots, unique_counts)
+    }
     invalid_slot_values = {
         int(slot_index)
-        for slot_index in np.unique(material_indices)
+        for slot_index in unique_slots
         if (
             int(slot_index) < 0
             or int(slot_index) >= len(materials)
@@ -8541,13 +8780,31 @@ def validate_face_assigned_material_slots(mesh_obj):
         "status": "ok",
         "material_count": len(materials),
         "assigned_slot_indices": sorted(
-            int(value) for value in np.unique(material_indices)
+            material_index_counts
         ),
         "unused_empty_slot_indices": [
             index
             for index, material in enumerate(materials)
             if material is None
         ],
+        "material_index_evidence": {
+            "kind": "speedtree_blender_material_index_counts",
+            "schema_version": 1,
+            "object_name": str(mesh_obj.name),
+            "mesh_name": str(mesh_obj.data.name),
+            "polygon_count": len(mesh_obj.data.polygons),
+            "material_slots": [
+                str(material.name) if material is not None else None
+                for material in materials
+            ],
+            "material_index_counts": [
+                {
+                    "material_index": slot_index,
+                    "polygon_count": material_index_counts[slot_index],
+                }
+                for slot_index in sorted(material_index_counts)
+            ],
+        },
     }
 
 
@@ -8791,24 +9048,39 @@ def park_cluster_source_full_reference(
     }
 
 
-def _mesh_face_material_counts(obj):
+def _mesh_face_material_counts(obj, material_index_counts=None):
     materials = list(obj.data.materials)
     counts = Counter()
-    material_indices = mesh_polygon_material_indices(obj.data)
-    slot_counts = np.bincount(
-        material_indices,
-        minlength=len(materials),
-    )
-    for slot, count in enumerate(slot_counts):
+    if material_index_counts is None:
+        # Source meshes must still be scanned exactly: Blender permits a
+        # polygon material index that does not resolve to an existing slot,
+        # even on a zero/one-slot mesh.  Only the already validated merged
+        # histogram may bypass this read.
+        material_indices = mesh_polygon_material_indices(obj.data)
+        unique_slots, unique_counts = np.unique(
+            material_indices,
+            return_counts=True,
+        )
+        material_index_counts = {
+            int(slot): int(count)
+            for slot, count in zip(unique_slots, unique_counts)
+        }
+    for slot, count in sorted(material_index_counts.items()):
         if not count:
             continue
+        slot = int(slot)
         material = materials[slot] if 0 <= slot < len(materials) else None
         key = material.name if material is not None else f"<unassigned:{slot}>"
         counts[key] += int(count)
     return counts
 
 
-def validate_source_geometry_coverage(source_objects, merged_obj):
+def validate_source_geometry_coverage(
+    source_objects,
+    merged_obj,
+    *,
+    merged_material_index_counts=None,
+):
     """Prove that every cleaned source face survives the final SK merge.
 
     SpeedTree material-grouped FBX files may contain authored scan trunks,
@@ -8842,7 +9114,10 @@ def validate_source_geometry_coverage(source_objects, merged_obj):
             }
         )
 
-    actual_materials = _mesh_face_material_counts(merged_obj)
+    actual_materials = _mesh_face_material_counts(
+        merged_obj,
+        merged_material_index_counts,
+    )
     expected_faces = sum(row["faces"] for row in expected_objects)
     actual_faces = len(merged_obj.data.polygons)
     missing_material_faces = {
@@ -8944,8 +9219,18 @@ def run_merge_export(
             api.production_group_base_name(material.name)
         ) == "default"
     ]
+    merged_material_index_counts = {
+        int(row["material_index"]): int(row["polygon_count"])
+        for row in material_slot_validation[
+            "material_index_evidence"
+        ]["material_index_counts"]
+    }
     source_geometry_coverage = (
-        validate_source_geometry_coverage(expected_source_objects, merged_obj)
+        validate_source_geometry_coverage(
+            expected_source_objects,
+            merged_obj,
+            merged_material_index_counts=merged_material_index_counts,
+        )
         if expected_source_objects is not None
         else {"status": "not_requested"}
     )
@@ -9249,7 +9534,14 @@ def run_assembly_pipeline(
 
     if import_result is None:
         material_consolidation = consolidate_speedtree_group_materials(
-            source_import_meshes, texture_contract=texture_contract
+            source_import_meshes,
+            texture_contract=texture_contract,
+            authoritative_material_names=(
+                (settings or {}).get(
+                    "authoritative_cluster_material_names",
+                    (),
+                )
+            ),
         )
     else:
         material_consolidation = import_result.get(
@@ -9262,6 +9554,50 @@ def run_assembly_pipeline(
             "changed_object_count": material_consolidation.get("changed_object_count", 0),
             "changed_face_count": material_consolidation.get("changed_face_count", 0),
             "groups": material_consolidation.get("groups", []),
+        }
+    )
+
+    authoritative_names = list(
+        (settings or {}).get(
+            "authoritative_cluster_material_names",
+            (),
+        )
+    )
+    if authoritative_names:
+        scene_material_reconciliation = (
+            _consolidate_blender_numeric_material_duplicates(
+                [
+                    obj
+                    for obj in bpy.context.scene.objects
+                    if obj.type == "MESH" and obj.data
+                ],
+                texture_contract=texture_contract,
+                authoritative_material_names=authoritative_names,
+            )
+        )
+    else:
+        scene_material_reconciliation = {
+            "groups": [],
+            "skipped_groups": [],
+            "changed_object_count": 0,
+            "changed_face_count": 0,
+        }
+    reports["authoritative_cluster_material_reconciliation"] = (
+        scene_material_reconciliation
+    )
+    reports["steps"].append(
+        {
+            "name": "reconcile_authoritative_cluster_materials",
+            "status": (
+                "applied"
+                if scene_material_reconciliation.get("groups")
+                else "skipped"
+            ),
+            "groups": scene_material_reconciliation.get("groups", []),
+            "skipped_groups": scene_material_reconciliation.get(
+                "skipped_groups",
+                [],
+            ),
         }
     )
 
@@ -9540,6 +9876,10 @@ def run_import_and_assemble(settings, raw_import_observer=None):
         texture_contract=texture_contract,
         source_identity_path=settings.get("source_identity_path", ""),
         raw_import_observer=raw_import_observer,
+        authoritative_material_names=settings.get(
+            "authoritative_cluster_material_names",
+            (),
+        ),
     )
     import_duration = perf_counter() - import_started
     if authorized_dummy_cleanup_left_no_renderable_geometry(imported):
