@@ -866,6 +866,16 @@ def _speedtree_asset_root(source_fbx_path):
     return source.parent.parent if source.parent.name.lower() == "fbx" else source.parent
 
 
+def _asset_cluster_root(asset_root):
+    """Resolve the Cluster output folder for tree and Cluster-SPM layouts."""
+    root = Path(asset_root).expanduser().resolve()
+    return root if root.name.casefold() == "cluster" else root / "cluster"
+
+
+def _speedtree_cluster_root(source_fbx_path):
+    return _asset_cluster_root(_speedtree_asset_root(source_fbx_path))
+
+
 def _atlas_manifest_asset_root(manifest_path, manifest=None):
     manifest_path = Path(manifest_path).resolve()
     explicit = str((manifest or {}).get("asset_root") or "").strip()
@@ -1080,7 +1090,7 @@ def _speedtree_preserved_cluster_sources(
             return None
         source_maps[role] = raw_path
 
-    cluster_root = _speedtree_asset_root(source_fbx_path) / "cluster"
+    cluster_root = _speedtree_cluster_root(source_fbx_path)
     resolved = {}
     for map_name, value in source_maps.items():
         try:
@@ -2045,7 +2055,7 @@ def _validate_atlas_cluster_origin_receipt(
         diagnostics.append(
             "origin_receipt.physical_capture_contract_sha256=missing"
         )
-    cluster_root = Path(asset_root) / "cluster"
+    cluster_root = _asset_cluster_root(asset_root)
     for role, path in source_paths.items():
         if not _path_is_under(path, cluster_root):
             diagnostics.append(
@@ -2141,7 +2151,7 @@ def _validate_atlas_cluster_entry(
         diagnostics.append("files=missing")
         raw_files = {}
     asset_root = _atlas_manifest_asset_root(manifest_path, contract)
-    cluster_root = asset_root / "cluster"
+    cluster_root = _asset_cluster_root(asset_root)
     normalized = {}
     for raw_role, raw_path in sorted(raw_files.items()):
         role = _texture_semantic_role(raw_role)
@@ -4380,9 +4390,7 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                 cluster_manifest_binding.get("source_paths") or {}
             )
             preserved_cluster = {
-                "cluster_root": str(
-                    _speedtree_asset_root(source_fbx) / "cluster"
-                ),
+                "cluster_root": str(_speedtree_cluster_root(source_fbx)),
                 "source_maps": preserved_files,
                 "preserved_files": preserved_files,
                 "origin_kind": ATLAS_BLENDER_CLUSTER_BAKE_STATUS,
