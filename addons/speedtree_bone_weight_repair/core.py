@@ -937,8 +937,13 @@ def _speedtree_stmat_materials(source_fbx_path):
             continue
         source_paths = []
         source_maps = {}
+        file_maps = {}
         source_slots = []
         for map_index, map_node in enumerate(node.findall("./Map")):
+            map_name = str(map_node.attrib.get("Name") or "").strip()
+            exported = str(map_node.attrib.get("File") or "").strip()
+            if map_name and exported:
+                file_maps[map_name.casefold()] = str(stmat_path.parent / exported)
             source = str(map_node.attrib.get("Source") or "").strip()
             if source:
                 source_paths.append(source)
@@ -972,6 +977,7 @@ def _speedtree_stmat_materials(source_fbx_path):
             ),
             "source_paths": source_paths,
             "source_maps": source_maps,
+            "file_maps": file_maps,
             "source_slots": source_slots,
             "user_data": user_data,
         }
@@ -1691,7 +1697,7 @@ def _speedtree_preserved_declared_sources(
     materials = stmat_data.get("materials", {})
     material_key = _speedtree_material_name_key(material.name)
     if material_key not in materials:
-        return None
+        return _speedtree_connected_declared_sources(material, stmat_data)
     stmat_material = materials[material_key]
     source_paths = stmat_material.get("source_paths") or []
     if not source_paths:
@@ -1715,6 +1721,70 @@ def _speedtree_preserved_declared_sources(
             return None
         resolved.append(str(path))
     return {"declared_sources": sorted(set(resolved), key=str.casefold)}
+
+
+def _speedtree_connected_declared_sources(material, stmat_data):
+    """Resolve consolidated names by a unique, connected STMAT Color path."""
+    if not material.node_tree:
+        return None
+    colors = []
+    for node in material.node_tree.nodes:
+        if node.type != "BSDF_PRINCIPLED":
+            continue
+        for link in node.inputs["Base Color"].links:
+            image = getattr(link.from_node, "image", None)
+            if image and image.filepath:
+                path = Path(bpy.path.abspath(image.filepath, library=image.library))
+                if path.is_file():
+                    colors.append(_path_identity(path))
+    if len(set(colors)) != 1:
+        return None
+    matches = []
+    for row in stmat_data.get("materials", {}).values():
+        for domain in ("file_maps", "source_maps"):
+            maps = row.get(domain) or {}
+            color = maps.get("color")
+            if color and _path_identity(color) == colors[0]:
+                matches.append((row["name"], domain, color))
+    if len({row[0] for row in matches}) != 1:
+        return None
+    name, domain, color = matches[0]
+    return {"source_material": name, "domain": domain, "declared_sources": [str(color)]}
+
+
+def _bind_preserved_cluster_surface(material, source_maps):
+    """Fill absent surface bindings from proven sources without rebuilding the graph."""
+    material.use_nodes = True
+    bsdfs = [node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"]
+    if len(bsdfs) != 1:
+        return []
+    bsdf = bsdfs[0]
+    changed = []
+    for role, socket_name in (("color", "Base Color"), ("normal", "Normal")):
+        value = source_maps.get(role)
+        if not value:
+            continue
+        target = bsdf.inputs[socket_name]
+        normal_map = None
+        if target.is_linked:
+            upstream = target.links[0].from_node
+            if role != "normal" or upstream.type != "NORMAL_MAP":
+                continue
+            normal_map = upstream
+            target = normal_map.inputs["Color"]
+            if target.is_linked:
+                continue
+        path = Path(value)
+        image = _load_speedtree_image(path, role, require_decodable=True)
+        if role == "normal" and normal_map is None:
+            normal_map = material.node_tree.nodes.new("ShaderNodeNormalMap")
+            material.node_tree.links.new(normal_map.outputs["Normal"], target)
+            target = normal_map.inputs["Color"]
+        texture = material.node_tree.nodes.new("ShaderNodeTexImage")
+        texture.image = image
+        material.node_tree.links.new(texture.outputs["Color"], target)
+        changed.append(role)
+    return changed
 
 
 def _speedtree_manifest_paths(source_fbx_path, stmat_material=None):
@@ -3722,6 +3792,15 @@ def preflight_speedtree_material_texture_contracts(
             effective.update(manifest_binding)
         if effective is None and len(existing) == 1:
             effective = dict(existing[0])
+        if effective is None and not manifest_binding_rejected and not existing:
+            connected = _speedtree_connected_declared_sources(material, stmat_cache[source_key])
+            if connected:
+                effective = {
+                    "material": material.name,
+                    "status": "ok",
+                    "texture_source_mode": "preserve_declared_sources",
+                    "declared_source_receipt": connected,
+                }
         if (
             effective is None
             and runtime_tolerant
@@ -4379,6 +4458,7 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
             preserved_files = dict(
                 cluster_manifest_binding.get("source_paths") or {}
             )
+            restored_roles = _bind_preserved_cluster_surface(material, preserved_files)
             preserved_cluster = {
                 "cluster_root": str(
                     _speedtree_asset_root(source_fbx) / "cluster"
@@ -4404,7 +4484,8 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
                     ),
                     "match_source": "atlas_import_manifest",
                     "status": "preserved_cluster",
-                    "changed": False,
+                    "changed": bool(restored_roles),
+                    "restored_roles": restored_roles,
                     **preserved_cluster,
                 }
             )
@@ -4546,7 +4627,8 @@ def normalize_speedtree_material_textures(objects, texture_contract=None):
             )
             continue
         preserve_declared = (
-            strict_contract and source_mode == "preserve_declared_sources"
+            source_mode == "preserve_declared_sources"
+            and (strict_contract or bool((contract_binding or {}).get("declared_source_receipt")))
         )
         if preserve_declared:
             preserved_cluster = None
