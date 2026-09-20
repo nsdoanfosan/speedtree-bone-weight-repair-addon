@@ -18,6 +18,24 @@ boundary. Blender does not synthesize or replace skeletal data.
 
 ## Active pipeline
 
+An explicit `<SPM stem>.rigid_generators.json` sidecar can preserve intentional
+zero-bone generators. It contains `schema_version: 1`, the exact `spm_name`, and
+unique `generator_guids`. Both bone-normalization policies validate these
+generators and preserve their zero values. The native exporter binds their
+vertices to the existing top-level deform bone, and the wind writer excludes
+`Bone_1_Start` from simulation while preserving the full skeleton contract.
+Exports without this sidecar retain their previous behavior.
+
+For Perforce-managed SPM changes, set `SPEEDTREE_PERFORCE_RECOVERY=1` and
+`SPEEDTREE_PERFORCE_CLIENT=ArtSources` (or the actual explicitly selected client).
+The bundled verifier checks the exact source mapping and compares server bytes
+with the saved SPM before either bone-normalization policy writes it. The default
+recovery is the submitted have revision; `SPEEDTREE_PERFORCE_SHELF=<number>` can
+select an already uploaded shelf. Missing or different server bytes stop the
+operation. It never creates a shelf, submits, moves changelists, or restores files.
+The receipt stores a `p4://` reference which is revalidated before cached reuse.
+Do not use the legacy local-backup mode for this workspace's managed sources.
+
 The one-button path is `SpeedTree -> Import -> Assemble`:
 
 1. Export FBX, Raw XML, and the native runtime receipt through the configured

@@ -16,6 +16,7 @@ import numpy as np
 from mathutils import Vector, kdtree
 
 from . import handoff_contract, speedtree_cli
+from .wind_structural_roles import apply_scan_trunk_roles
 from .preview_texture_contract import (
     PREVIEW_ONLY_USAGE,
     PREVIEW_RECEIPT_VERSION,
@@ -8055,12 +8056,15 @@ def build_dynamic_wind_data(
     flexibility=1.0,
     import_root_name=None,
     wind_preset="TREE",
+    rigid_bone_names=(),
 ):
     indexed, skeleton_contract = build_final_skeleton_wind_contract(
         bone_records, import_root_name
     )
     joints = []
     for bone in indexed:
+        if bone['name'] in rigid_bone_names:
+            continue
         if ground_cover and bone["bone_index"] == 0 and bone["parent_index"] == -1:
             # Keep the authored root in the final SkeletonContract, but leave
             # it out of DynamicWind joints. Ground-cover exports use this root
@@ -8213,6 +8217,10 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             flexibility=settings.get("dynamic_wind_flexibility", 1.0),
             import_root_name=armature.name,
             wind_preset=settings.get("wind_preset", "TREE"),
+            rigid_bone_names=("Bone_1_Start",) if (
+                settings.get("spm_path") and
+                Path(settings["spm_path"]).with_suffix(".rigid_generators.json").is_file()
+            ) else (),
         )
         write_report(dynamic_wind_path, dynamic_wind)
         result["dynamic_wind_path"] = dynamic_wind_path
@@ -8604,6 +8612,9 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
             "max_error": coordinate_errors[-1] if coordinate_errors else None,
         },
     }
+    source_spm = str(armature.get("codex_source_identity") or "")
+    if source_spm and Path(source_spm).suffix.lower() == ".spm":
+        return apply_scan_trunk_roles(bone_records, info, source_spm)
     return bone_records, info
 
 
