@@ -25,11 +25,18 @@ def _p4(client, *args):
 
 
 def _records(data):
+    def decode(value):
+        if not isinstance(value, bytes):
+            return value
+        try:
+            return value.decode('utf-8')
+        except UnicodeDecodeError:
+            return value.decode('cp949')
+
     stream, rows = io.BytesIO(data), []
     while stream.tell() < len(data):
         raw = marshal.load(stream)
-        row = {k.decode('utf-8') if isinstance(k, bytes) else k:
-               v.decode('utf-8') if isinstance(v, bytes) else v for k, v in raw.items()}
+        row = {decode(k): decode(v) for k, v in raw.items()}
         if row.get('code') == 'error':
             raise RuntimeError('Perforce recovery check failed: ' + row.get('data', ''))
         if row.get('code') == 'stat':

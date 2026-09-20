@@ -83,4 +83,11 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'positive changelist'):
                 recovery.verified_recovery(self.path)
 
+    def test_korean_server_paths_are_decoded_without_loss(self):
+        path = self.path.parent / '식생.spm'
+        payload = marshal.dumps({b'code': b'stat', b'depotFile': '//depot/식생.spm'.encode('cp949'),
+                                 b'path': str(path).encode('cp949')})
+        with patch.object(recovery, '_p4', return_value=payload):
+            self.assertEqual(recovery._mapping(path, 'ArtSources'), '//depot/식생.spm')
+
 if __name__ == '__main__': unittest.main()
