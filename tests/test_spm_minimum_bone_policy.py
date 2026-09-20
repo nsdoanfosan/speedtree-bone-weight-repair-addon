@@ -1,4 +1,5 @@
 import gzip
+import json
 import hashlib
 import importlib.util
 import tempfile
@@ -119,6 +120,25 @@ def _generator_values(raw):
 
 
 class MinimumAbsoluteBranchBonePolicyTests(unittest.TestCase):
+    def test_explicit_rigid_intent_survives_both_policies(self):
+        with tempfile.TemporaryDirectory() as td:
+            spm = Path(td) / 'SK_tree_test.spm'
+            spm.write_text(_document(), encoding='utf-8')
+            sidecar = spm.with_suffix('.rigid_generators.json')
+            sidecar.write_text(json.dumps({'schema_version': 1, 'spm_name': spm.name,
+                'generator_guids': ['visible_zero-guid']}), encoding='utf-8')
+            speedtree_cli.ensure_minimum_absolute_branch_bones(spm)
+            speedtree_cli.apply_relative_branch_bones_one(spm)
+            values = _generator_values(spm.read_bytes())
+            self.assertEqual(values['visible_zero']['Physics:Bones'], '0')
+            self.assertEqual(values['base_ref_zero']['Physics:Bones'], '1')
+            sidecar.write_text(json.dumps({'schema_version': 1, 'spm_name': spm.name,
+                'generator_guids': ['missing-guid']}), encoding='utf-8')
+            before = spm.read_bytes()
+            with self.assertRaises(RuntimeError):
+                speedtree_cli.ensure_minimum_absolute_branch_bones(spm)
+            self.assertEqual(before, spm.read_bytes())
+
     def test_plain_and_gzip_spm_repair_only_live_visible_zero_bone_branches(self):
         for compressed in (False, True):
             with self.subTest(compressed=compressed), tempfile.TemporaryDirectory() as td:

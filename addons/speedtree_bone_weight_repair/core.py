@@ -16,6 +16,7 @@ import numpy as np
 from mathutils import Vector, kdtree
 
 from . import handoff_contract, speedtree_cli
+from .wind_structural_roles import apply_scan_trunk_roles
 from .preview_texture_contract import (
     PREVIEW_ONLY_USAGE,
     PREVIEW_RECEIPT_VERSION,
@@ -3977,6 +3978,10 @@ def preflight_speedtree_material_texture_contracts(
                 )
                 material_diagnostics.append(diagnostic)
             else:
+                # A freshly verified capture is resolved even when the raw
+                # STMAT resolver classified it as an unmanaged texture set.
+                effective["status"] = "ok"
+                effective["texture_source_mode"] = "preserve_declared_sources"
                 effective["origin_receipt"] = dict(
                     cluster_proof["origin_receipt"]
                 )
@@ -4023,6 +4028,17 @@ def preflight_speedtree_material_texture_contracts(
                 severity="info",
             )
             material_diagnostics.append(diagnostic)
+        if (
+            cluster_proof is not None
+            and effective is not None
+            and effective.get("status") == "ok"
+            and effective.get("texture_contract_status")
+            == ATLAS_BLENDER_CLUSTER_BAKE_STATUS
+        ):
+            # The exact STMAT/map/path/hash proof supersedes the unresolved
+            # input disposition. Keeping leave_unassigned here discards a
+            # successfully validated bake during normalization.
+            effective["binding_disposition"] = "bind_available"
         if (
             effective is not None
             and effective.get("texture_source_mode")
@@ -8040,12 +8056,15 @@ def build_dynamic_wind_data(
     flexibility=1.0,
     import_root_name=None,
     wind_preset="TREE",
+    rigid_bone_names=(),
 ):
     indexed, skeleton_contract = build_final_skeleton_wind_contract(
         bone_records, import_root_name
     )
     joints = []
     for bone in indexed:
+        if bone['name'] in rigid_bone_names:
+            continue
         if ground_cover and bone["bone_index"] == 0 and bone["parent_index"] == -1:
             # Keep the authored root in the final SkeletonContract, but leave
             # it out of DynamicWind joints. Ground-cover exports use this root
@@ -8182,7 +8201,6 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
         },
         "export_report": export_report or {},
     }
-    write_report(json_path, data)
     result = {"path": json_path, "data": data, "warnings": warnings, "grouping_health": grouping_health}
 
     # Also emit the lean, Unreal-ready dynamic wind JSON (the import form). Needs
@@ -8198,7 +8216,18 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             flexibility=settings.get("dynamic_wind_flexibility", 1.0),
             import_root_name=armature.name,
             wind_preset=settings.get("wind_preset", "TREE"),
+            rigid_bone_names=("Bone_1_Start",) if (
+                settings.get("spm_path") and
+                Path(settings["spm_path"]).with_suffix(".rigid_generators.json").is_file()
+            ) else (),
         )
+        # Structural response is independent of immutable category/group inputs.
+        # Evaluate every current export; never select by asset or species name.
+        from .wind_structure_contract import attach_from_export
+        dynamic_wind, structure_report = attach_from_export(
+            settings, paths, data, dynamic_wind, armature=armature
+        )
+        data["wind_structure_modifier"] = structure_report
         write_report(dynamic_wind_path, dynamic_wind)
         result["dynamic_wind_path"] = dynamic_wind_path
         result["dynamic_wind"] = {
@@ -8206,6 +8235,7 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             "simulation_group_count": len(dynamic_wind["SimulationGroups"]),
             "skeleton_contract": dynamic_wind["SkeletonContract"],
         }
+    write_report(json_path, data)
     return result
 
 
@@ -8589,6 +8619,9 @@ def build_xml_bone_metadata(xml_path, armature, trunk_generator_regex="trunk"):
             "max_error": coordinate_errors[-1] if coordinate_errors else None,
         },
     }
+    source_spm = str(armature.get("codex_source_identity") or "")
+    if source_spm and Path(source_spm).suffix.lower() == ".spm":
+        return apply_scan_trunk_roles(bone_records, info, source_spm)
     return bone_records, info
 
 

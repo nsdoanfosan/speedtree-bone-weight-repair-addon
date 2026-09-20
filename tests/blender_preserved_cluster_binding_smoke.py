@@ -2,6 +2,7 @@
 import json,sys,tempfile
 from pathlib import Path
 import bpy
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'addons'))
 from speedtree_bone_weight_repair import core
 
@@ -28,6 +29,23 @@ with tempfile.TemporaryDirectory() as directory:
  second=core.normalize_speedtree_material_textures([obj],contract)
  assert second['changed_count']==0,second
  assert links==[(l.from_node.name,l.from_socket.name,l.to_node.name,l.to_socket.name) for l in m.node_tree.links]
+ # The STMAT resolver calls physical captures unmanaged; exact proof must
+ # promote that input to a usable binding rather than keep leave_unassigned.
+ unresolved=dict(binding,status='not_managed',binding_disposition='leave_unassigned')
+ proof={'source_maps':binding['source_paths'],'origin_receipt':binding['origin_receipt']}
+ with patch.object(core,'_speedtree_manifest_texture_binding',return_value=None), patch.object(core,'_speedtree_preserved_cluster_sources',return_value=proof):
+  preflight=core.preflight_speedtree_material_texture_contracts([obj],{'bindings':[unresolved]})
+ resolved=preflight['texture_contract']['bindings'][0]
+ assert resolved['status']=='ok',resolved
+ assert resolved['texture_source_mode']=='preserve_declared_sources',resolved
+ assert resolved['binding_disposition']=='bind_available',resolved
+ core.normalize_speedtree_material_textures([obj],preflight['texture_contract'])
+ assert bsdf.inputs['Base Color'].is_linked
+ # Invalid proof still fails in strict publication mode.
+ with patch.object(core,'_speedtree_manifest_texture_binding',return_value=None), patch.object(core,'_speedtree_preserved_cluster_sources',return_value=None):
+  try:core.preflight_speedtree_material_texture_contracts([obj],{'bindings':[unresolved],'strict_speedtree_pipeline_contract':True})
+  except RuntimeError:pass
+  else:raise AssertionError('Invalid capture proof was accepted')
  # A renamed/consolidated material can retain exact exported STMAT image identity.
  export=root/'renamed_export.png';write_image(export)
  stmat=root/'probe.stmat'

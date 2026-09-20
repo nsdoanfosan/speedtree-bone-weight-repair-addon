@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import tempfile
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -245,6 +246,41 @@ with tempfile.TemporaryDirectory(
         expected_binding={"origin_receipt": legacy_receipt},
     )
     assert legacy_proof is not None, legacy_proof
+    mesh = bpy.data.meshes.new("DispositionRegression")
+    obj = bpy.data.objects.new("DispositionRegression", mesh)
+    mesh.materials.append(owner)
+    owner["codex_source_fbx"] = str(source_fbx)
+    unresolved_contract = {
+        "strict_speedtree_pipeline_contract": True,
+        core.handoff_contract.TEXTURE_CONTRACT_MODE_FIELD:
+            core.handoff_contract.RUNTIME_TOLERANT_TEXTURE_MODE,
+        "bindings": [{
+            "material": owner.name,
+            "status": "not_managed",
+            "texture_source_mode": "preserve_declared_sources",
+            "binding_disposition": "leave_unassigned",
+        }],
+    }
+    # Exercise STMAT/path/hash validation, not a mocked successful receipt.
+    with patch.object(core, "_speedtree_manifest_texture_binding", return_value=None):
+        normalized = core.preflight_speedtree_material_texture_contracts(
+            [obj], unresolved_contract
+        )["texture_contract"]
+        binding = normalized["bindings"][0]
+        assert binding["binding_disposition"] == "bind_available", binding
+        assert binding["origin_receipt"]["slot_files"], binding
+        with patch.object(core, "_bind_preserved_cluster_surface", return_value=["color"]) as bind:
+            result = core.normalize_speedtree_material_textures([obj], normalized)
+            bind.assert_called_once()
+            assert result["materials"][0]["status"] == "preserved_cluster", result
+        color_path = Path(source_files["albedo"])
+        original_color = color_path.read_bytes()
+        color_path.write_bytes(b"tampered")
+        rejected = core.preflight_speedtree_material_texture_contracts(
+            [obj], normalized
+        )["texture_contract"]["bindings"][0]
+        assert rejected["binding_disposition"] == "leave_unassigned", rejected
+        color_path.write_bytes(original_color)
     assert (
         legacy_proof["origin_receipt"]["slot_index_space"]
         == core.STMAT_MAP_INDEX_SPACE

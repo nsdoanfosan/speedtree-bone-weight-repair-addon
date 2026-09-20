@@ -170,6 +170,29 @@ def _is_cluster_source_spm(spm):
     )
 
 
+def _authored_rigid_generator_guids(spm, generators):
+    """Honor explicit per-source rigid intent without guessing from names."""
+    path = Path(spm).with_suffix('.rigid_generators.json')
+    if not path.exists():
+        return set()
+    data = json.loads(path.read_text(encoding='utf-8'))
+    guids = data.get('generator_guids')
+    if (data.get('schema_version') != 1 or data.get('spm_name') != Path(spm).name
+            or not isinstance(guids, list) or not guids
+            or any(not isinstance(guid, str) or not guid for guid in guids)
+            or len(set(guids)) != len(guids)):
+        raise RuntimeError('Invalid authored rigid generator contract: ' + str(path))
+    by_guid = {g.findtext('GUID'): g for g in generators.findall('Generator')}
+    for guid in guids:
+        generator = by_guid.get(guid)
+        if generator is None or generator.get('Type', '').casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
+            raise RuntimeError('Rigid generator missing or not a branch: ' + guid)
+        value = _spm_property_value_element(generator, 'Physics:Bones')
+        if value is None or float(value.text) != 0.0:
+            raise RuntimeError('Authored rigid generator must retain zero bones: ' + guid)
+    return set(guids)
+
+
 def ensure_minimum_absolute_branch_bones(spm):
     """Persist the non-Cluster Branch/Spline-Branch minimum-bone policy.
 
@@ -342,12 +365,15 @@ def ensure_minimum_absolute_branch_bones(spm):
             runtime_branch_node_count_by_generator.get(generator_guid, 0) + 1
         )
 
+    rigid_guids = _authored_rigid_generator_guids(spm, generators)
     changed_generators = []
     for generator in generators.findall("Generator"):
         generator_type = str(generator.attrib.get("Type") or "").strip()
         if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
             continue
         generator_guid = str(generator.findtext("GUID") or "").strip()
+        if generator_guid in rigid_guids:
+            continue
         runtime_branch_node_count = (
             runtime_branch_node_count_by_generator.get(generator_guid, 0)
         )
@@ -438,11 +464,15 @@ def ensure_minimum_absolute_branch_bones(spm):
         / "_spm_backups"
         / f"minimum_absolute_branch_bones_{timestamp}_{original_sha256[:8]}"
     )
-    backup_root.mkdir(parents=True, exist_ok=False)
-    backup = backup_root / spm.name
-    backup.write_bytes(original)
-    if hashlib.sha256(backup.read_bytes()).hexdigest() != original_sha256:
-        raise RuntimeError("Minimum-bone SPM backup hash verification failed")
+    if os.environ.get("SPEEDTREE_PERFORCE_RECOVERY"):
+        from .perforce_recovery import verified_recovery
+        backup = verified_recovery(spm)
+    else:
+        backup_root.mkdir(parents=True, exist_ok=False)
+        backup = backup_root / spm.name
+        backup.write_bytes(original)
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != original_sha256:
+            raise RuntimeError("Minimum-bone SPM backup hash verification failed")
 
     if spm.read_bytes() != original:
         raise RuntimeError(
@@ -512,7 +542,10 @@ def _relative_branch_bones_one_candidate(spm):
 
     changed_generators = []
     relative_generator_count = 0
+    rigid_guids = _authored_rigid_generator_guids(spm, generators)
     for generator in generators.findall("Generator"):
+        if generator.findtext('GUID') in rigid_guids:
+            continue
         generator_type = str(generator.attrib.get("Type") or "").strip()
         if generator_type.casefold() not in _SPM_MINIMUM_BONE_GENERATOR_TYPES:
             continue
@@ -630,11 +663,15 @@ def apply_relative_branch_bones_one(spm):
             / "_spm_backups"
             / f"relative_branch_bones_one_{timestamp}_{source_sha256[:8]}"
         )
-        backup_root.mkdir(parents=True, exist_ok=False)
-        backup = backup_root / spm.name
-        backup.write_bytes(original)
-        if hashlib.sha256(backup.read_bytes()).hexdigest() != source_sha256:
-            raise RuntimeError("Relative-one SPM backup hash verification failed")
+        if os.environ.get("SPEEDTREE_PERFORCE_RECOVERY"):
+            from .perforce_recovery import verified_recovery
+            backup = verified_recovery(spm)
+        else:
+            backup_root.mkdir(parents=True, exist_ok=False)
+            backup = backup_root / spm.name
+            backup.write_bytes(original)
+            if hashlib.sha256(backup.read_bytes()).hexdigest() != source_sha256:
+                raise RuntimeError("Relative-one SPM backup hash verification failed")
         if spm.read_bytes() != original:
             raise RuntimeError(
                 "SpeedTree SPM changed while Relative-one policy was computed: "
@@ -823,6 +860,9 @@ def _input_fingerprint(exe, spm, options, kind, target):
         "speedtree_exe": _file_identity(exe, include_hash=False),
         "speedtree_hook": _file_identity(hook),
     }
+    rigid_contract = Path(spm).with_suffix('.rigid_generators.json')
+    if rigid_contract.is_file():
+        payload['authored_rigid_generators'] = _file_identity(rigid_contract)
     encoded = json.dumps(
         payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
@@ -1586,9 +1626,21 @@ def _terminate_process_tree(process):
 
 
 def _run_process(command, cwd, timeout_seconds):
+    environment = os.environ.copy()
+    environment.pop('SPEEDTREE_AUTHORED_RIGID_GENERATORS', None)
+    for argument in command:
+        source = Path(str(argument))
+        if source.suffix.casefold() == '.spm' and source.is_file() and source.with_suffix('.rigid_generators.json').is_file():
+            raw = source.read_bytes()
+            xml = gzip.decompress(raw) if raw.startswith(b'\x1f\x8b') else raw
+            generators = ET.fromstring(xml).find('Generators')
+            guids = _authored_rigid_generator_guids(source, generators)
+            environment['SPEEDTREE_AUTHORED_RIGID_GENERATORS'] = ';'.join(sorted(guids))
+            environment['SPEEDTREE_COLLISION_PERSISTENT'] = '0'
     popen_kwargs = {
         "cwd": str(cwd),
         "stdin": subprocess.DEVNULL,
+        "env": environment,
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(
@@ -2186,18 +2238,21 @@ def _validated_minimum_bone_policy_receipt(spm, receipt):
         )
 
     if status == "updated":
-        backup = Path(str(receipt.get("backup") or "")).resolve()
+        backup_reference = str(receipt.get("backup") or "")
         source_digest = str(receipt.get("source_sha256") or "").lower()
-        if not backup.is_file() or not re.fullmatch(
-            r"[0-9a-f]{64}", source_digest
-        ):
-            raise RuntimeError(
-                "Updated minimum branch-bone policy receipt has no verified backup"
-            )
-        if _sha256_file(backup).lower() != source_digest:
-            raise RuntimeError(
-                "Minimum branch-bone policy backup digest does not match receipt"
-            )
+        if backup_reference.startswith("p4://"):
+            from .perforce_recovery import verify_reference
+            verify_reference(spm, backup_reference, source_digest)
+        else:
+            backup = Path(backup_reference).resolve()
+            if not backup.is_file() or not re.fullmatch(r"[0-9a-f]{64}", source_digest):
+                raise RuntimeError(
+                    "Updated minimum branch-bone policy receipt has no verified backup"
+                )
+            if _sha256_file(backup).lower() != source_digest:
+                raise RuntimeError(
+                    "Minimum branch-bone policy backup digest does not match receipt"
+                )
 
     validated = dict(receipt)
     validated["sealed_source_identity"] = current
