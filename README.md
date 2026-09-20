@@ -51,6 +51,23 @@ The one-button path is `SpeedTree -> Import -> Assemble`:
 Cluster sources may use the dedicated Export-collection parking contract for
 Cluster Normalizer ownership. That path changes export ownership only.
 
+## Structural wind modifier export
+
+The final-export writer computes `evaluated_structure_art_v4` from the current
+SPM generator graph, evaluated native FBX/XML support data and final FBX bind
+positions. It writes an independent `WindStructureModifierContract` sibling to
+the normal Wind JSON and a detailed audit in the rich JSON. It preserves the
+base simulation groups, Influence and GustAttenuation; root and excluded joints
+remain neutral. Regenerating the contract replaces it rather than multiplying
+previous gains. There are no asset-name correction tables.
+
+The recipe is a bounded artistic approximation of bend amplitude, not measured
+material dynamics. `BendRateScale`, `TorsionGain` and `FlutterGain` stay at 1;
+leaf-aspect timing and physical damping are not implemented. Source or skeleton
+errors must be checked in `SourceValidationStatus` and the rich audit.
+SpeedTree Batch checks the installed recipe before selecting cached exports or
+publishing a new handoff. Old Wind JSON requires Repair/export.
+
 ## Blender location
 
 - Module: `speedtree_bone_weight_repair`

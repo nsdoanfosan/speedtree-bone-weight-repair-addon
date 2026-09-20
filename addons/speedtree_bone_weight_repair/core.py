@@ -8201,7 +8201,6 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
         },
         "export_report": export_report or {},
     }
-    write_report(json_path, data)
     result = {"path": json_path, "data": data, "warnings": warnings, "grouping_health": grouping_health}
 
     # Also emit the lean, Unreal-ready dynamic wind JSON (the import form). Needs
@@ -8222,6 +8221,13 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
                 Path(settings["spm_path"]).with_suffix(".rigid_generators.json").is_file()
             ) else (),
         )
+        # Structural response is independent of immutable category/group inputs.
+        # Evaluate every current export; never select by asset or species name.
+        from .wind_structure_contract import attach_from_export
+        dynamic_wind, structure_report = attach_from_export(
+            settings, paths, data, dynamic_wind, armature=armature
+        )
+        data["wind_structure_modifier"] = structure_report
         write_report(dynamic_wind_path, dynamic_wind)
         result["dynamic_wind_path"] = dynamic_wind_path
         result["dynamic_wind"] = {
@@ -8229,6 +8235,7 @@ def write_unreal_json_from_scene(settings, paths, export_report=None):
             "simulation_group_count": len(dynamic_wind["SimulationGroups"]),
             "skeleton_contract": dynamic_wind["SkeletonContract"],
         }
+    write_report(json_path, data)
     return result
 
 
