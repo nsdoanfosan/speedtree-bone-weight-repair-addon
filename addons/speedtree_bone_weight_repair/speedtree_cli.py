@@ -1185,6 +1185,15 @@ def _native_receipt_is_valid(path, spm):
             source_stat.st_mtime_ns // 100 + 116444736000000000
         )
         geometries = list(payload.get("geometries") or [])
+        # A tagged BaseRef source pointer used to survive as pointer-1. The
+        # serializer then silently attached its vertices to global Root. ID 0
+        # is legitimate for a decoded root node, but not an undecoded object.
+        unresolved_root_owner = any(
+            int(row.get("source_bone_id", -1)) == 0
+            and int(row.get("native_source_object_id") or 0) != 0
+            and not str(row.get("source_rtti") or "").strip()
+            for row in payload.get("generated_instances") or []
+        )
         return bool(
             payload.get("kind") == "speedtree_native_export_receipt"
             and payload.get("status") == "ready"
@@ -1199,8 +1208,9 @@ def _native_receipt_is_valid(path, spm):
                 else -1
             ) == len(geometries)
             and all(int(row.get("vertex_count") or 0) >= 0 for row in geometries)
+            and not unresolved_root_owner
         )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
