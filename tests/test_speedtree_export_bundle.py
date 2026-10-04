@@ -808,6 +808,33 @@ class SpeedTreeExportBundleTests(unittest.TestCase):
                 second_inputs["speedtree_hook"]["sha256"],
             )
 
+    def test_receipt_rejects_undecoded_root_but_accepts_real_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            spm = root / "tree.spm"
+            spm.write_bytes(b"spm")
+            receipt = root / "tree.speedtree_native_receipt.json"
+            payload = {
+                "schema_version": 5, "kind": "speedtree_native_export_receipt",
+                "status": "ready", "source": {
+                    "path": str(spm.resolve()), "size": spm.stat().st_size,
+                    "last_write_time_100ns": spm.stat().st_mtime_ns // 100 + 116444736000000000,
+                },
+                "geometry_count": 1, "geometries": [{"vertex_count": 3}],
+                "generated_instances": [{
+                    "source_bone_id": 0, "native_source_object_id": 1582183941839,
+                    "source_rtti": "", "vertex_ranges": [[0, 2]],
+                }],
+            }
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(speedtree_cli._native_receipt_is_valid(receipt, spm))
+            with self.assertRaisesRegex(RuntimeError, "invalid"):
+                speedtree_cli.load_native_receipt(receipt, spm)
+            payload["generated_instances"][0]["source_rtti"] = ".?AVCStartNode@@"
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertTrue(speedtree_cli._native_receipt_is_valid(receipt, spm))
+            self.assertEqual(speedtree_cli.load_native_receipt(receipt, spm)["generated_instances"][0]["source_bone_id"], 0)
+
     def test_zero_geometry_native_receipt_is_valid(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
